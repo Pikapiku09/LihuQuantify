@@ -1,0 +1,25 @@
+# 状态/数据绝不进镜像（含 token）
+data/
+outputs/
+backups/
+tests/
+docs/
+scripts/
+tushareMcp.json
+.env
+*.duckdb
+*.duckdb.wal
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 版本控制 / IDE
+.git/
+.gitignore
+.idea/
+.vscode/

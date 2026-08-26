@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LihuQuantify · 量化监控看板</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        /* ============ 设计系统 ============ */
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-card: #111827;
+            --bg-hover: #1f2937;
+            --bg-input: #1a2235;
+            --border: #1f2a3d;
+            --text-primary: #e5e7eb;
+            --text-secondary: #9ca3af;
+            --text-muted: #9ca3af;
+            --accent: #3b82f6;
+            --accent-glow: rgba(59, 130, 246, 0.15);
+            --green: #10b981;
+            --red: #ef4444;
+            --amber: #f59e0b;
+            --purple: #8b5cf6;
+            --cyan: #06b6d4;
+            --radius: 12px;
+            --radius-sm: 8px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.4);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                         "Microsoft YaHei", "Noto Sans SC", sans-serif;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* ============ 布局 ============ */
+        .layout { display: flex; min-height: 100vh; }
+        .sidebar {
+            width: 220px;
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            padding: 24px 0;
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            height: 100vh;
+            z-index: 100;
+            transition: var(--transition);
+        }
+        .sidebar-logo {
+            padding: 0 24px 24px;
+            border-bottom: 1px solid var(--border);
+        }
+        .sidebar-logo h1 {
+            font-size: 18px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+        .sidebar-logo span {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 4px;
+            display: block;
+        }
+        .nav-item {
+            padding: 12px 24px;
+            margin: 4px 12px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--text-secondary);
+            transition: var(--transition);
+            font-size: 14px;
+        }
+        .nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .nav-item.active {
+            background: var(--accent-glow);
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .nav-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+        .nav-badge {
+            margin-left: auto;
+            background: var(--accent);
+            color: white;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-weight: 600;
+        }
+        .main {
+            margin-left: 220px;
+            flex: 1;
+            padding: 32px;
+            max-width: 1400px;
+        }
+
+        /* ============ 页面切换动画 ============ */
+        .page { display: none; animation: fadeIn 0.35s ease-out; }
+        .page.active { display: block; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ============ 卡片 ============ */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow);
+            transition: var(--transition);
+        }
+        .card:hover { border-color: #2d3f55; }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .card-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+        /* ============ 指标网格 ============ */
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .metric-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+            transition: var(--transition);
+        }
+        .metric-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent), var(--cyan));
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .metric-card:hover::before { opacity: 1; }
+        .metric-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .metric-value {
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+        .metric-value.positive { color: var(--green); }
+        .metric-value.negative { color: var(--red); }
+        .metric-value.neutral { color: var(--text-primary); }
+        .metric-sub {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 8px;
+        }
+
+        /* ============ 状态徽章 ============ */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .badge-uptrend { background: rgba(16,185,129,0.15); color: var(--green); }
+        .badge-sideways { background: rgba(245,158,11,0.15); color: var(--amber); }
+        .badge-downtrend { background: rgba(239,68,68,0.15); color: var(--red); }
+        .badge-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+        /* ============ 表格 ============ */
+        .table-wrap { overflow-x: auto; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+        tr:hover td { background: var(--bg-hover); }
+        td .pos { color: var(--green); }
+        td .neg { color: var(--red); }
+
+        /* ============ 图表容器 ============ */
+        .chart-box {
+            width: 100%;
+            height: 320px;
+            margin-top: 8px;
+        }
+
+        /* ============ 报告页 ============ */
+        .report-list { display: grid; gap: 12px; }
+        .report-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .report-item:hover {
+            border-color: var(--accent);
+            transform: translateX(4px);
+        }
+        .report-date { font-weight: 600; font-size: 15px; }
+        .report-meta { color: var(--text-muted); font-size: 12px; margin-top: 4px; }
+        .report-view {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            margin-top: 20px;
+            line-height: 1.8;
+            font-size: 14px;
+        }
+        .report-view h1, .report-view h2, .report-view h3 { margin: 20px 0 12px; }
+        .report-view h1 { font-size: 20px; color: var(--text-primary); }
+        .report-view h2 { font-size: 16px; color: var(--text-primary); }
+        .report-view table { font-size: 13px; margin: 12px 0; }
+        .report-view th, .report-view td { padding: 8px 12px; }
+        .report-view code {
+            background: var(--bg-hover);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .report-view blockquote {
+            border-left: 3px solid var(--amber);
+            padding-left: 16px;
+            color: var(--amber);
+            margin: 12px 0;
+        }
+        .back-btn {
+            background: var(--bg-hover);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 8px 16px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 13px;
+            transition: var(--transition);
+            margin-bottom: 16px;
+        }
+        .back-btn:hover { background: var(--bg-card); color: var(--text-primary); }
+
+        /* ============ 加载/空状态 ============ */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--text-muted);
+        }
+        .loading::after {
+            content: '';
+            width: 24px;
+            height: 24px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-left: 12px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+        .empty-state svg { width: 48px; height: 48px; margin-bottom: 16px; opacity: 0.4; }
+
+        /* ============ 响应式 ============ */
+        @media (max-width: 900px) {
+            .sidebar { width: 64px; }
+            .sidebar-logo h1, .sidebar-logo span { display: none; }
+            .nav-item { padding: 12px; justify-content: center; }
+            .nav-item span { display: none; }
+            .main { margin-left: 64px; padding: 20px; }
+            .metric-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        /* ============ 滚动条 ============ */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-primary); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-logo">
+                <h1>LihuQuantify</h1>
+                <span>量化监控看板</span>
+            </div>
+            <nav>
+                <div class="nav-item active" onclick="showPage('dashboard', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"/></svg>
+                    <span>仪表盘</span>
+                </div>
+                <div class="nav-item" onclick="showPage('reports', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                    <span>巡检报告</span>
+                </div>
+                <div class="nav-item" onclick="showPage('backtest', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                    <span>回测分析</span>
+                </div>
+                <div class="nav-item" onclick="showPage('grid', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
+                    <span>网格搜索</span>
+                </div>
+            </nav>
+        </aside>
+
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- ============ 仪表盘 ============ -->
+            <div class="page active" id="page-dashboard">
+                <div class="metric-grid" id="metricsGrid">
+                    <div class="loading">加载中</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--accent)"></span>持仓与止损监控</div>
+                        <span class="badge badge-sideways" id="marketBadge">-</span>
+                    </div>
+                    <div class="table-wrap">
+                        <table id="positionsTable">
+                            <thead><tr><th>代码</th><th>持股</th><th>成本</th><th>止损线</th><th>状态</th></tr></thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                    <div id="pendingStops" style="margin-top:12px;"></div>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--green)"></span>近 10 笔交易</div>
+                    </div>
+                    <div class="table-wrap">
+                        <table id="tradesTable">
+                            <thead><tr><th>日期</th><th>代码</th><th>方向</th><th>价格</th><th>数量</th><th>盈亏</th><th>原因</th></tr></thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============ 报告页 ============ -->
+            <div class="page" id="page-reports">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--purple)"></span>每日巡检报告</div>
+                    </div>
+                    <div class="report-list" id="reportList">
+                        <div class="loading">加载中</div>
+                    </div>
+                </div>
+                <div id="reportView"></div>
+            </div>
+
+            <!-- ============ 回测页 ============ -->
+            <div class="page" id="page-backtest">
+                <div class="metric-grid" id="backtestMetrics"></div>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--cyan)"></span>绩效指标详情</div>
+                    </div>
+                    <div id="backtestDetail"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+
+            <!-- ============ 网格搜索页 ============ -->
+            <div class="page" id="page-grid">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--amber)"></span>参数网格搜索结果</div>
+                    </div>
+                    <div id="gridContent"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // ============ 页面切换 ============
+        function showPage(name, el) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.getElementById('page-' + name).classList.add('active');
+            el.classList.add('active');
+            if (name === 'dashboard') loadDashboard();
+            if (name === 'reports') loadReports();
+            if (name === 'backtest') loadBacktest();
+            if (name === 'grid') loadGrid();
+        }
+
+        // ============ 工具 ============
+        const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const fmt = {
+            money: v => v == null ? '-' : '¥' + Number(v).toLocaleString('zh-CN', {maximumFractionDigits: 0}),
+            pct: v => v == null ? '-' : (v * 100).toFixed(2) + '%',
+            num: v => v == null ? '-' : Number(v).toLocaleString('zh-CN'),
+            sign: v => v == null ? '' : v >= 0 ? `+${(v*100).toFixed(2)}%` : `${(v*100).toFixed(2)}%`,
+            color: v => v == null ? '' : v >= 0 ? 'positive' : 'negative',
+        };
+
+        // ============ 仪表盘 ============
+        let _dashTimer = null;
+
+        async function loadDashboard() {
+            try {
+                const res = await fetch('/api/dashboard');
+                const data = await res.json();
+                renderDashboard(data);
+            } catch (e) {
+                document.getElementById('metricsGrid').innerHTML =
+                    '<div class="empty-state">后端未启动<br><small>运行: python -m web.server</small></div>';
+            }
+        }
+
+        // 修复H.3：仪表盘 60 秒自动刷新（页面隐藏时暂停）
+        function startAutoRefresh() {
+            if (_dashTimer) return;
+            _dashTimer = setInterval(() => {
+                if (!document.hidden && document.getElementById('page-dashboard').classList.contains('active')) {
+                    loadDashboard();
+                }
+            }, 60000);
+        }
+        startAutoRefresh();
+
+        function renderDashboard(data) {
+            const m = data.market || {};
+            const acc = data.account || {};
+            const bt = data.backtest || {};
+
+            // 市场状态徽章
+            const badge = document.getElementById('marketBadge');
+            const stateMap = { '上涨': 'badge-uptrend', '震荡': 'badge-sideways', '下跌': 'badge-downtrend' };
+            badge.className = 'badge ' + (stateMap[m.state] || 'badge-sideways');
+            badge.innerHTML = `<span class="badge-dot" style="background:${m.state==='上涨'?'var(--green)':m.state==='下跌'?'var(--red)':'var(--amber)'}"></span>${esc(m.state || '-')} ${m.ret20d != null ? `(${m.ret20d > 0 ? '+' : ''}${m.ret20d}%)` : ''}`;
+
+            // 指标卡片（修复C：当前实盘配置口径优先；网格最优格降级为训练段参考）
+            const btM = bt.metrics || {};
+            const cards = [
+                { label: '总资产', value: fmt.money(acc.total_asset), sub: `现金 ${fmt.money(acc.cash)}` },
+                { label: '持仓数', value: acc.positions?.length || 0, sub: '当前持仓' },
+                { label: '停手票', value: Object.keys(acc.halt_map || {}).length, sub: '连亏3笔停手30天' },
+                bt.available
+                    ? { label: '当前配置回测收益', value: fmt.sign(btM.total_return), sub: `${bt.market_filter_mode} · ${bt.pool_info?.n_with_data || '-'}只×${bt.pool_info?.years || '-'}年`, cls: fmt.color(btM.total_return) }
+                    : { label: '当前配置回测', value: '—', sub: '运行 run_full_backtest.py 生成' },
+                bt.available
+                    ? { label: '最大回撤', value: fmt.pct(btM.max_drawdown), sub: '当前配置口径', cls: 'negative' }
+                    : { label: '最大回撤', value: '—', sub: '待回测' },
+                bt.available
+                    ? { label: '胜率 / 盈亏比', value: fmt.pct(btM.win_rate), sub: `盈亏比 ${btM.profit_loss_ratio?.toFixed(2) ?? '-'}` }
+                    : { label: '胜率', value: '—', sub: '待回测' },
+            ];
+            document.getElementById('metricsGrid').innerHTML = cards.map(c => `
+                <div class="metric-card">
+                    <div class="metric-label">${c.label}</div>
+                    <div class="metric-value ${c.cls || 'neutral'}">${c.value}</div>
+                    <div class="metric-sub">${c.sub}</div>
+                </div>
+            `).join('');
+
+            // 持仓表格
+            const tbody = document.querySelector('#positionsTable tbody');
+            const positions = acc.positions || [];
+            if (positions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">空仓</td></tr>';
+            } else {
+                tbody.innerHTML = positions.map(p => `
+                    <tr>
+                        <td><strong>${esc(p.ts_code)}</strong></td>
+                        <td>${fmt.num(p.volume)}</td>
+                        <td>${p.cost?.toFixed(2)}</td>
+                        <td>${p.stop_price ? p.stop_price.toFixed(2) : '-'}</td>
+                        <td>${p.triggered ? '<span class="neg">已触发</span>' : '<span class="pos">监控中</span>'}</td>
+                    </tr>
+                `).join('');
+            }
+
+            // 待执行止损
+            const pending = data.pending_stops || [];
+            document.getElementById('pendingStops').innerHTML = pending.length ? `
+                <div style="font-size:12px;color:var(--amber);margin-top:8px;">
+                    ⚠️ 待执行止损 ${pending.length} 个：${pending.map(p => `${esc(p.ts_code)}(${esc(p.reason)})`).join(', ')}
+                </div>
+            ` : '';
+
+            // 交易表格
+            const trTbody = document.querySelector('#tradesTable tbody');
+            const trades = data.recent_trades || [];
+            if (trades.length === 0) {
+                trTbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">暂无交易</td></tr>';
+            } else {
+                trTbody.innerHTML = trades.map(t => `
+                    <tr>
+                        <td>${esc(String(t.date || '-'))}</td>
+                        <td>${esc(t.ts_code)}</td>
+                        <td>${t.side === 'buy' ? '<span class="pos">买入</span>' : '<span class="neg">卖出</span>'}</td>
+                        <td>${t.price?.toFixed(2)}</td>
+                        <td>${fmt.num(t.volume)}</td>
+                        <td class="${t.pnl >= 0 ? 'pos' : 'neg'}">${t.pnl ? fmt.money(t.pnl) : '-'}</td>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.reason || '')}">${esc(t.reason || '-')}</td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        // ============ 报告页 ============
+        async function loadReports() {
+            try {
+                const res = await fetch('/api/reports');
+                const data = await res.json();
+                renderReports(data.reports || []);
+            } catch (e) {
+                document.getElementById('reportList').innerHTML =
+                    '<div class="empty-state">后端未启动</div>';
+            }
+        }
+
+        function renderReports(reports) {
+            const el = document.getElementById('reportList');
+            if (reports.length === 0) {
+                el.innerHTML = '<div class="empty-state">暂无报告<br><small>先运行 python run_scheduler.py --run-now</small></div>';
+                return;
+            }
+            el.innerHTML = reports.map(r => `
+                <div class="report-item" onclick="loadReport('${r.name}')">
+                    <div>
+                        <div class="report-date">${r.date}</div>
+                        <div class="report-meta">${r.title}</div>
+                    </div>
+                    <div style="color:var(--text-muted);font-size:12px">${(r.size / 1024).toFixed(1)} KB</div>
+                </div>
+            `).join('');
+        }
+
+        async function loadReport(name) {
+            const view = document.getElementById('reportView');
+            view.innerHTML = '<div class="loading">加载中</div>';
+            try {
+                const res = await fetch(`/api/reports/${name}`);
+                const data = await res.json();
+                view.innerHTML = `
+                    <button class="back-btn" onclick="document.getElementById('reportView').innerHTML=''">← 返回列表</button>
+                    <div class="report-view">${mdToHtml(data.content)}</div>
+                `;
+                view.scrollIntoView({ behavior: 'smooth' });
+            } catch (e) {
+                view.innerHTML = '<div class="empty-state">报告加载失败</div>';
+            }
+        }
+
+        // 简易 Markdown → HTML（修复H.1：渲染前先转义，防 XSS）
+        function mdToHtml(md) {
+            const safe = String(md ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return safe
+                .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+                .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+                .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+                .replace(/^&gt; (.*$)/gim, '<blockquote>$1</blockquote>')
+                .replace(/^\s*- \[([x ])\] (.*)$/gim, '<div style="padding-left:8px">• [$1] $2</div>')
+                .replace(/^\s*-\s(.*)$/gim, '<div style="padding-left:8px">• $1</div>')
+                .replace(/\n\n/g, '<br><br>')
+                .replace(/\n/g, '<br>');
+        }
+
+        // ============ 回测页（修复C：权益曲线 ECharts + 当前配置口径） ============
+        let _equityChart = null;
+
+        async function loadBacktest() {
+            const el = document.getElementById('backtestMetrics');
+            const detail = document.getElementById('backtestDetail');
+            el.innerHTML = '<div class="loading">加载中</div>';
+            detail.innerHTML = '';
+            try {
+                const res = await fetch('/api/equity');
+                if (res.status === 404) {
+                    el.innerHTML = '<div class="empty-state">暂无回测结果<br><small>先运行 python run_full_backtest.py</small></div>';
+                    return;
+                }
+                const data = await res.json();
+                renderEquityChart(data);
+            } catch (e) {
+                el.innerHTML = '<div class="empty-state">后端未启动</div>';
+            }
+        }
+
+        function renderEquityChart(data) {
+            const curve = data.equity_curve || [];
+            const m = data.metrics || {};
+            const dd = data.max_drawdown_range || {};
+            const pool = data.pool_info || {};
+
+            // 指标卡片（当前配置口径；含幸存者偏差提示）
+            const cards = [
+                { label: '总收益', value: fmt.sign(m.total_return), sub: '含幸存者偏差（乐观口径）', cls: fmt.color(m.total_return) },
+                { label: '年化收益', value: fmt.pct(m.annual_return), sub: '同上', cls: fmt.color(m.annual_return) },
+                { label: '最大回撤', value: fmt.pct(m.max_drawdown), sub: `${dd.start || '-'} ~ ${dd.end || '-'}`, cls: 'negative' },
+                { label: '卡玛比率', value: (m.calmar ?? '-').toFixed ? m.calmar.toFixed(2) : '-', sub: '收益/回撤', cls: fmt.color(m.calmar) },
+                { label: '胜率', value: fmt.pct(m.win_rate), sub: `${m.total_trades ?? '-'} 轮` },
+                { label: '盈亏比', value: (m.profit_loss_ratio ?? 0).toFixed ? m.profit_loss_ratio.toFixed(2) : '-', sub: m.profit_loss_ratio >= 1 ? '≥1 达标' : '<1 未达标' },
+            ];
+            document.getElementById('backtestMetrics').innerHTML = cards.map(c => `
+                <div class="metric-card">
+                    <div class="metric-label">${c.label}</div>
+                    <div class="metric-value ${c.cls || 'neutral'}">${c.value}</div>
+                    <div class="metric-sub">${c.sub}</div>
+                </div>
+            `).join('');
+
+            // 回测元信息
+            const detail = document.getElementById('backtestDetail');
+            detail.innerHTML = `
+                <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px;color:var(--text-muted);margin-bottom:16px">
+                    <span>生成：${esc(data.generated_at || '-')}</span>
+                    <span>配置：${esc(data.config_hash || '-')}</span>
+                    <span>市场过滤：${esc(data.market_filter_mode || '-')}</span>
+                    <span>池：${esc(pool.type || '-')}（${pool.n_with_data ?? '-'}只×${pool.years ?? '-'}年，截至 ${esc(pool.end_date || '-')}）</span>
+                </div>
+                <blockquote style="border-left:3px solid var(--amber);padding-left:12px;color:var(--amber);font-size:12px;margin:0 0 16px">
+                    ⚠️ 口径提示：池按当前上市股票构建（幸存者偏差，收益系统性偏高）；
+                    已含连亏3笔停手 + 板块≤40% + T+1 + 三档止损铁律。
+                </blockquote>
+                <div id="equityChart" style="width:100%;height:380px"></div>
+            `;
+
+            // ECharts 权益曲线（修复C.4）+ 最大回撤区间阴影
+            const chartDom = document.getElementById('equityChart');
+            if (!chartDom || typeof echarts === 'undefined') return;
+            if (_equityChart) _equityChart.dispose();
+            _equityChart = echarts.init(chartDom);
+            const dates = curve.map(p => p.date);
+            const values = curve.map(p => p.equity);
+            const markArea = dd.start && dd.end ? [{
+                silent: true,
+                itemStyle: { color: 'rgba(239,68,68,0.08)' },
+                data: [[{ xAxis: dd.start }, { xAxis: dd.end }]],
+                label: { show: true, position: 'insideTop', color: '#ef4444', fontSize: 11,
+                         formatter: `最大回撤 ${(dd.depth * 100).toFixed(1)}%` },
+            }] : [];
+            _equityChart.setOption({
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: '#111827',
+                    borderColor: '#1f2a3d',
+                    textStyle: { color: '#e5e7eb', fontSize: 12 },
+                    valueFormatter: v => '¥' + Number(v).toLocaleString('zh-CN', {maximumFractionDigits: 0}),
+                },
+                grid: { left: 70, right: 30, top: 30, bottom: 40 },
+                xAxis: {
+                    type: 'category', data: dates,
+                    axisLine: { lineStyle: { color: '#1f2a3d' } },
+                    axisLabel: { color: '#9ca3af', fontSize: 11 },
+                },
+                yAxis: {
+                    type: 'value', scale: true,
+                    axisLine: { show: false },
+                    splitLine: { lineStyle: { color: '#1f2a3d', type: 'dashed' } },
+                    axisLabel: { color: '#9ca3af', fontSize: 11,
+                                  formatter: v => (v / 10000).toFixed(1) + '万' },
+                },
+                series: [{
+                    name: '权益', type: 'line', data: values,
+                    symbol: 'none',
+                    lineStyle: { color: '#3b82f6', width: 1.5 },
+                    areaStyle: {
+                        color: {
+                            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+                            colorStops: [
+                                { offset: 0, color: 'rgba(59,130,246,0.25)' },
+                                { offset: 1, color: 'rgba(59,130,246,0)' },
+                            ],
+                        },
+                    },
+                    markArea,
+                }],
+                dataZoom: [{ type: 'inside' }],
+            });
+            window.addEventListener('resize', () => _equityChart && _equityChart.resize());
+        }
+
+        // ============ 网格搜索页（修复C/H：训练段参考·弱化展示） ============
+        async function loadGrid() {
+            const el = document.getElementById('gridContent');
+            el.innerHTML = '<div class="loading">加载中</div>';
+            try {
+                const res = await fetch('/api/grid');
+                const data = await res.json();
+                const grids = data.grids || {};
+                const keys = Object.keys(grids);
+                if (keys.length === 0) {
+                    el.innerHTML = '<div class="empty-state">暂无网格数据</div>';
+                    return;
+                }
+                const warn = `
+                    <div style="border-left:3px solid var(--amber);padding-left:12px;color:var(--amber);font-size:12px;margin:0 0 16px">
+                        ⚠️ 下表为<b>训练段参考</b>（含幸存者偏差，非实盘口径）——网格最优格仅用于横向比较，
+                        不作为实盘参数依据；实盘参数见 settings.yaml（决策日志纪律）。
+                    </div>
+                `;
+                el.innerHTML = warn + `
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>网格</th><th>最优参数</th><th>收益*</th><th>卡玛</th><th>轮次</th><th>稳健点</th><th>原参数判定</th></tr></thead>
+                            <tbody>
+                                ${keys.map(k => {
+                                    const g = grids[k];
+                                    const b = g.best || {};
+                                    const orig = g.orig_robust == null ? '-' :
+                                        (g.orig_robust ? '<span class="pos">✓ 稳健</span>' : '<span class="neg">✗ 不稳健</span>');
+                                    return `<tr>
+                                        <td><strong>${esc(k)}</strong><br><small style="color:var(--text-muted)">${esc(g.label || '')}</small></td>
+                                        <td>ma5=${b.ma5_dev} fresh=${b.freshness} chase=${b.chasing}</td>
+                                        <td class="${fmt.color(b.total_return)}">${fmt.pct(b.total_return)}</td>
+                                        <td>${b.calmar?.toFixed(2) ?? '-'}</td>
+                                        <td>${b.trades ?? '-'}</td>
+                                        <td>${g.robust_points != null ? `${g.robust_points}/${g.count}` : '-'}</td>
+                                        <td>${orig}</td>
+                                    </tr>`;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top:16px;color:var(--text-muted);font-size:12px">
+                        稳健点 = 自身+一阶邻域全正的参数组合数；*收益含幸存者偏差（乐观口径）。
+                        热力图见 outputs/grid_heatmap_*.png
+                    </div>
+                `;
+            } catch (e) {
+                el.innerHTML = '<div class="empty-state">后端未启动</div>';
+            }
+        }
+
+        // 初始加载
+        loadDashboard();
+    </script>
+</body>
+</html>

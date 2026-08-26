@@ -1,0 +1,46 @@
+# LihuQuantify 部署（第四轮清单4/5：群晖 DS918+ / 任何 Docker 宿主机）
+#
+# 用法（项目根目录）：
+#   docker compose up -d --build
+#
+# 安全边界（第四轮清单9）：
+#   - web 端口默认映射到宿主机所有网卡（局域网可访问）。
+#     如需收窄：把 "8000:8000" 改为 "192.168.x.x:8000:8000"（绑定内网 IP）。
+#   - 绝不在路由器上把 8000 端口映射到公网；远程访问用 Tailscale/ZeroTier 组网。
+#   - tushareMcp.json（token）与 .env（邮件授权码）不进 git，仅本机挂载。
+
+services:
+  scheduler:
+    build: .
+    image: lihu-quantify:latest
+    container_name: lihu-scheduler
+    restart: unless-stopped          # NAS 重启后自动恢复（幂等保护防重复巡检）
+    environment:
+      - TZ=Asia/Shanghai
+      # token 文件路径覆盖（settings.yaml 里是 Windows 绝对路径）
+      - LIHU_TUSHARE__TOKEN_FILE=/app/tushareMcp.json
+      # 邮件授权码（可选，放 .env；settings.yaml 留空）
+      - LIHU_ALERT__EMAIL__AUTH_CODE=${AUTH_CODE:-}
+      # healthchecks.io 心跳 URL（可选；空=不 ping）
+      - LIHU_HEARTBEAT__HEALTHCHECKS_URL=${HEALTHCHECKS_URL:-}
+    volumes:
+      - ./data:/app/data              # duckdb + paper_state + 日志（持久化，命根子）
+      - ./outputs:/app/outputs        # 报告/图表
+      - ./config:/app/config          # settings.yaml（改配置重启容器生效）
+      - ./tushareMcp.json:/app/tushareMcp.json:ro   # token（只读挂载）
+    command: python run_scheduler.py --mode paper --n 50
+
+  web:
+    build: .
+    image: lihu-quantify:latest
+    container_name: lihu-web
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - LIHU_WEB_HOST=0.0.0.0         # 容器内必须 0.0.0.0 才能端口映射；宿主侧安全由 ports 控制
+    ports:
+      - "8000:8000"                    # 局域网访问 http://<NAS_IP>:8000；勿公网映射
+    volumes:
+      - ./data:/app/data               # 只读展示 scheduler 写入的状态（共享同一卷）
+      - ./outputs:/app/outputs
+    command: python -m web.server

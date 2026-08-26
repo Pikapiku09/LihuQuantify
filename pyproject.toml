@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lihu-quantify"
+version = "0.1.0"
+description = "A 股日线级量化交易系统：Tushare 数据 → 策略/风控 → 回测 → MiniQMT 实盘"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Lihu" }]
+dependencies = [
+    "tushare>=1.4.0",
+    "duckdb>=0.10.0",
+    "pandas>=2.0.0",
+    "pandas-ta>=0.3.14b0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "pyyaml>=6.0",
+    "loguru>=0.7.0",
+    "requests>=2.31.0",
+    "apscheduler>=3.10.0",
+    "jinja2>=3.1.0",
+    "svgwrite>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.1.0",
+]
+web = [
+    # 看板（web/server.py）；scheduler 本体不需要
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+]
+qmt = [
+    # xtquant 由 MiniQMT 客户端自带，不通过 pip 安装
+    # 使用时把 MiniQMT 的 bin.x64 加入 PYTHONPATH
+]
+
+[project.scripts]
+lihu = "lihu_quantify.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

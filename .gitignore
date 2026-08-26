@@ -1,0 +1,29 @@
+
+# ===== 敏感信息（绝不入库，第四轮清单9） =====
+# Tushare token（MCP JSON 或纯文本）
+tushareMcp.json
+# 邮件授权码等
+.env
+*.env.local
+
+# ===== 运行时状态/数据（本地生成，体积大且含账户状态） =====
+data/
+outputs/
+backups/
+
+# 测试状态隔离目录
+tests/.test_state/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Python 虚拟环境
+.venv/

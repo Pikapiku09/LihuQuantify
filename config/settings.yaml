@@ -1,0 +1,101 @@
+# LihuQuantify 全局配置
+# 环境变量优先级高于本文件（LIHU_ 前缀）
+
+tushare:
+  token: ""                          # 留空则读 token_file
+  token_file: "E:/LihuQuantify/tushareMcp.json"   # 支持 MCP JSON 格式或纯文本
+  cache_dir: "./data/cache"
+  # 接口调用频率上限（继承原 dsh-invest-plugin 纪律）
+  rate_limits:
+    quote_per_stock: 1               # daily/daily_basic/moneyflow 每股各 1 次
+    index_per_run: 1
+    sector_per_run: 1
+    fina_per_run: 1
+
+duckdb:
+  path: "./data/lihu_quant.duckdb"
+
+qmt:
+  enabled: false
+  path: "C:/国金QMT/bin.x64"
+  account: ""
+
+# 模拟盘初始资金
+init_capital: 100000
+
+# 股票池：分层抽样池（修复J——head-50 已证实存在池子偏差，2026-08-26 决策日志）
+universe:
+  pool_mode: "strat"                     # strat=成交额分层抽样 | head=代码排序前N只（旧，已弃用）
+  pool_size: 200                          # strat 模式目标数量
+  pool_layers: 5                          # 分层数
+  pool_seed: 42                           # 抽样种子（可复现）
+  exclude_prefix: ["688", "300", "301"]   # 科创/创业板排除
+  exclude_st: true
+  min_list_days: 60
+  min_avg_amount_20d: 100000000          # 20 日日均成交额 ≥ 1 亿
+
+# 策略参数（修复4 网格搜索稳健区域：50只×2年训练段，2026-08-26）
+# close_to_ma5_max_dev=0.05 组内 fresh∈{3,5,7,10}×chase∈{0.05,0.08,0.12} 全为正（稳健区域）
+# 注意：验证段（2025-12~2026-08 震荡市）该组为负 —— 必须配合市场状态过滤使用（见修复6结论）
+strategy:
+  ma_periods: [5, 10, 20, 60]
+  golden_cross_max_freshness_days: 3
+  volume_ratio_threshold: 1.0
+  entity_ratio_threshold: 0.40
+  close_to_ma5_max_dev: 0.05
+  chasing_high_threshold: 0.08
+  market_filter: true                    # 市场状态参考信号（000001.SH 20日涨幅）
+  market_filter_mode: "reduce"            # reduce=非上涨段仓位减半（默认，修复G保守化）
+                                         # 证据等级：中等偏弱——holdout ON-3%-20d 仅 16 笔样本（+7.2% vs OFF -7.5%），
+                                         # 变体脆弱（2%阈值≈无效 +0.5%、60日窗为负 -8.1%）
+                                         # 积累 ≥100 笔纸面交易后再评估是否升级 block（见 docs/决策日志.md）
+                                         # block=非上涨段禁止开仓（旧模式，已判脆弱弃用）
+
+# 风控参数（铁律，不可放松）
+risk:
+  max_single_position: 0.25
+  max_sector_position: 0.40
+  stop_loss_warn: -0.03
+  stop_loss_exec: -0.05
+  stop_loss_force: -0.08
+  trailing_profit_pullback: 0.03         # 盈利回撤 3% 离场
+  trailing_break_ma: 10                   # 或破 10 日线离场
+  max_trades_per_ticker_month: 3
+  halt_after_consec_losses: 3
+  halt_days: 30
+  chasing_high_threshold: 0.08           # 乖离 10 日线 8% 视为追高
+
+# 回测撮合参数
+backtest:
+  commission: 0.00025                     # 佣金 万 2.5（最低 5 元）
+  stamp_tax: 0.0005                       # 卖出印花税 万 5（2023.8 起减半）
+  slippage: 0.001                         # 0.1%
+
+# 调度
+scheduler:
+  daily_scan_cron: "30 16 * * 1-5"        # 周一至周五 16:30（第四轮清单3：Tushare 当日日线 16:00 后完整，15:30 可能取到昨日）
+  monthly_review_cron: "0 16 * * L"       # 月末 16:00
+  timezone: "Asia/Shanghai"
+
+# 心跳（第四轮清单2：healthchecks.io 缺席告警；url 留空=不 ping）
+heartbeat:
+  healthchecks_url: ""                    # 例 https://hc-ping.com/<uuid>；后台设"每日 17:30 前未收到完成 ping → 告警"
+
+# 告警（Server酱微信推送；key 为空则仅控制台）
+alert:
+  serverchan_key: ""
+  email:
+    enabled: false                        # 总开关（授权码未填时保持 false）
+    smtp_host: "smtp.qq.com"              # 或 smtp.163.com
+    smtp_port: 465
+    username: ""                          # 发件邮箱
+    auth_code: ""                         # 授权码（非登录密码）；建议放 .env: LIHU_ALERT__EMAIL__AUTH_CODE
+    to: []                                # 收件人列表
+    send_daily_digest: true               # 每日巡检摘要邮件
+
+# 指标自研参数
+indicators:
+  td_sequential_lookback: 4              # 与 4 根前收盘价比较
+  td_sequential_exhaustion: 9            # 9 衰竭点
+  divergence_window: 60                  # MACD 背离检测窗口
+  divergence_min_window: 36              # 最小窗口（短于此不判背离）

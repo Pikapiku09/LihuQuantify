@@ -38,9 +38,9 @@ def test_alerter_business_methods():
     alerter.alert_halt("600584.SH", date(2026, 9, 26))
     alerter.alert_bought("000001.SZ", 100, 10.0, 9.2)
     assert len(alerter.history) == 4
-    # 按级别过滤
+    # 按级别过滤（修复3/第五轮清单：halt 由 error 降为 warn）
     warns = alerter.alerts_since(LEVEL_WARN)
-    assert len(warns) == 2   # checklist_reject + stop_loss
+    assert len(warns) == 3   # checklist_reject + stop_loss + halt
 
 
 def test_alerter_serverchan_push_mock():

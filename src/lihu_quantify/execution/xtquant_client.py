@@ -85,8 +85,8 @@ class MiniQMTClient(BrokerBase):
         if not self._connected:
             raise RuntimeError("MiniQMT 未连接，请先 connect()")
 
-    def buy(self, ts_code: str, price: float, volume: int) -> OrderResult:
-        """市价买入（用限价=现价±滑点模拟市价，避免市价单被拒）。"""
+    def buy(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
+        """市价买入（用限价=现价±滑点模拟市价，避免市价单被拒）。reason 仅记录用。"""
         self._ensure_connected()
         try:
             from xtquant import xtconstant
@@ -101,13 +101,15 @@ class MiniQMTClient(BrokerBase):
             )
             if order_id < 0:
                 return OrderResult(success=False, msg=f"下单失败 code={order_id}")
-            logger.info(f"[实盘买入] {ts_code} {volume}股 @ {price} → order_id={order_id}")
+            logger.info(f"[实盘买入] {ts_code} {volume}股 @ {price}"
+                        f"（原因 {reason or '-'}）→ order_id={order_id}")
             return OrderResult(success=True, order_id=str(order_id))
         except Exception as e:
             logger.error(f"买入异常 {ts_code}: {e}")
             return OrderResult(success=False, msg=str(e))
 
-    def sell(self, ts_code: str, price: float, volume: int) -> OrderResult:
+    def sell(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
+        """市价卖出。reason 为离场原因（止损类型等，仅记录用）。"""
         self._ensure_connected()
         try:
             from xtquant import xtconstant
@@ -122,7 +124,8 @@ class MiniQMTClient(BrokerBase):
             )
             if order_id < 0:
                 return OrderResult(success=False, msg=f"下单失败 code={order_id}")
-            logger.info(f"[实盘卖出] {ts_code} {volume}股 @ {price} → order_id={order_id}")
+            logger.info(f"[实盘卖出] {ts_code} {volume}股 @ {price}"
+                        f"（原因 {reason or '-'}）→ order_id={order_id}")
             return OrderResult(success=True, order_id=str(order_id))
         except Exception as e:
             logger.error(f"卖出异常 {ts_code}: {e}")

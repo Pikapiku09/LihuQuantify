@@ -37,6 +37,7 @@ web = [
     # 看板（web/server.py）；scheduler 本体不需要
     "fastapi>=0.110.0",
     "uvicorn>=0.29.0",
+    "httpx>=0.27.0",   # 看板端点测试（fastapi TestClient 依赖）
 ]
 qmt = [
     # xtquant 由 MiniQMT 客户端自带，不通过 pip 安装

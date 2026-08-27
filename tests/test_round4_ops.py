@@ -66,33 +66,35 @@ def test_build_email_alerter_incomplete():
     assert build_email_alerter(cfg) is None
 
 
-def test_alerter_email_channel_warn_only():
-    """Alerter 集成：warn/error 即时发邮件；info 不发（进每日摘要）。"""
+def test_alerter_email_channel_error_only():
+    """第五轮后邮件机制：仅 error 即时发邮件；warn/info 进每日日报。"""
     ea = MagicMock()
     ea.ready = True
     alerter = Alerter(serverchan_key="", email=ea)
     alerter.send("info 事件", level="info")
-    ea.send.assert_not_called()
     alerter.send("warn 事件", level="warn")
+    ea.send.assert_not_called()
+    alerter.send("error 事件", level="error")
     ea.send.assert_called_once()
     subject = ea.send.call_args[0][0]
-    assert "warn 事件" in subject
+    assert "error 事件" in subject
 
 
-def test_daily_digest_counts_lists():
-    """摘要邮件：executed/rejected 为 list 时按数量展示。"""
+def test_send_daily_report_smoke():
+    """send_daily_report：HTML 日报发送冒烟（executed/rejected 计数进正文）。"""
     ea = MagicMock()
     ea.ready = True
+    ea.send.return_value = True
     alerter = Alerter(email=ea)
     summary = {
         "trade_date": date(2026, 8, 26), "market_state": "上涨",
         "signals": 10, "executed": [{}, {}, {}], "rejected": [{}],
         "total_asset": 100753, "report": "outputs/reports/x.md",
     }
-    alerter.send_daily_digest(summary)
-    body = ea.send.call_args[0][1]
-    assert "成交: 3 笔" in body
-    assert "拦截: 1 个" in body
+    assert alerter.send_daily_report(summary) is True
+    args, kwargs = ea.send.call_args
+    assert "2026-08-26" in args[0]
+    assert "当前持仓" in args[1]
 
 
 # ============ 清单2：Heartbeat ============

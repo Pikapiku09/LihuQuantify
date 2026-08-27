@@ -63,6 +63,62 @@ def _read_paper_state() -> dict:
     return _read_json(DATA_DIR / "paper_state.json")
 
 
+def _read_last_scan() -> dict:
+    """第六轮清单2/3：最近一次巡检摘要（rich 数据源）。"""
+    return _read_json(DATA_DIR / "last_scan.json")
+
+
+def _merge_positions(state: dict, registry: dict, scan_summary: dict) -> list[dict]:
+    """第六轮清单2：持仓合并——paper_state 的 volume/cost 为准，
+    last_scan.summary.positions 提供 name/price/market_value/float_pnl/
+    float_pnl_pct/weight/stop_price（无 last_scan 时回退旧字段）。
+    """
+    rich = {p.get("ts_code"): p
+            for p in (scan_summary.get("positions") or []) if p.get("ts_code")}
+    positions = []
+    for code, p in (state.get("positions") or {}).items():
+        reg = registry.get(code, {})
+        rp = rich.get(code, {})
+        positions.append({
+            "ts_code": code,
+            "name": rp.get("name", ""),
+            "volume": p.get("volume", 0),
+            "cost": p.get("cost", 0.0),
+            "price": rp.get("price"),
+            "market_value": rp.get("market_value"),
+            "float_pnl": rp.get("float_pnl"),
+            "float_pnl_pct": rp.get("float_pnl_pct"),
+            "weight": rp.get("weight"),
+            "stop_price": reg.get("stop_price") if reg.get("stop_price") is not None
+                          else rp.get("stop_price"),
+            "triggered": reg.get("triggered", False),
+        })
+    return positions
+
+
+def _live_metrics(state: dict, scan_summary: dict, total_asset: float) -> dict:
+    """第六轮清单3：真实监控指标（非回测预测值）。
+
+    - cumulative_return：(total_asset − init_capital) / init_capital
+    - day_pnl：total_asset − prev_total_asset（上次巡检为空 → None 不展示）
+    - floating_pnl：Σ last_scan.summary.positions.float_pnl
+    - realized_today：Σ last_scan.summary.sells_today.pnl
+    """
+    init_capital = state.get("init_capital") or 0
+    prev = scan_summary.get("prev_total_asset")
+    positions = scan_summary.get("positions") or []
+    sells = scan_summary.get("sells_today") or []
+    return {
+        "cumulative_return": (
+            (total_asset - init_capital) / init_capital if init_capital else None
+        ),
+        "day_pnl": (total_asset - prev) if (prev is not None and prev > 0) else None,
+        "floating_pnl": sum(p.get("float_pnl") or 0 for p in positions),
+        "realized_today": sum(s.get("pnl") or 0 for s in sells),
+        "init_capital": init_capital,
+    }
+
+
 def _read_stop_registry() -> dict:
     return _read_json(DATA_DIR / "stop_registry.json")
 
@@ -132,22 +188,19 @@ async def index():
 
 @app.get("/api/dashboard")
 async def dashboard():
-    """仪表盘聚合数据（修复C：总资产读 asset 快照，非 init_capital）。"""
+    """仪表盘聚合数据（修复C：总资产读 asset 快照，非 init_capital）。
+
+    第六轮清单2/3：持仓合并 last_scan 的 rich 字段（名称/现价/市值/浮盈亏），
+    新增 live 块（真实监控指标：累计收益率/今日盈亏/浮动盈亏/今日已实现）。
+    """
     state = _read_paper_state()
     registry = _read_stop_registry()
     pending = _read_pending_stops()
     market = _market_state()
+    last_scan = _read_last_scan()
+    scan_summary = (last_scan.get("summary") or {}) if last_scan else {}
 
-    positions = []
-    for code, p in (state.get("positions") or {}).items():
-        reg = registry.get(code, {})
-        positions.append({
-            "ts_code": code,
-            "volume": p.get("volume", 0),
-            "cost": p.get("cost", 0.0),
-            "stop_price": reg.get("stop_price"),
-            "triggered": reg.get("triggered", False),
-        })
+    positions = _merge_positions(state, registry, scan_summary)
 
     trades = state.get("trades", [])
     # 近 10 笔交易（倒序）
@@ -163,10 +216,12 @@ async def dashboard():
             "cash": state.get("cash", 0),
             "total_asset": total_asset,
             "market_value": asset_snap.get("market_value", 0),
+            "init_capital": state.get("init_capital", 100000),
             "asset_source": "snapshot" if asset_snap else "legacy_init_capital",
             "positions": positions,
             "halt_map": state.get("halt_map", {}),
         },
+        "live": _live_metrics(state, scan_summary, total_asset),
         "stop_registry": registry,
         "pending_stops": pending,
         "recent_trades": recent_trades,

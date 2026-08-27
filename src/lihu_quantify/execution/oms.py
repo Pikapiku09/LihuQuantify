@@ -154,8 +154,11 @@ class OrderManagementSystem:
                     msg=f"铁律2：{signal.ts_code} 现持仓亏损（{cur:.2f} < 成本 {existing.cost:.2f}），禁止向下补仓",
                 ), None
 
-        # 下买入单
-        buy_result = self.broker.buy(signal.ts_code, buy_price, volume)
+        # 下买入单（修复4/第六轮：交易记录携带策略原因）
+        buy_result = self.broker.buy(
+            signal.ts_code, buy_price, volume,
+            reason=signal.reason or "策略买入",
+        )
         if not buy_result.success:
             logger.error(f"买入失败，不登记止损：{buy_result.msg}")
             return buy_result, None
@@ -194,7 +197,8 @@ class OrderManagementSystem:
                 )
                 # 卖出（用当前价，实际可挂跌一分钱保证成交）
                 sell_price = round(price - 0.01, 2)
-                result = self.broker.sell(code, sell_price, stop.volume)
+                result = self.broker.sell(code, sell_price, stop.volume,
+                                          reason="价格止损")   # 修复4/第六轮
                 if result.success:
                     stop.triggered = True
                     stop.triggered_at = date.today()

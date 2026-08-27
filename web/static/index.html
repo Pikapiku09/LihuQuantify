@@ -231,6 +231,11 @@
         tr:hover td { background: var(--bg-hover); }
         td .pos { color: var(--green); }
         td .neg { color: var(--red); }
+        /* 第六轮清单2/3：A股口径红涨绿跌（涨=red，跌=green），用于价格/盈亏类数值 */
+        .up { color: var(--red); font-weight: 600; }
+        .dn { color: var(--green); font-weight: 600; }
+        .metric-value.up { color: var(--red); }
+        .metric-value.dn { color: var(--green); }
 
         /* ============ 图表容器 ============ */
         .chart-box {
@@ -382,7 +387,7 @@
                     </div>
                     <div class="table-wrap">
                         <table id="positionsTable">
-                            <thead><tr><th>代码</th><th>持股</th><th>成本</th><th>止损线</th><th>状态</th></tr></thead>
+                            <thead><tr><th>代码</th><th>名称</th><th>持股</th><th>成本</th><th>现价</th><th>市值</th><th>浮动盈亏</th><th>盈亏%</th><th>止损线</th><th>状态</th></tr></thead>
                             <tbody></tbody>
                         </table>
                     </div>
@@ -454,10 +459,14 @@
         const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         const fmt = {
             money: v => v == null ? '-' : '¥' + Number(v).toLocaleString('zh-CN', {maximumFractionDigits: 0}),
+            // 第六轮：带符号金额（盈亏展示）；A股口径红涨绿跌
+            moneySign: v => v == null ? '-' : (v >= 0 ? '+' : '') + '¥' + Number(v).toLocaleString('zh-CN', {maximumFractionDigits: 0}),
             pct: v => v == null ? '-' : (v * 100).toFixed(2) + '%',
             num: v => v == null ? '-' : Number(v).toLocaleString('zh-CN'),
             sign: v => v == null ? '' : v >= 0 ? `+${(v*100).toFixed(2)}%` : `${(v*100).toFixed(2)}%`,
             color: v => v == null ? '' : v >= 0 ? 'positive' : 'negative',
+            // A股红涨绿跌 class（零/空 → 中性）
+            ud: v => v == null || v === 0 ? 'neutral' : v > 0 ? 'up' : 'dn',
         };
 
         // ============ 仪表盘 ============
@@ -488,7 +497,7 @@
         function renderDashboard(data) {
             const m = data.market || {};
             const acc = data.account || {};
-            const bt = data.backtest || {};
+            const live = data.live || {};
 
             // 市场状态徽章
             const badge = document.getElementById('marketBadge');
@@ -496,21 +505,19 @@
             badge.className = 'badge ' + (stateMap[m.state] || 'badge-sideways');
             badge.innerHTML = `<span class="badge-dot" style="background:${m.state==='上涨'?'var(--green)':m.state==='下跌'?'var(--red)':'var(--amber)'}"></span>${esc(m.state || '-')} ${m.ret20d != null ? `(${m.ret20d > 0 ? '+' : ''}${m.ret20d}%)` : ''}`;
 
-            // 指标卡片（修复C：当前实盘配置口径优先；网格最优格降级为训练段参考）
-            const btM = bt.metrics || {};
+            // 指标卡片（第六轮清单3：真实监控指标替换回测预测值；
+            // 回测绩效移至"回测分析/网格搜索"页）
             const cards = [
                 { label: '总资产', value: fmt.money(acc.total_asset), sub: `现金 ${fmt.money(acc.cash)}` },
+                { label: '累计收益率', value: live.cumulative_return != null ? fmt.sign(live.cumulative_return) : '—',
+                  sub: `初始 ${fmt.money(live.init_capital ?? acc.init_capital)}`, cls: live.cumulative_return != null ? fmt.ud(live.cumulative_return) : '' },
+                { label: '今日盈亏', value: live.day_pnl != null ? fmt.moneySign(live.day_pnl) : '—',
+                  sub: live.day_pnl != null ? `已实现 ${fmt.moneySign(live.realized_today ?? 0)}` : '待次日对比',
+                  cls: live.day_pnl != null ? fmt.ud(live.day_pnl) : '' },
+                { label: '浮动盈亏', value: fmt.moneySign(live.floating_pnl ?? 0),
+                  sub: `${acc.positions?.length || 0} 只持仓`, cls: fmt.ud(live.floating_pnl ?? 0) },
                 { label: '持仓数', value: acc.positions?.length || 0, sub: '当前持仓' },
                 { label: '停手票', value: Object.keys(acc.halt_map || {}).length, sub: '连亏3笔停手30天' },
-                bt.available
-                    ? { label: '当前配置回测收益', value: fmt.sign(btM.total_return), sub: `${bt.market_filter_mode} · ${bt.pool_info?.n_with_data || '-'}只×${bt.pool_info?.years || '-'}年`, cls: fmt.color(btM.total_return) }
-                    : { label: '当前配置回测', value: '—', sub: '运行 run_full_backtest.py 生成' },
-                bt.available
-                    ? { label: '最大回撤', value: fmt.pct(btM.max_drawdown), sub: '当前配置口径', cls: 'negative' }
-                    : { label: '最大回撤', value: '—', sub: '待回测' },
-                bt.available
-                    ? { label: '胜率 / 盈亏比', value: fmt.pct(btM.win_rate), sub: `盈亏比 ${btM.profit_loss_ratio?.toFixed(2) ?? '-'}` }
-                    : { label: '胜率', value: '—', sub: '待回测' },
             ];
             document.getElementById('metricsGrid').innerHTML = cards.map(c => `
                 <div class="metric-card">
@@ -520,18 +527,23 @@
                 </div>
             `).join('');
 
-            // 持仓表格
+            // 持仓表格（第六轮清单2：名称/现价/市值/浮盈亏/盈亏%，红涨绿跌）
             const tbody = document.querySelector('#positionsTable tbody');
             const positions = acc.positions || [];
             if (positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">空仓</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-muted)">空仓</td></tr>';
             } else {
                 tbody.innerHTML = positions.map(p => `
                     <tr>
                         <td><strong>${esc(p.ts_code)}</strong></td>
+                        <td>${esc(p.name || '-')}</td>
                         <td>${fmt.num(p.volume)}</td>
                         <td>${p.cost?.toFixed(2)}</td>
-                        <td>${p.stop_price ? p.stop_price.toFixed(2) : '-'}</td>
+                        <td>${p.price != null ? p.price.toFixed(2) : '-'}</td>
+                        <td>${p.market_value != null ? fmt.money(p.market_value) : '-'}</td>
+                        <td class="${fmt.ud(p.float_pnl)}">${p.float_pnl != null ? fmt.moneySign(p.float_pnl) : '-'}</td>
+                        <td class="${fmt.ud(p.float_pnl_pct)}">${p.float_pnl_pct != null ? fmt.sign(p.float_pnl_pct) : '-'}</td>
+                        <td>${p.stop_price != null ? p.stop_price.toFixed(2) : '-'}</td>
                         <td>${p.triggered ? '<span class="neg">已触发</span>' : '<span class="pos">监控中</span>'}</td>
                     </tr>
                 `).join('');
@@ -545,7 +557,7 @@
                 </div>
             ` : '';
 
-            // 交易表格
+            // 交易表格（第六轮清单4：pnl/reason 已有数据；A股口径红涨绿跌）
             const trTbody = document.querySelector('#tradesTable tbody');
             const trades = data.recent_trades || [];
             if (trades.length === 0) {
@@ -555,10 +567,10 @@
                     <tr>
                         <td>${esc(String(t.date || '-'))}</td>
                         <td>${esc(t.ts_code)}</td>
-                        <td>${t.side === 'buy' ? '<span class="pos">买入</span>' : '<span class="neg">卖出</span>'}</td>
+                        <td>${t.side === 'buy' ? '<span class="up">买入</span>' : '<span class="dn">卖出</span>'}</td>
                         <td>${t.price?.toFixed(2)}</td>
                         <td>${fmt.num(t.volume)}</td>
-                        <td class="${t.pnl >= 0 ? 'pos' : 'neg'}">${t.pnl ? fmt.money(t.pnl) : '-'}</td>
+                        <td class="${t.pnl != null ? fmt.ud(t.pnl) : ''}">${t.pnl != null ? fmt.moneySign(t.pnl) : '-'}</td>
                         <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.reason || '')}">${esc(t.reason || '-')}</td>
                     </tr>
                 `).join('');

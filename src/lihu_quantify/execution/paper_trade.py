@@ -72,6 +72,8 @@ class PaperBroker(BrokerBase):
         self.trade_day: Optional[object] = None
         self.halted_until: Optional[_date] = None   # 修复F：连亏停手（持久化）
         self._halt_map: dict[str, _date] = {}        # 修复F：按票停手 {ts_code: until}
+        # 修复4(第六轮)：持仓期最高价（移动止盈基准，与回测 portfolio.high_water_mark 同语义）
+        self.high_water_mark: dict[str, float] = {}
         # 行情源（Tushare；None 时用手动 set_price 注入，便于测试）
         self._tushare = tushare_client
         self._store = duckdb_store
@@ -110,6 +112,7 @@ class PaperBroker(BrokerBase):
             "trade_day": str(self.trade_day) if self.trade_day else None,
             "halted_until": str(self.halted_until) if self.halted_until else None,
             "halt_map": {k: str(v) for k, v in self._halt_map.items()},
+            "high_water_mark": dict(self.high_water_mark),   # 修复4(第六轮)
             "positions": {
                 code: {
                     "volume": p.volume, "available": p.available,
@@ -149,6 +152,8 @@ class PaperBroker(BrokerBase):
                 k: _date.fromisoformat(v)
                 for k, v in (state.get("halt_map") or {}).items()
             }
+            # 修复4(第六轮)：恢复高水位（旧状态文件无此字段 → 空 dict，重建即可）
+            self.high_water_mark = dict(state.get("high_water_mark") or {})
             self.positions = {
                 code: _PaperPosition(
                     volume=p.get("volume", 0),
@@ -203,7 +208,7 @@ class PaperBroker(BrokerBase):
 
     # ===== 交易 =====
 
-    def buy(self, ts_code: str, price: float, volume: int) -> OrderResult:
+    def buy(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
         if volume <= 0 or volume % 100 != 0:
             return OrderResult(success=False, msg=f"股数 {volume} 非 100 倍数")
         turnover = price * volume
@@ -221,13 +226,16 @@ class PaperBroker(BrokerBase):
         self.trades.append({
             "order_id": order_id, "ts_code": ts_code, "side": "buy",
             "price": price, "volume": volume, "commission": commission,
+            "reason": reason,        # 修复4(第六轮)：交易记录存原因
             "date": self.trade_day,
         })
+        # 修复4(第六轮)：新仓高水位以成交价起算（同回测 portfolio.apply_fill）
+        self.update_high_water(ts_code, price, save=False)
         logger.info(f"[模拟盘买入] {ts_code} {volume}股 @ {price:.2f}（佣金 {commission:.2f}）")
         self._save_state()   # 修复B：持久化
         return OrderResult(success=True, order_id=order_id, filled_volume=volume, filled_price=price)
 
-    def sell(self, ts_code: str, price: float, volume: int) -> OrderResult:
+    def sell(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
         pos = self.positions.get(ts_code)
         if pos is None or pos.available < volume:
             avail = pos.available if pos else 0
@@ -236,21 +244,35 @@ class PaperBroker(BrokerBase):
         commission = max(turnover * self.COMMISSION_RATE, self.MIN_COMMISSION)
         stamp_tax = turnover * self.STAMP_TAX_RATE
         self.cash += turnover - commission - stamp_tax
+        # 修复4(第六轮)：卖出实现盈亏（减仓前用加权成本，扣卖出双边费用）
+        pnl = (price - pos.cost) * volume - commission - stamp_tax
         pos.volume -= volume
         pos.available -= volume
         if pos.volume <= 0:
             self.positions.pop(ts_code, None)
+            self.high_water_mark.pop(ts_code, None)   # 清仓清理高水位（同回测）
         order_id = f"PB-S-{len(self.trades) + 1}"
         self.trades.append({
             "order_id": order_id, "ts_code": ts_code, "side": "sell",
             "price": price, "volume": volume,
             "commission": commission, "stamp_tax": stamp_tax,
+            "pnl": pnl, "reason": reason,   # 修复4(第六轮)：盈亏+原因（看板交易表）
             "date": self.trade_day,
         })
-        logger.info(f"[模拟盘卖出] {ts_code} {volume}股 @ {price:.2f}（费用 {commission + stamp_tax:.2f}）")
+        logger.info(f"[模拟盘卖出] {ts_code} {volume}股 @ {price:.2f}"
+                    f"（盈亏 {pnl:+.2f}，费用 {commission + stamp_tax:.2f}，原因 {reason or '-'}）")
         self._on_sell_halt_check(ts_code, price)   # 修复F：连亏停手检查
         self._save_state()   # 修复B：持久化
         return OrderResult(success=True, order_id=order_id, filled_volume=volume, filled_price=price)
+
+    def update_high_water(self, ts_code: str, price: float, save: bool = True) -> None:
+        """修复4(第六轮)：更新持仓期最高价（只升不降；变化时持久化）。"""
+        if price is None or price <= 0:
+            return
+        if price > self.high_water_mark.get(ts_code, 0.0):
+            self.high_water_mark[ts_code] = price
+            if save:
+                self._save_state()
 
     def cancel(self, order_id: str) -> OrderResult:
         # 模拟盘即时成交，无撤单概念

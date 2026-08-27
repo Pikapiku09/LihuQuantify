@@ -1,16 +1,20 @@
 """告警器：微信（Server酱）/ 邮件（SMTP）/ 控制台。
 
 第四轮清单1：EmailAlerter（smtplib + SSL，QQ/163 授权码）。
-    - 所有 alert_* 业务方法同时走 Server酱 + 邮件双通道
-    - send_daily_digest：巡检完成后发摘要邮件
+第五轮（邮件通知优化）：每交易日仅一封综合日报邮件。
+    - WARN/INFO 级告警（风控拦截/止损/停手等）不再即时发邮件，
+      全部记入当日告警历史，由日报统一呈现（旧机制每日几十封碎片邮件）
+    - 仅 ERROR（API 异常等系统故障）保留即时邮件（日报发不出时的兜底通知）
+    - send_daily_report：巡检完成后发结构化 HTML 综合日报
+      （账户总览/当前持仓/今日操作/盈亏分析/风险提示，见 monitor/daily_report.py）
     - 邮件发送失败不影响主流程（仅 warning 日志）
 
 触发场景（docs/ARCHITECTURE.md §10.3）：
-    - Checklist 拒绝（风控拦截）
-    - 止损触发
-    - 连亏 3 笔停手
-    - API 异常
-    - 巡检完成摘要（邮件）
+    - Checklist 拒绝（风控拦截）→ 记录进日报
+    - 止损触发 → 记录进日报
+    - 连亏 3 笔停手 → 记录进日报
+    - API 异常 → 即时邮件（ERROR）+ 记录进日报
+    - 巡检完成综合日报（邮件，每日一封）
 
 配置（config/settings.yaml）：
     alert:
@@ -22,7 +26,7 @@
         username: "xxx@qq.com"
         auth_code: ""                # 授权码；.env: LIHU_ALERT__EMAIL__AUTH_CODE 覆盖
         to: ["xxx@qq.com"]
-        send_daily_digest: true
+        send_daily_digest: true      # 每日综合日报邮件（HTML）
 """
 
 from __future__ import annotations
@@ -68,13 +72,19 @@ class EmailAlerter:
         """配置完备性（host/user/auth_code/to 齐全）。"""
         return bool(self.smtp_host and self.username and self.auth_code and self.to)
 
-    def send(self, subject: str, body: str) -> bool:
-        """发送邮件。失败返回 False（不抛异常，不影响主流程）。"""
+    def send(self, subject: str, body: str, html: bool = False) -> bool:
+        """发送邮件。失败返回 False（不抛异常，不影响主流程）。
+
+        Args:
+            subject: 主题
+            body: 正文（html=True 时为 HTML 内容）
+            html: 是否 HTML 邮件（日报用）
+        """
         if not self.ready:
             logger.debug(f"[邮件] 配置不完整，跳过: {subject}")
             return False
         try:
-            msg = MIMEText(body, "plain", "utf-8")
+            msg = MIMEText(body, "html" if html else "plain", "utf-8")
             msg["Subject"] = Header(subject, "utf-8")
             msg["From"] = formataddr(("LihuQuantify", self.username))
             msg["To"] = ", ".join(self.to)
@@ -130,8 +140,9 @@ class Alerter:
         # Server酱微信推送
         if self.serverchan_key:
             self._push_serverchan(title, detail)
-        # 邮件通道（第四轮清单1：仅 warn/error 即时发；info 类进每日摘要）
-        if self.email is not None and level in (LEVEL_WARN, LEVEL_ERROR):
+        # 邮件通道（第五轮：仅 ERROR 系统故障即时发；WARN/INFO 进每日日报，
+        # 确保每交易日只发一封综合简报，避免碎片邮件轰炸）
+        if self.email is not None and level == LEVEL_ERROR:
             subject = f"{_LEVEL_PREFIX.get(level, '')} LihuQuantify: {title}"
             self.email.send(subject, detail or title)
         return True
@@ -153,28 +164,20 @@ class Alerter:
             logger.warning(f"Server酱推送异常: {e}")
         return False
 
-    # ===== 每日摘要（第四轮清单1：巡检完成后邮件） =====
+    # ===== 每日综合日报（第五轮：巡检完成后邮件，每日一封） =====
 
-    def send_daily_digest(self, summary: dict) -> bool:
-        """每日巡检摘要邮件（trade_date/市场状态/信号数/成交/拦截/权益/报告路径）。"""
+    def send_daily_report(self, summary: dict) -> bool:
+        """每日综合日报邮件（HTML 结构化，见 monitor/daily_report.py）。
+
+        模块：账户总览 / 当前持仓 / 今日操作（买入·卖出·拒绝）/ 盈亏分析 /
+        市场与风险提示。summary 为 DailyScanner._scan_impl 的扩展输出。
+        """
         if self.email is None:
             return False
-        executed = summary.get("executed", 0)
-        rejected = summary.get("rejected", 0)
-        executed_n = len(executed) if isinstance(executed, (list, tuple)) else executed
-        rejected_n = len(rejected) if isinstance(rejected, (list, tuple)) else rejected
-        lines = [
-            f"基准日: {summary.get('trade_date', '-')}",
-            f"市场状态: {summary.get('market_state', '-')}",
-            f"信号: {summary.get('signals', 0)} 个 | 成交: {executed_n} 笔"
-            f" | 拦截: {rejected_n} 个",
-            f"总资产: {summary.get('total_asset', 0):,.0f}",
-            f"报告: {summary.get('report', '-')}",
-            "",
-            "以上内容仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。",
-        ]
-        subject = f"📊 LihuQuantify 巡检摘要 {summary.get('trade_date', '')}"
-        return self.email.send(subject, "\n".join(lines))
+        from .daily_report import build_daily_report_email
+
+        subject, html = build_daily_report_email(summary or {})
+        return self.email.send(subject, html, html=True)
 
     # ===== 业务告警便捷方法 =====
 
@@ -195,11 +198,15 @@ class Alerter:
         )
 
     def alert_halt(self, ts_code: str, until) -> bool:
-        """连亏 3 笔停手。"""
+        """连亏 3 笔停手。
+
+        修复3（第五轮清单）：ERROR→WARN。ERROR 会即时发邮件，与"每交易日
+        仅一封日报"冲突；降为 WARN 后归入日报"市场与风险提示"区呈现。
+        """
         return self.send(
             f"连亏停手: {ts_code}",
             f"该票连亏 3 笔，停手至 {until}",
-            level=LEVEL_ERROR,
+            level=LEVEL_WARN,
         )
 
     def alert_api_error(self, api: str, msg: str) -> bool:

@@ -91,7 +91,7 @@ alert:
     username: ""                          # 发件邮箱
     auth_code: ""                         # 授权码（非登录密码）；建议放 .env: LIHU_ALERT__EMAIL__AUTH_CODE
     to: []                                # 收件人列表
-    send_daily_digest: true               # 每日巡检摘要邮件
+    send_daily_digest: true               # 每日综合日报邮件（HTML：持仓/操作/盈亏/风险提示，每日一封）
 
 # 指标自研参数
 indicators:

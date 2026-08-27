@@ -37,12 +37,12 @@ class BrokerBase(ABC):
         """连接/初始化。"""
 
     @abstractmethod
-    def buy(self, ts_code: str, price: float, volume: int) -> OrderResult:
-        """买入（volume 必须 100 倍数）。"""
+    def buy(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
+        """买入（volume 必须 100 倍数）。reason 为交易原因（记录用）。"""
 
     @abstractmethod
-    def sell(self, ts_code: str, price: float, volume: int) -> OrderResult:
-        """卖出。"""
+    def sell(self, ts_code: str, price: float, volume: int, reason: str = "") -> OrderResult:
+        """卖出。reason 为离场原因（止损类型等，记录用）。"""
 
     @abstractmethod
     def cancel(self, order_id: str) -> OrderResult:

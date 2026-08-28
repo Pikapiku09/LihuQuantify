@@ -5,6 +5,8 @@ tushareMcp.json
 # 邮件授权码等
 .env
 *.env.local
+# LLM api key 原始文件（第八轮：Mimo 密钥，已迁移到 .env）
+Mimo.txt
 
 # ===== 运行时状态/数据（本地生成，体积大且含账户状态） =====
 data/

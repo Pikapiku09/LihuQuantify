@@ -354,21 +354,29 @@
                 <span>量化监控看板</span>
             </div>
             <nav>
-                <div class="nav-item active" onclick="showPage('dashboard', this)">
+                <div role="button" tabindex="0" class="nav-item active" onclick="showPage('dashboard', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"/></svg>
                     <span>仪表盘</span>
                 </div>
-                <div class="nav-item" onclick="showPage('reports', this)">
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('reports', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
                     <span>巡检报告</span>
                 </div>
-                <div class="nav-item" onclick="showPage('backtest', this)">
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('backtest', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
                     <span>回测分析</span>
                 </div>
-                <div class="nav-item" onclick="showPage('grid', this)">
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('grid', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
                     <span>网格搜索</span>
+                </div>
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('heatmap', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zM14 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"/></svg>
+                    <span>市场热力图</span>
+                </div>
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('config', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                    <span>系统配置</span>
                 </div>
             </nav>
         </aside>
@@ -439,8 +447,52 @@
                     <div id="gridContent"><div class="loading">加载中</div></div>
                 </div>
             </div>
+
+            <!-- ============ 市场热力图页（第八轮需求2） ============ -->
+            <div class="page" id="page-heatmap">
+                <div class="card">
+                    <div class="card-header" style="flex-wrap:wrap;gap:8px;">
+                        <div class="card-title"><span class="dot" style="background:var(--red)"></span>市场热力图</div>
+                        <div style="display:flex;gap:6px;" id="heatmapDimBtns">
+                            <button class="hm-dim-btn active" data-dim="industry" onclick="switchHeatmapDim('industry', this)">按行业</button>
+                            <button class="hm-dim-btn" data-dim="pct_bucket" onclick="switchHeatmapDim('pct_bucket', this)">按涨跌幅</button>
+                            <button class="hm-dim-btn" data-dim="amount_bucket" onclick="switchHeatmapDim('amount_bucket', this)">按成交额</button>
+                        </div>
+                        <span class="badge" id="heatmapMeta">-</span>
+                    </div>
+                    <p style="margin:0 0 8px;font-size:12px;color:var(--text-muted);">
+                        面积=成交额，颜色=当日涨跌幅（红涨绿跌）；点击行业块下钻，点击个股查看详情。
+                        数据随每日巡检更新（日级），<span id="heatmapRefreshNote"></span>。
+                    </p>
+                    <div id="heatmapChart" style="width:100%;height:560px;"></div>
+                </div>
+            </div>
+
+            <!-- ============ 系统配置页（第八轮） ============ -->
+            <div class="page" id="page-config">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--purple)"></span>系统配置（只读）</div>
+                    </div>
+                    <div id="configContent"><div class="loading">加载中</div></div>
+                </div>
+            </div>
         </main>
     </div>
+
+    <!-- 热力图个股详情弹窗 -->
+    <div id="hmDetailModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;align-items:center;justify-content:center;" onclick="if(event.target===this)closeHmDetail()">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;max-width:640px;width:92%;max-height:80vh;overflow:auto;padding:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <div id="hmDetailTitle" style="font-size:16px;font-weight:600;"></div>
+                <button onclick="closeHmDetail()" style="background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer;">×</button>
+            </div>
+            <div id="hmDetailInfo" style="font-size:13px;color:var(--text-muted);margin-bottom:10px;"></div>
+            <div id="hmDetailTable"></div>
+        </div>
+    </div>
+
+    <script src="/static/vendor/echarts.min.js"></script>
 
     <script>
         // ============ 页面切换 ============
@@ -453,6 +505,8 @@
             if (name === 'reports') loadReports();
             if (name === 'backtest') loadBacktest();
             if (name === 'grid') loadGrid();
+            if (name === 'heatmap') loadHeatmap();
+            if (name === 'config') loadConfig();
         }
 
         // ============ 工具 ============
@@ -803,6 +857,198 @@
                         热力图见 outputs/grid_heatmap_*.png
                     </div>
                 `;
+            } catch (e) {
+                el.innerHTML = '<div class="empty-state">后端未启动</div>';
+            }
+        }
+
+        // ============ 市场热力图（第八轮需求2：日级刷新） ============
+        let hmChart = null, hmDim = 'industry', hmLastDate = null, hmTimer = null;
+
+        // A股红涨绿跌：涨跌幅 → 背景色
+        function hmColor(p) {
+            if (p == null) return '#64748b';
+            const c = Math.min(Math.abs(p) / 8, 1);   // ±8% 封顶饱和
+            if (p > 0) return `rgba(239, 68, 68, ${0.25 + 0.6 * c})`;   // 红
+            if (p < 0) return `rgba(34, 197, 94, ${0.25 + 0.6 * c})`;   // 绿
+            return '#475569';
+        }
+
+        function switchHeatmapDim(dim, btn) {
+            hmDim = dim;
+            document.querySelectorAll('.hm-dim-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            loadHeatmap(true);
+        }
+
+        async function loadHeatmap(force = false) {
+            const el = document.getElementById('heatmapChart');
+            const meta = document.getElementById('heatmapMeta');
+            try {
+                const res = await fetch(`/api/heatmap?dim=${hmDim}`);
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    el.innerHTML = `<div class="empty-state" style="padding:60px 0;">${esc(err.detail || '数据不可用')}</div>`;
+                    meta.textContent = '-';
+                    return;
+                }
+                const d = await res.json();
+                // 日级数据：日期未变且非强制 → 跳过重绘（避免闪动）
+                if (!force && d.trade_date === hmLastDate && hmChart) return;
+                hmLastDate = d.trade_date;
+                meta.textContent = `${d.trade_date} · ${d.count} 只`;
+                renderHeatmap(d);
+                // 自动刷新（X 秒轮询；数据本身随每日巡检更新）
+                if (!hmTimer) {
+                    const seconds = 30;
+                    document.getElementById('heatmapRefreshNote').textContent = `每 ${seconds}s 自动检查更新`;
+                    hmTimer = setInterval(() => loadHeatmap(false), seconds * 1000);
+                }
+            } catch (e) {
+                el.innerHTML = '<div class="empty-state" style="padding:60px 0;">后端未启动</div>';
+            }
+        }
+
+        function renderHeatmap(d) {
+            const el = document.getElementById('heatmapChart');
+            if (typeof echarts === 'undefined') {
+                el.innerHTML = '<div class="empty-state">echarts.min.js 加载失败（web/static/vendor/）</div>';
+                return;
+            }
+            if (!hmChart) {
+                hmChart = echarts.init(el);
+                window.addEventListener('resize', () => hmChart && hmChart.resize());
+            }
+            const data = d.children.map(g => ({
+                name: g.name,
+                value: g.value,
+                avg_pct: g.avg_pct,
+                itemStyle: { color: hmColor(g.avg_pct) },
+                children: (g.children || []).map(l => ({
+                    name: l.name,
+                    code: l.code,
+                    value: l.value,
+                    pct_chg: l.pct_chg,
+                    close: l.close,
+                    itemStyle: { color: hmColor(l.pct_chg) },
+                })),
+            }));
+            hmChart.setOption({
+                backgroundColor: 'transparent',
+                tooltip: {
+                    formatter: info => {
+                        const v = info.data;
+                        if (v.code) {
+                            return `<b>${esc(v.name)}</b> ${esc(v.code)}<br>` +
+                                `涨跌幅：${v.pct_chg != null ? v.pct_chg.toFixed(2) + '%' : '-'}<br>` +
+                                `收盘：${v.close ?? '-'}<br>成交额：${(v.value / 100000).toFixed(2)} 亿`;
+                        }
+                        return `<b>${esc(v.name)}</b><br>` +
+                            `平均涨跌：${v.avg_pct != null ? v.avg_pct.toFixed(2) + '%' : '-'}<br>` +
+                            `成交额合计：${(v.value / 100000000).toFixed(2)} 亿`;
+                    },
+                },
+                series: [{
+                    type: 'treemap',
+                    roam: false, nodeClick: 'zoomToNode',
+                    breadcrumb: { show: true, bottom: 0 },
+                    label: {
+                        show: true, formatter: p => {
+                            const pct = p.data.pct_chg != null ? p.data.pct_chg : p.data.avg_pct;
+                            const pctTxt = pct != null ? `${pct > 0 ? '+' : ''}${pct.toFixed(1)}%` : '';
+                            return `{n|${p.name}}\n{p|${pctTxt}}`;
+                        },
+                        rich: {
+                            n: { fontSize: 11, color: '#fff', fontWeight: 600 },
+                            p: { fontSize: 12, color: '#fff' },
+                        },
+                    },
+                    itemStyle: { borderColor: 'rgba(0,0,0,.35)', borderWidth: 1, gapWidth: 2 },
+                    upperLabel: { show: true, height: 22, color: '#fff' },
+                    levels: [
+                        { itemStyle: { gapWidth: 3 } },
+                        { colorSaturation: [0.3, 0.6] },
+                    ],
+                    data,
+                }],
+            });
+            hmChart.off('click');
+            hmChart.on('click', p => {
+                if (p.data && p.data.code) openHmDetail(p.data.code, p.data.name);
+            });
+        }
+
+        async function openHmDetail(code, name) {
+            const modal = document.getElementById('hmDetailModal');
+            document.getElementById('hmDetailTitle').textContent = `${name || ''}（${code}）`;
+            document.getElementById('hmDetailInfo').textContent = '加载中...';
+            document.getElementById('hmDetailTable').innerHTML = '';
+            modal.style.display = 'flex';
+            try {
+                const res = await fetch(`/api/heatmap/detail?code=${encodeURIComponent(code)}`);
+                if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.status);
+                const d = await res.json();
+                const i = d.info || {};
+                document.getElementById('hmDetailInfo').textContent =
+                    `${i.industry || '未知'}${i.area ? ' · ' + i.area : ''} · ${code}`;
+                document.getElementById('hmDetailTable').innerHTML = `
+                    <div class="table-wrap"><table>
+                        <thead><tr><th>日期</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th><th>涨跌幅</th><th>成交额(亿)</th></tr></thead>
+                        <tbody>${d.bars.map(b => {
+                            const cls = b.pct_chg > 0 ? 'up' : (b.pct_chg < 0 ? 'dn' : '');
+                            return `<tr>
+                                <td>${esc(b.date)}</td>
+                                <td>${b.open ?? '-'}</td><td>${b.high ?? '-'}</td><td>${b.low ?? '-'}</td>
+                                <td class="${cls}">${b.close ?? '-'}</td>
+                                <td class="${cls}">${b.pct_chg != null ? (b.pct_chg > 0 ? '+' : '') + b.pct_chg.toFixed(2) + '%' : '-'}</td>
+                                <td>${b.amount != null ? (b.amount / 100000).toFixed(2) : '-'}</td>
+                            </tr>`;
+                        }).join('')}</tbody>
+                    </table></div>
+                    <p style="margin:8px 0 0;font-size:12px;color:var(--text-muted)">近 10 个交易日（Tushare 日线缓存）</p>`;
+            } catch (e) {
+                document.getElementById('hmDetailInfo').textContent = `详情加载失败：${e.message || e}`;
+            }
+        }
+
+        function closeHmDetail() {
+            document.getElementById('hmDetailModal').style.display = 'none';
+        }
+
+        // ============ 系统配置页（第八轮：只读展示） ============
+        async function loadConfig() {
+            const el = document.getElementById('configContent');
+            try {
+                const res = await fetch('/api/config');
+                const d = await res.json();
+                if (d.error) { el.innerHTML = `<div class="empty-state">${esc(d.error)}</div>`; return; }
+                const section = (title, obj, notes = {}) => `
+                    <h3 style="margin:14px 0 8px;font-size:14px;">${title}</h3>
+                    <div class="table-wrap"><table>
+                        <thead><tr><th>参数</th><th>当前值</th><th>说明</th></tr></thead>
+                        <tbody>${Object.entries(obj).map(([k, v]) => `
+                            <tr><td>${esc(k)}</td><td><code>${esc(String(v))}</code></td>
+                            <td style="color:var(--text-muted)">${esc(notes[k] || '')}</td></tr>`).join('')}
+                        </tbody>
+                    </table></div>`;
+                el.innerHTML =
+                    `<p style="margin:0 0 4px;font-size:13px;color:var(--text-muted)">${esc(d.note || '')}</p>` +
+                    `<p style="margin:0 0 4px;font-size:13px;color:var(--text-muted)">操作日志：${esc(d.log_files || '')}</p>` +
+                    section('智能资金控制（capital_guard）', d.capital_guard || {}, {
+                        enabled: '总开关',
+                        min_cash_threshold: '可用现金低于此值 → 跳过全部买入尝试',
+                        top_n_enabled: '资金紧张时按评分只买前 N 只',
+                        top_n: '候选保留数上限',
+                    }) +
+                    section('热力图（heatmap）', d.heatmap || {}, {
+                        enabled: '总开关', refresh_seconds: '前端轮询间隔（数据为日级）',
+                    }) +
+                    section('调度（scheduler）', d.scheduler || {}, {
+                        daily_scan_cron: '每日巡检时间（cron）', timezone: '时区',
+                    }) +
+                    section('策略（strategy）', d.strategy || {}) +
+                    section('风控（risk）', d.risk || {}) +
+                    `<p style="margin:12px 0 0;font-size:12px;color:var(--text-muted)">初始资金：${d.init_capital ?? '-'}（回测/看板参考口径）</p>`;
             } catch (e) {
                 el.innerHTML = '<div class="empty-state">后端未启动</div>';
             }

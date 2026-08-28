@@ -399,6 +399,249 @@ async def grid():
     return {"grids": results}
 
 
+# ============================================================
+# 第八轮需求2：热力图（日级刷新，基于 DuckDB 巡检缓存）
+# ============================================================
+
+def _pct_bucket(p: float) -> str:
+    if p is None:
+        return "无数据"
+    if p < -5:
+        return "① 大跌 <-5%"
+    if p < -2:
+        return "② 下跌 -5%~-2%"
+    if p < 0:
+        return "③ 微跌 -2%~0"
+    if p < 2:
+        return "④ 微涨 0~2%"
+    if p < 5:
+        return "⑤ 上涨 2~5%"
+    return "⑥ 大涨 ≥5%"
+
+
+def _amount_bucket(a: float) -> str:
+    """amount 单位：千元（Tushare daily 口径）。"""
+    if a is None:
+        return "无数据"
+    if a < 200_000:
+        return "① 冷清 <2亿"
+    if a < 500_000:
+        return "② 温和 2~5亿"
+    if a < 1_000_000:
+        return "③ 活跃 5~10亿"
+    return "④ 放量 ≥10亿"
+
+
+def _heatmap_rows() -> list[dict]:
+    """最新交易日行情：读 data/cache/daily_*.json（巡检取数缓存，日级刷新）。
+
+    同票多缓存文件取最新 bar；行业/名称映射读 DuckDB stock_basic
+    （调度器巡检锁库时降级为"未知"）。
+    """
+    import json as _json
+
+    cache_dir = DATA_DIR / "cache"
+    files = list(cache_dir.glob("daily_*.json"))
+    if not files:
+        return []
+    best: dict[str, dict] = {}
+    for fp in files:
+        try:
+            resp = _json.loads(fp.read_text(encoding="utf-8"))
+            data = (resp.get("data") or {})
+            fields = data.get("fields") or []
+            items = data.get("items") or []
+            if not fields or not items or "trade_date" not in fields:
+                continue
+            idx = {f: i for i, f in enumerate(fields)}
+            latest = max(items, key=lambda r: str(r[idx["trade_date"]]))
+            ts_code = latest[idx["ts_code"]] if "ts_code" in idx else None
+            if not ts_code:
+                continue
+            td = str(latest[idx["trade_date"]])
+            prev = best.get(ts_code)
+            if prev is None or td > prev["trade_date"]:
+                best[ts_code] = {
+                    "trade_date": td,
+                    "close": latest[idx["close"]] if "close" in idx else None,
+                    "pct_chg": latest[idx["pct_chg"]] if "pct_chg" in idx else None,
+                    "amount": latest[idx["amount"]] if "amount" in idx else None,
+                }
+        except Exception:
+            continue
+
+    industry_map: dict[str, tuple] = {}
+    try:
+        import duckdb
+
+        con = duckdb.connect(str(DATA_DIR / "lihu_quant.duckdb"), read_only=True)
+        try:
+            dfb = con.execute(
+                "SELECT ts_code, name, industry FROM stock_basic"
+            ).df()
+        finally:
+            con.close()
+        industry_map = {str(r["ts_code"]): (r["name"], r["industry"])
+                        for _, r in dfb.iterrows()}
+    except Exception:
+        pass
+
+    rows = []
+    for code, b in best.items():
+        name, industry = industry_map.get(code, (code, ""))
+        rows.append({
+            "ts_code": code,
+            "name": name or code,
+            "industry": industry or "未知",
+            "close": b["close"], "pct_chg": b["pct_chg"],
+            "amount": b["amount"], "trade_date": b["trade_date"],
+        })
+    # 只保留最新交易日（陈旧缓存文件剔除，避免混合日期误导）
+    if rows:
+        max_td = max(r["trade_date"] for r in rows)
+        rows = [r for r in rows if r["trade_date"] == max_td]
+    rows.sort(key=lambda r: -(r.get("amount") or 0))
+    return rows
+
+
+@app.get("/api/heatmap")
+async def heatmap(dim: str = "industry"):
+    """热力图 treemap 数据（ECharts children 结构，红涨绿跌由前端着色）。
+
+    维度：industry（行业）| pct_bucket（涨跌幅档）| amount_bucket（成交额档）。
+    数据范围 = 巡检覆盖的股票池（daily_quotes 最新交易日），日级刷新。
+    调度器巡检期间 DuckDB 被锁 → 503（前端提示稍后重试）。
+    """
+    if dim not in ("industry", "pct_bucket", "amount_bucket"):
+        raise HTTPException(400, "dim 须为 industry | pct_bucket | amount_bucket")
+    try:
+        rows = _heatmap_rows()
+    except Exception as e:
+        raise HTTPException(503, f"行情库暂时不可读（调度器巡检中会短暂锁库）：{e}")
+    if not rows:
+        raise HTTPException(503, "行情库为空（等待首次巡检写入）")
+
+    def group_key(r: dict) -> str:
+        if dim == "pct_bucket":
+            return _pct_bucket(r.get("pct_chg"))
+        if dim == "amount_bucket":
+            return _amount_bucket(r.get("amount"))
+        return str(r.get("industry") or "未知")
+
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(group_key(r), []).append(r)
+
+    children = []
+    for gname, items in sorted(groups.items(), key=lambda kv: -sum(i.get("amount") or 0 for i in kv[1])):
+        leaves = [{
+            "name": f"{i['name']}",
+            "code": i["ts_code"],
+            "industry": i["industry"],
+            "value": round(float(i.get("amount") or 0), 1),   # 面积=成交额（千元）
+            "pct_chg": round(float(i["pct_chg"]), 2) if i.get("pct_chg") is not None else None,
+            "close": round(float(i["close"]), 2) if i.get("close") is not None else None,
+        } for i in items]
+        pcts = [l["pct_chg"] for l in leaves if l["pct_chg"] is not None]
+        children.append({
+            "name": gname,
+            "value": round(sum(l["value"] for l in leaves), 1),
+            "avg_pct": round(sum(pcts) / len(pcts), 2) if pcts else None,
+            "children": leaves,
+        })
+    return {
+        "dim": dim,
+        "trade_date": max((r["trade_date"] for r in rows), default=None),
+        "dims": [
+            {"key": "industry", "label": "按行业"},
+            {"key": "pct_bucket", "label": "按涨跌幅"},
+            {"key": "amount_bucket", "label": "按成交额"},
+        ],
+        "count": len(rows),
+        "children": children,
+    }
+
+
+@app.get("/api/heatmap/detail")
+async def heatmap_detail(code: str):
+    """热力图点击 → 个股详情（缓存日线近 10 日 + 基础信息）。"""
+    if not code or "." not in code:
+        raise HTTPException(400, "code 须为 ts_code 格式（如 600000.SH）")
+    import json as _json
+
+    safe_code = code.replace(".", "_")
+    files = sorted((DATA_DIR / "cache").glob(f"daily_{safe_code}_*.json"))
+    if not files:
+        raise HTTPException(404, f"{code} 无本地行情（不在巡检覆盖范围）")
+    # 取文件名 end_date 最大的缓存（最新一次拉取）
+    fp = max(files, key=lambda p: p.stem.split("_")[2] if len(p.stem.split("_")) > 3 else "")
+    try:
+        resp = _json.loads(fp.read_text(encoding="utf-8"))
+        fields = (resp.get("data") or {}).get("fields") or []
+        items = (resp.get("data") or {}).get("items") or []
+    except (json.JSONDecodeError, OSError):
+        raise HTTPException(503, "行情缓存读取失败")
+    if not items:
+        raise HTTPException(404, f"{code} 无行情数据")
+    idx = {f: i for i, f in enumerate(fields)}
+    items.sort(key=lambda r: str(r[idx["trade_date"]]))
+    bars = [{
+        "date": str(r[idx["trade_date"]]),
+        "open": r[idx["open"]] if "open" in idx else None,
+        "high": r[idx["high"]] if "high" in idx else None,
+        "low": r[idx["low"]] if "low" in idx else None,
+        "close": r[idx["close"]] if "close" in idx else None,
+        "pct_chg": r[idx["pct_chg"]] if "pct_chg" in idx else None,
+        "amount": r[idx["amount"]] if "amount" in idx else None,
+    } for r in items[-10:]]
+    # 名称/行业（DuckDB 只读，锁库降级）
+    info = {"ts_code": code, "name": code, "industry": "未知", "area": ""}
+    try:
+        import duckdb
+
+        con = duckdb.connect(str(DATA_DIR / "lihu_quant.duckdb"), read_only=True)
+        try:
+            dfb = con.execute(
+                "SELECT ts_code, name, industry, area FROM stock_basic "
+                "WHERE ts_code = ?", [code]
+            ).df()
+        finally:
+            con.close()
+        if not dfb.empty:
+            r0 = dfb.iloc[0]
+            info = {"ts_code": code, "name": r0["name"] or code,
+                    "industry": r0["industry"] or "未知", "area": r0["area"] or ""}
+    except Exception:
+        pass
+    return {"info": info, "bars": bars}
+
+
+# ============================================================
+# 第八轮：配置展示（只读，脱敏——不含任何 token/密钥）
+# ============================================================
+
+@app.get("/api/config")
+async def config_view():
+    """看板配置页数据（只读展示，修改请编辑 config/settings.yaml 后重启调度器）。"""
+    try:
+        sys.path.insert(0, str(ROOT / "src"))
+        from lihu_quantify.config import get_settings
+
+        st = get_settings(str(ROOT / "config" / "settings.yaml"))
+        cg, hm, sc, stg, rk = (st.capital_guard, st.heatmap,
+                               st.scheduler, st.strategy, st.risk)
+        return {
+            "capital_guard": cg.model_dump(), "heatmap": hm.model_dump(),
+            "scheduler": sc.model_dump(),
+            "strategy": stg.model_dump(), "risk": rk.model_dump(),
+            "init_capital": st.init_capital,
+            "note": "只读展示；修改 config/settings.yaml 后需重启调度器生效。",
+            "log_files": "data/logs/scheduler_YYYYMMDD.log（保留 30 天）",
+        }
+    except Exception as e:
+        return {"error": f"配置读取失败：{e}"}
+
+
 def main():
     """本机直跑默认 127.0.0.1（安全边界，第四轮清单9）。
 

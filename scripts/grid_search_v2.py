@@ -324,11 +324,12 @@ def run_one(data: dict, settings, ma5_dev: float, freshness: int, chasing: float
     }
 
 
-def write_robustness_report(pool_label: str, grid_df: pd.DataFrame, ra: dict, out_dir: Path) -> Path:
+def write_robustness_report(pool_label: str, grid_df: pd.DataFrame, ra: dict, out_dir: Path,
+                            tag: str = "") -> Path:
     """稳健性报告 Markdown。"""
     pool_built_date = date.today()
     lines = [
-        f"# 扩边网格稳健性报告 · {pool_label} 池（含连亏停手）",
+        f"# 扩边网格稳健性报告 · {pool_label} 池（含连亏停手）{tag}",
         "",
         f"> 数据段：训练段 {TRAIN_START} ~ {TRAIN_END}（已消费段，仅做稳健性诊断，不据此选参）",
         f"> 网格：ma5_dev {GRID_MA5_DEV} × freshness {GRID_FRESHNESS} × chasing {GRID_CHASING}"
@@ -404,7 +405,7 @@ def write_robustness_report(pool_label: str, grid_df: pd.DataFrame, ra: dict, ou
         "",
         "以上内容仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。",
     ]
-    out = out_dir / f"grid_v2_{pool_label}_halt_robustness.md"
+    out = out_dir / f"grid_v2_{pool_label}_halt{tag}_robustness.md"
     out.write_text("\n".join(lines), encoding="utf-8")
     logger.info(f"稳健性报告已写入: {out}")
     return out
@@ -417,6 +418,8 @@ def main():
     parser.add_argument("--n", type=int, default=200, help="分层池目标数量")
     parser.add_argument("--layers", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tag", default="",
+                        help="输出文件后缀标签（如 _fix97），避免覆盖既有基线输出")
     args = parser.parse_args()
 
     settings = get_settings(str(ROOT / "config" / "settings.yaml"))
@@ -481,13 +484,13 @@ def main():
                     f"→ ret={m['total_return']:.2%} calmar={m['calmar']:.2f} "
                     f"trades={m['trades']} ({time.time()-t1:.0f}s)")
     grid_df = pd.DataFrame(rows)
-    csv_path = out_dir / f"grid_v2_{pool_label}_halt.csv"
+    csv_path = out_dir / f"grid_v2_{pool_label}_halt{args.tag}.csv"
     grid_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     logger.info(f"网格完成（{time.time()-t0:.0f}s）→ {csv_path.name}")
 
     # ===== 稳健性分析（修复I） =====
     ra = robustness_analysis(grid_df, metric="total_return")
-    report_path = write_robustness_report(pool_label, grid_df, ra, out_dir)
+    report_path = write_robustness_report(pool_label, grid_df, ra, out_dir, tag=args.tag)
 
     # ===== 修复H.2：summary JSON（后端读结构化数据，不再正则抓 MD） =====
     summary = {
@@ -507,7 +510,7 @@ def main():
         "sector_rule": "板块≤40%（修复E，含在口径内）",
         "survivorship_bias": "本池按当前上市股票构建，历史回测收益系统性偏高（乐观口径）",
     }
-    summary_path = out_dir / f"grid_v2_{pool_label}_halt_summary.json"
+    summary_path = out_dir / f"grid_v2_{pool_label}_halt{args.tag}_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     logger.info(f"摘要已写入: {summary_path.name}")
 

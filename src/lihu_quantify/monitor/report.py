@@ -7,6 +7,7 @@
     四、盈亏分析（今日已实现/浮动/累计/持仓盈亏分布）
     五、市场与风险（市场状态/过滤模式/待执行止损/停手票/当日告警）
     六、铁律自检（运行时校验，保留修复G 逻辑）
+    七、资金利用（第八轮：止损回笼/同轮再投资/闲置现金/守卫与 top-N）
 传 rich=None 时回退旧薄版格式（兼容旧调用/测试）。
 
 归档：outputs/reports/YYYY-MM-DD.md
@@ -269,6 +270,39 @@ class ReportGenerator:
         lines.extend(self._iron_rules_check(
             positions, stop_orders, executed, total_asset,
         ))
+
+        # ---- 七、资金利用（需求3/第八轮：先卖后买 + 守卫/top-N 透视） ----
+        cap = rich.get("capital") or {}
+        if cap:
+            lines.append("## 七、资金利用")
+            lines.append("")
+            lines.append("| 指标 | 数值 |")
+            lines.append("|---|---|")
+            lines.append(f"| 今日止损回笼 | {_fmt_money(cap.get('released', 0))} |")
+            lines.append(f"| 同轮再投资 | {_fmt_money(cap.get('reinvested', 0))} |")
+            lines.append(f"| 期末闲置现金 | {_fmt_money(cap.get('idle_cash', 0))} |")
+            lines.append(f"| 常规单笔预算 | {_fmt_money(cap.get('budget', 0))} |")
+            if cap.get("guard_skipped"):
+                lines.append("| 资金守卫 | ⛔ 现金低于阈值，本轮未尝试买入 |")
+            elif cap.get("topn_used"):
+                lines.append(f"| Top-N 筛选 | 保留 {cap['topn_used']} 个"
+                             f"（{cap.get('topn_skipped', 0)} 个未尝试） |")
+            else:
+                lines.append("| 资金守卫 | 未触发 |")
+            lines.append("")
+            if cap.get("idle_warn"):
+                lines.append(f"- ⚠️ 闲置现金 {_fmt_money(cap.get('idle_cash', 0))} 超过 "
+                             f"2 倍单笔预算（{_fmt_money(cap.get('budget', 0))}）："
+                             f"资金利用效率偏低，关注次日买入机会")
+            lines.append("")
+
+        # ---- 八、AI 收盘总结（第八轮清单：纯展示层；None/空 → 整节省略） ----
+        ai_text = rich.get("ai_summary")
+        if ai_text:
+            lines.append("## 八、AI 收盘总结")
+            lines.append("")
+            lines.append(ai_text)
+            lines.append("")
 
         lines.append("---")
         lines.append("以上内容仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。")

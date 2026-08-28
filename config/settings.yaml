@@ -99,3 +99,24 @@ indicators:
   td_sequential_exhaustion: 9            # 9 衰竭点
   divergence_window: 60                  # MACD 背离检测窗口
   divergence_min_window: 36              # 最小窗口（短于此不判背离）
+
+# 智能资金控制（第八轮需求1：仅影响买入尝试的组织方式，不动闸门/铁律/仓位上限）
+capital_guard:
+  enabled: true
+  min_cash_threshold: 5000               # 可用现金低于此值 → 本轮跳过买入（汇总告警，不逐票刷"资金不足"）
+  top_n_enabled: true                    # 资金紧张（过闸信号数 > 可买槽数）时按评分只买前 N 只
+  top_n: 5                               # 候选保留数上限
+
+# 看板热力图（第八轮需求2：日级刷新，基于 DuckDB 巡检缓存，无新增数据源依赖）
+heatmap:
+  enabled: true
+  refresh_seconds: 30                    # 前端轮询间隔（秒）；数据随每日巡检更新
+
+# AI 收盘总结（第八轮清单：纯展示层，绝不参与信号/下单/止损决策）
+# api_key 不写在本文件——.env 注入 LIHU_AI_SUMMARY__API_KEY=sk-xxx，填好后把 enabled 改 true
+ai_summary:
+  enabled: true                          # Mimo key 已入 .env（LIHU_AI_SUMMARY__API_KEY）；改回 false 即整体下线
+  api_base: "https://api.xiaomimimo.com/v1"   # Mimo 自用 api（OpenAI 兼容）；备选 DeepSeek: https://api.deepseek.com
+  model: "mimo-v2.5-pro"                 # 官方 /v1/models 实测 id（小写）；备选 deepseek-chat / qwen-turbo / glm-4-flash
+  timeout: 20                            # 秒；超时静默降级（报告无 AI 段，巡检不受影响）
+  max_chars: 300                         # 总结长度上限

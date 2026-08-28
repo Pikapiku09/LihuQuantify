@@ -17,6 +17,7 @@
     pending_stops: [{ts_code,name,volume,stop_price,reason}] 收盘登记、次日开盘执行
     halted_codes: {ts_code: until_str}
     alerts: [{level,title,detail}]
+    ai_summary: str | None    AI 收盘总结（第八轮清单，纯展示层；None/空 → 整节省略）
 """
 
 from __future__ import annotations
@@ -340,6 +341,55 @@ def _render_risk(d: dict) -> str:
     return _section("五、市场与风险提示", "".join(parts))
 
 
+def _render_capital(d: dict) -> str:
+    """需求3（第八轮）：资金利用效率（先卖后买口径修复 + 守卫/top-N 透视）。
+
+    数据来自 summary["capital"]（scheduler._scan_impl 组装，与 .md 报告同源）。
+    """
+    cap = d.get("capital") or {}
+    if not cap:
+        return ""
+    rows = [
+        [_td("今日止损回笼"), _td(_money(cap.get("released", 0)), num=True)],
+        [_td("同轮再投资"), _td(_money(cap.get("reinvested", 0)), num=True)],
+        [_td("期末闲置现金"), _td(_money(cap.get("idle_cash", 0)), num=True)],
+        [_td("常规单笔预算"), _td(_money(cap.get("budget", 0)), num=True)],
+    ]
+    if cap.get("guard_skipped"):
+        rows.append([_td("资金守卫"),
+                     _td("⛔ 现金低于阈值，本轮未尝试买入")])
+    elif cap.get("topn_used"):
+        rows.append([_td("Top-N 筛选"),
+                     _td(f"保留 {cap['topn_used']} 个（{cap.get('topn_skipped', 0)} 个未尝试）")])
+    else:
+        rows.append([_td("资金守卫"), _td("未触发")])
+    parts = [_table(["指标", "数值"], rows)]
+    if cap.get("idle_warn"):
+        parts.append(
+            f"<p style='margin:8px 0 0;font-size:13px;'>⚠️ 闲置现金 "
+            f"{_esc(_money(cap.get('idle_cash', 0)))} 超过 2 倍单笔预算"
+            f"（{_esc(_money(cap.get('budget', 0)))}）：资金利用效率偏低，"
+            f"关注次日买入机会</p>"
+        )
+    return _section("七、资金利用", "".join(parts))
+
+
+def _render_ai_summary(d: dict) -> str:
+    """第八轮清单：AI 收盘总结（纯展示层；None/空 → 整节省略）。
+
+    文本末尾自带免责声明（SYSTEM_PROMPT 约束），此处灰底引用块展示。
+    """
+    text = (d.get("ai_summary") or "").strip()
+    if not text:
+        return ""
+    body = (
+        '<div style="background:#f1f5f9;border-left:4px solid #94a3b8;'
+        'padding:10px 12px;border-radius:0 6px 6px 0;font-size:13px;'
+        f'color:#1f2937;line-height:1.8;white-space:pre-wrap;">{_esc(text)}</div>'
+    )
+    return _section("八、AI 收盘总结", body)
+
+
 # ===== 主入口 =====
 
 def build_daily_report_email(d: dict) -> tuple[str, str]:
@@ -371,6 +421,8 @@ def build_daily_report_email(d: dict) -> tuple[str, str]:
         _render_operations(d),
         _render_pnl_analysis(d),
         _render_risk(d),
+        _render_capital(d),
+        _render_ai_summary(d),
     ])
 
     report = d.get("report", "")

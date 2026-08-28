@@ -114,7 +114,8 @@ class StopLossManager:
 
         # 5. 移动止盈（修复1）：浮盈后从高水位回撤 3% 离场
         if high_water_mark > position.cost:
-            trail_price = high_water_mark * (1 + self.trailing_pullback)  # 高水位×0.97
+            # 第七轮修复1：原 (1 + trailing_pullback) 为 bug 口径（×1.03 → 浮盈即走），修正为 ×0.97
+            trail_price = high_water_mark * (1 - self.trailing_pullback)  # 高水位×0.97（回撤3%离场）
             if close <= trail_price:
                 return StopAction(
                     kind="trailing_stop",

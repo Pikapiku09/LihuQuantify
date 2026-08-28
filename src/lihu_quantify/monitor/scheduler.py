@@ -18,7 +18,7 @@ from typing import Optional
 import pandas as pd
 from loguru import logger
 
-from ..config import Settings
+from ..config import CapitalGuardConfig, Settings
 from ..data.tushare_client import TushareClient
 from ..data.duckdb_store import DuckDBStore
 from ..indicators.standard import add_all_standard
@@ -27,6 +27,7 @@ from ..risk.checklist import ChecklistGate, CheckContext
 from ..execution.paper_trade import PaperBroker
 from ..execution.oms import OrderManagementSystem
 from ..types import AccountSnapshot, Position
+from .ai_summary import build_ai_summary
 from .alerts import Alerter
 from .report import ReportGenerator
 
@@ -59,6 +60,28 @@ _STOP_REASON_LABEL = {
     "ma_break": "MA10 破位",
     "trailing_stop": "移动止盈",   # 修复4(第六轮)
 }
+
+
+def _signal_score(bar) -> float:
+    """需求1（第八轮）：信号质量代理评分（0~1，仅用于资金紧张时的 top-N 排序）。
+
+    透明公式（非策略参数，不参与闸门判定与回测）：
+        40% 量比强度（vol_ratio 截断 3.0）
+        30% 实体占比（body_ratio）
+        30% 金叉新鲜度（ma5_x_ma10，越新鲜得分越高，7 天为 0）
+    依据 CherryClaw 三层过滤的三个连续度量做等权代理，无隐藏拟合。
+    """
+    try:
+        vol_ratio = float(bar.get("vol_ratio") or 0)
+        body = float(bar.get("body_ratio") or 0)
+        # fresh=0（金叉当日）合法值，不能用 or 回退（0 为 falsy）
+        raw_fresh = bar.get("ma5_x_ma10")
+        fresh = float(raw_fresh) if raw_fresh is not None else 7.0
+    except (TypeError, ValueError):
+        return 0.0
+    return (0.4 * min(max(vol_ratio, 0.0), 3.0) / 3.0
+            + 0.3 * min(max(body, 0.0), 1.0)
+            + 0.3 * (1 - min(max(fresh, 0.0), 7.0) / 7.0))
 
 
 def _build_daily_summary(
@@ -433,7 +456,9 @@ class DailyScanner:
             sig = strategy.latest_signal(df)
             if sig is not None:
                 df_ind = add_all_standard(df)
-                signals.append((sig, df_ind.iloc[-1]))
+                last_ind = df_ind.iloc[-1]
+                # 需求1（第八轮）：信号评分（资金紧张时 top-N 排序用）
+                signals.append((sig, last_ind, _signal_score(last_ind)))
         logger.info(f"[巡检] 扫描信号 {len(signals)} 个")
 
         # 市场参考信号（修复A：reduce=非上涨段仓位减半；block=禁止）
@@ -445,69 +470,112 @@ class DailyScanner:
 
         executed, rejected = [], []
         gate = ChecklistGate(chasing_high_threshold=s.chasing_high_threshold)
+        # ---- 需求3（第八轮）：先卖后买（口径修复） ----
+        # 回测引擎日循环 = 撮合 T-1 卖单（T 开盘）→ T 收盘买入；
+        # 纸面原顺序"买入→卖出"导致止损回笼资金闲置一天，先执行待执行止损。
+        executed_stops = self._execute_pending_stops(latest)
         asset = self.broker.query_asset()
         total_asset = asset.get("total_asset", 0)
+        cash = asset.get("cash", 0)
 
         block_mode = s.market_filter and market_state != "上涨" and s.market_filter_mode == "block"
         reduce_scale = 0.5 if (s.market_filter and market_state != "上涨"
                                and s.market_filter_mode == "reduce") else 1.0
         held = {p.ts_code for p in self.broker.query_positions()}
-        if not block_mode:
-            for sig, last_bar in signals:
-                if sig.ts_code in held:
-                    continue   # 已持仓不重复买
-                # 修复F：连亏停手检查
-                if getattr(self.broker, "is_halted", None) and self.broker.is_halted(
-                    sig.ts_code, today=latest
-                ):
-                    rejected.append({"ts_code": sig.ts_code,
-                                     "name": name_map.get(sig.ts_code, ""),
-                                     "price": float(last_bar["close"]),
-                                     "reasons": "铁律F：连亏3笔停手期内"})
-                    self.alerter.alert_halt(sig.ts_code, "停手期内")
-                    continue
-                # 修复E：执行价一律用最新交易日收盘
-                price = float(last_bar["close"])
-                invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * reduce_scale
-                volume = int(invest / price / 100) * 100
-                if volume < 100:
-                    continue
-                snapshot = self._snapshot()
-                # 修复C：板块传入（同板块 ≤40% 校验生效）
-                check_ctx = CheckContext(
-                    current_price=price,
-                    ma10=float(last_bar.get("ma10", 0)) if pd.notna(last_bar.get("ma10")) else 0.0,
-                    sector=sector_map.get(sig.ts_code, ""),
-                    invest_amount=invest,
-                )
-                result = gate.check(sig, snapshot, check_ctx)
-                if not result.approved:
-                    reasons = "、".join(
-                        f"{i.name}({i.reason})" for i in result.rejected_items()
-                    )
-                    rejected.append({"ts_code": sig.ts_code,
-                                     "name": name_map.get(sig.ts_code, ""),
-                                     "price": price, "reasons": reasons})
-                    self.alerter.alert_checklist_reject(sig.ts_code, reasons)
-                    continue
-                buy_result, stop = oms.place_buy_with_stop(sig, volume, price)
-                if buy_result.success and stop:
-                    executed.append({
-                        "ts_code": sig.ts_code,
-                        "name": name_map.get(sig.ts_code, ""),
-                        "volume": volume, "price": price, "stop": stop.stop_price,
-                    })
-                    self.alerter.alert_bought(sig.ts_code, volume, price, stop.stop_price)
-                elif not buy_result.success:
-                    rejected.append({"ts_code": sig.ts_code,
-                                     "name": name_map.get(sig.ts_code, ""),
-                                     "price": price, "reasons": buy_result.msg})
-                    self.alerter.alert_checklist_reject(sig.ts_code, buy_result.msg)
+        # 需求1（第八轮）：资金守卫与 top-N 筛选配置
+        # isinstance 守卫：MagicMock settings（测试）/异常配置 → 不启用
+        cg = getattr(self.settings, "capital_guard", None)
+        cg_enabled = isinstance(cg, CapitalGuardConfig) and cg.enabled
+        budget = r.max_single_position * total_asset * reduce_scale   # 常规单笔投入
+        guard_skipped = False
+        topn_used, topn_skipped = 0, 0
 
-        # 止损检查（修复D：收盘判断→次日开盘执行，与回测口径对齐）
-        # 修复2（第五轮清单）：on_new_day 已移至 _scan_impl 开头（买入前），
-        # 此处直接处理待执行/新登记。
-        executed_stops, new_pending = self._check_stops_with_alert(oms, latest)   # 第五轮：日报数据
+        if not block_mode:
+            # ---- 需求1：可用资金过低 → 本轮跳过全部买入尝试（汇总一条） ----
+            if cg_enabled and cash < cg.min_cash_threshold:
+                guard_skipped = True
+                msg = (f"资金守卫：可用现金 {cash:,.0f} 低于阈值 "
+                       f"{cg.min_cash_threshold:,.0f}，本轮跳过 {len(signals)} 个买入尝试")
+                logger.info(f"[资金守卫] 现金 {cash:,.0f} < {cg.min_cash_threshold:,.0f}，"
+                            f"跳过 {len(signals)} 个买入尝试")
+                self.alerter.alert_checklist_reject("资金守卫", msg)
+                rejected.append({"ts_code": "-", "name": "资金守卫",
+                                 "price": 0, "reasons": msg})
+            else:
+                # 预筛（已持仓/停手期）——闸门与下单仍逐票实时执行（行为兼容）
+                candidates: list[tuple] = []   # (score, idx, sig, last_bar)
+                for idx, (sig, last_bar, score) in enumerate(signals):
+                    if sig.ts_code in held:
+                        continue   # 已持仓不重复买
+                    # 修复F：连亏停手检查
+                    if getattr(self.broker, "is_halted", None) and self.broker.is_halted(
+                        sig.ts_code, today=latest
+                    ):
+                        rejected.append({"ts_code": sig.ts_code,
+                                         "name": name_map.get(sig.ts_code, ""),
+                                         "price": float(last_bar["close"]),
+                                         "reasons": "铁律F：连亏3笔停手期内"})
+                        self.alerter.alert_halt(sig.ts_code, "停手期内")
+                        continue
+                    candidates.append((score, idx, sig, last_bar))
+
+                # ---- 需求1：资金紧张 → top-N 筛选（按评分只尝试前 N 个） ----
+                slots = int(cash // budget) if budget > 0 else 0
+                if (cg_enabled and cg.top_n_enabled and 0 < cg.top_n < len(candidates)
+                        and len(candidates) > slots):
+                    candidates.sort(key=lambda x: (-x[0], x[1]))   # 评分降序，同分按信号顺序
+                    topn_skipped = len(candidates) - cg.top_n
+                    candidates = candidates[:cg.top_n]
+                    topn_used = len(candidates)
+                    msg = (f"Top-N 筛选：过预筛 {topn_used + topn_skipped} 个 > "
+                           f"可买 {slots} 槽（现金 {cash:,.0f}），按评分保留前 "
+                           f"{topn_used} 个，{topn_skipped} 个未尝试")
+                    logger.info(f"[Top-N] {msg}")
+                    rejected.append({"ts_code": "-", "name": "Top-N 筛选",
+                                     "price": 0, "reasons": msg})
+
+                for score, idx, sig, last_bar in candidates:
+                    # 修复E：执行价一律用最新交易日收盘
+                    price = float(last_bar["close"])
+                    invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * reduce_scale
+                    volume = int(invest / price / 100) * 100
+                    if volume < 100:
+                        continue
+                    snapshot = self._snapshot()
+                    # 修复C：板块传入（同板块 ≤40% 校验生效）
+                    check_ctx = CheckContext(
+                        current_price=price,
+                        ma10=float(last_bar.get("ma10", 0)) if pd.notna(last_bar.get("ma10")) else 0.0,
+                        sector=sector_map.get(sig.ts_code, ""),
+                        invest_amount=invest,
+                    )
+                    result = gate.check(sig, snapshot, check_ctx)
+                    if not result.approved:
+                        reasons = "、".join(
+                            f"{i.name}({i.reason})" for i in result.rejected_items()
+                        )
+                        rejected.append({"ts_code": sig.ts_code,
+                                         "name": name_map.get(sig.ts_code, ""),
+                                         "price": price, "reasons": reasons})
+                        self.alerter.alert_checklist_reject(sig.ts_code, reasons)
+                        continue
+                    buy_result, stop = oms.place_buy_with_stop(sig, volume, price)
+                    if buy_result.success and stop:
+                        executed.append({
+                            "ts_code": sig.ts_code,
+                            "name": name_map.get(sig.ts_code, ""),
+                            "volume": volume, "price": price, "stop": stop.stop_price,
+                        })
+                        self.alerter.alert_bought(sig.ts_code, volume, price, stop.stop_price)
+                    elif not buy_result.success:
+                        rejected.append({"ts_code": sig.ts_code,
+                                         "name": name_map.get(sig.ts_code, ""),
+                                         "price": price, "reasons": buy_result.msg})
+                        self.alerter.alert_checklist_reject(sig.ts_code, buy_result.msg)
+
+        # 止损收盘判定（修复D：收盘判断→次日开盘执行，与回测口径对齐）
+        # 需求3（第八轮）：执行已在买入前完成（先卖后买），此处只做新登记
+        new_pending = self._register_new_stops(oms, latest)
 
         # 报告归档 + 日报数据聚合
         positions = self.broker.query_positions()
@@ -531,6 +599,30 @@ class DailyScanner:
             mode=self.mode,
             alerts=self.alerter.history[hist_start:],
         )
+        # ---- 需求3（第八轮）：资金利用效率数据（.md 报告与邮件日报共用） ----
+        summary["capital"] = {
+            # 今日止损执行回笼金额（毛额，今日开盘价 × 股数）
+            "released": round(sum(
+                (st.get("open_price") or 0) * (st.get("volume") or 0)
+                for st in executed_stops), 2),
+            # 同轮再投资金额（先卖后买顺序修复后，当日回笼资金即可复用）
+            "reinvested": round(sum(
+                (e.get("price") or 0) * (e.get("volume") or 0)
+                for e in executed), 2),
+            "idle_cash": summary.get("cash", 0),          # 期末闲置现金
+            "budget": round(budget, 2),                   # 常规单笔投入
+            "idle_warn": bool(budget > 0 and summary.get("cash", 0) > 2 * budget),
+            "guard_skipped": guard_skipped,               # 资金守卫触发（本轮未尝试买入）
+            "topn_used": topn_used,                       # top-N 实际保留数（0=未启用）
+            "topn_skipped": topn_skipped,                 # top-N 未尝试数
+        }
+        # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
+        #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
+        #      结果随 last_scan.json 持久化） ----
+        summary["ai_summary"] = build_ai_summary(
+            summary, getattr(self.settings, "ai_summary", None),
+            getattr(getattr(self.settings, "ai_summary", None), "api_key", ""),
+        )
         stop_orders = [
             {"ts_code": st.ts_code, "stop_price": st.stop_price,
              "volume": st.volume, "triggered": st.triggered}
@@ -549,7 +641,7 @@ class DailyScanner:
                 for p in positions
             ],
             signals=[{"ts_code": s_.ts_code, "price": s_.suggested_price, "reason": s_.reason}
-                     for s_, _ in signals],
+                     for s_, _, _sc in signals],
             executed=executed,
             rejected=rejected,
             stop_orders=stop_orders,
@@ -634,28 +726,28 @@ class DailyScanner:
     def _check_stops_with_alert(
         self, oms: OrderManagementSystem, latest: date
     ) -> tuple[list[dict], list[dict]]:
-        """止损检查（修复D：与回测口径对齐）。
+        """止损检查（修复D：与回测口径对齐）。第八轮拆分为两个子步骤：
 
-        口径（三处统一，写入文档）：
-            回测   = 当日收盘判断 → 次日开盘成交
-            模拟盘 = 当日收盘判断 → 记入待执行 → 次日开盘价成交（本方法）
-            实盘   = 盘中条件单（OMS monitor_loop）
+            _execute_pending_stops  执行昨日登记（今日开盘价卖出）
+            _register_new_stops     今日收盘判定（价格/MA10/移动止盈）
 
-        修复D 新增：
-            1. 待执行队列（今日收盘触发 → 次日 scan 的开盘价执行）
-            2. MA10 破位检查（收盘 < MA10 → ma_break 离场，与 stop_loss.py 一致）
+        保留本方法作为兼容包装（第六轮测试及旧调用）。
+        """
+        executed_stops = self._execute_pending_stops(latest)
+        new_pending = self._register_new_stops(oms, latest)
+        return executed_stops, new_pending
 
-        第五轮：返回 (今日执行的止损列表, 今日新登记的待执行列表) 供日报渲染。
-        修复4(第六轮)：
-            1. 待执行执行时把原因传给 broker.sell（交易记录存 pnl/reason）
-            2. 第二步先更新高水位，再增加移动止盈判定（浮盈后从高水位回撤
-               trailing_profit_pullback(默认3%) → trailing_stop 待执行），
-               语义与 risk/stop_loss.py 的移动止盈注释口径一致（高水位×0.97）
+    def _execute_pending_stops(self, latest: date) -> list[dict]:
+        """需求3（第八轮）：执行昨日登记的待执行止损（用今日开盘价）。
+
+        顺序修复（先卖后买）：回测引擎日循环为"撮合 T-1 卖单（T 开盘成交）
+        → T 收盘买入"，纸面原顺序"买入 → 卖出"导致当日止损回笼资金
+        无法用于同轮买入（2026-08-27 曾因"可用 4429"拒绝 44 个信号、
+        48k 资金闲置一天）。本方法移至买入循环之前调用，与回测口径对齐。
         """
         pending_file = _ROOT / "data" / "pending_stops.json"
         executed_stops: list[dict] = []   # 今日开盘执行的止损
 
-        # ---- 第一步：执行昨日登记的待执行止损（用今日开盘价） ----
         if pending_file.exists():
             try:
                 import json
@@ -696,13 +788,24 @@ class DailyScanner:
                 pending_file.write_text("[]", encoding="utf-8")
             except OSError:
                 pass
+        return executed_stops
 
-        # ---- 第二步：今日收盘判断（价格止损 + MA10 破位 + 移动止盈） ----
-        # 口径对齐（live 补充）：当日新买入的持仓不做当日收盘判定。
-        # 回测中 T+1 开盘成交的仓位首次止损判定在 T+1 收盘（信号日次一 bar）；
-        # 模拟盘 T 收盘成交 → 首次判定同样在 T+1 收盘。
-        # （否则策略允许的"收盘乖离 MA5 -5%"入场票会被信号日 MA10 在上方
-        #   而即时标记卖出，产生回测中不存在的当日 churn。）
+    def _register_new_stops(
+        self, oms: OrderManagementSystem, latest: date
+    ) -> list[dict]:
+        """今日收盘判断（价格止损 + MA10 破位 + 移动止盈）→ 登记明日待执行。
+
+        口径对齐（live 补充）：当日新买入的持仓不做当日收盘判定。
+        回测中 T+1 开盘成交的仓位首次止损判定在 T+1 收盘（信号日次一 bar）；
+        模拟盘 T 收盘成交 → 首次判定同样在 T+1 收盘。
+        （否则策略允许的"收盘乖离 MA5 -5%"入场票会被信号日 MA10 在上方
+          而即时标记卖出，产生回测中不存在的当日 churn。）
+
+        修复4(第六轮)：移动止盈——先更新高水位，再按
+        trailing_profit_pullback(默认3%) 判定（高水位×0.97，与
+        risk/stop_loss.py 第七轮修正后口径一致）。
+        """
+        pending_file = _ROOT / "data" / "pending_stops.json"
         buys_today = set()
         for t in getattr(self.broker, "trades", []) or []:
             if t.get("side") == "buy" and str(t.get("date", ""))[:10] == str(latest)[:10]:
@@ -774,7 +877,7 @@ class DailyScanner:
                 )
             except OSError as e:
                 logger.warning(f"待执行止损写入失败: {e}")
-        return executed_stops, new_pending
+        return new_pending
 
     def _fetch_open(self, ts_code: str, trade_date: date) -> float:
         """取指定日开盘价（Tushare daily）。"""

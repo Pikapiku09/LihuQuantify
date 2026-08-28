@@ -103,6 +103,45 @@ class IndicatorsConfig(BaseModel):
     divergence_min_window: int = 36
 
 
+class CapitalGuardConfig(BaseModel):
+    """第八轮需求1：智能资金控制（买入阶段的资金守卫与 top-N 筛选）。
+
+    仅影响买入尝试的组织方式，不改变闸门/铁律/仓位上限本身：
+      - cash < min_cash_threshold       → 本轮跳过全部买入尝试（一条汇总告警，
+                                           不再产生逐票"资金不足"噪音拒绝）
+      - 过闸信号数 > 可买槽数（cash/单笔预算）且 top_n_enabled
+                                        → 按信号评分排序，只买前 top_n 只
+    """
+    enabled: bool = True
+    min_cash_threshold: float = 5000.0   # 可用现金低于此值 → 跳过买入
+    top_n_enabled: bool = True           # 资金紧张时启用 top-N 筛选
+    top_n: int = 5                       # 保留的候选数量上限
+
+
+class HeatmapConfig(BaseModel):
+    """第八轮需求2：看板热力图（日级刷新，基于 DuckDB 巡检缓存）。"""
+    enabled: bool = True
+    refresh_seconds: int = 30            # 前端轮询间隔（数据本身为日级）
+
+
+class AiSummaryConfig(BaseModel):
+    """第八轮清单（AI 收盘总结）：LLM 生成日报总结段（纯展示层）。
+
+    硬边界：AI 输出仅用于 .md 报告与邮件日报展示，绝不参与信号/下单/
+    止损/风控决策；enabled=false 或 api_key 为空时零调用、零侵入。
+    api_key 不入 yaml（settings.yaml 无此键），仅经环境变量注入：
+        .env: LIHU_AI_SUMMARY__API_KEY=sk-xxx（pydantic 嵌套 env 覆盖）
+    """
+    enabled: bool = False                # 填好 key 后开 true；默认关 = 零侵入
+    api_base: str = "https://api.xiaomimimo.com/v1"   # OpenAI 兼容端点
+    model: str = "mimo-v2.5-pro"         # 选型：Mimo 自用 api（官方 id 小写；备选 DeepSeek
+                                         # api.deepseek.com/deepseek-chat、
+                                         # qwen-turbo、glm-4-flash，换模型只改这两项）
+    api_key: str = ""                    # 仅 .env 注入，绝不进 git/yaml
+    timeout: int = 20                    # 秒（超时静默降级，不阻断巡检）
+    max_chars: int = 300                 # 总结长度上限
+
+
 class Settings(BaseSettings):
     """全局配置。环境变量 LIHU_ 前缀覆盖 YAML。"""
 
@@ -123,6 +162,9 @@ class Settings(BaseSettings):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     indicators: IndicatorsConfig = Field(default_factory=IndicatorsConfig)
+    capital_guard: CapitalGuardConfig = Field(default_factory=CapitalGuardConfig)
+    heatmap: HeatmapConfig = Field(default_factory=HeatmapConfig)
+    ai_summary: AiSummaryConfig = Field(default_factory=AiSummaryConfig)
     alert: AlertConfig = Field(default_factory=AlertConfig)
 
     init_capital: float = 100000.0

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..types import AccountSnapshot, ChecklistItem, ChecklistResult, Signal
+from .limits import MAX_SECTOR_POSITION, MAX_SINGLE_POSITION
 
 
 @dataclass
@@ -37,8 +38,8 @@ class CheckContext:
 class ChecklistGate:
     """8 项强制闸门。"""
 
-    MAX_SINGLE_PCT = 0.25
-    MAX_SECTOR_PCT = 0.40
+    MAX_SINGLE_PCT = MAX_SINGLE_POSITION   # P2-9-3：常量收敛 → risk/limits.py（读 settings.risk）
+    MAX_SECTOR_PCT = MAX_SECTOR_POSITION
 
     def __init__(self, chasing_high_threshold: float = 0.08):
         """追高阈值可配置（修复4：网格搜索需要）。
@@ -71,7 +72,13 @@ class ChecklistGate:
     def _check_position(
         self, signal: Signal, account: AccountSnapshot, ctx: CheckContext
     ) -> ChecklistItem:
-        """1. 仓位预算 ≤25%。"""
+        """1. 仓位预算 ≤25%。
+
+        P0-6（第十一轮）：占比 = (该票存量市值 + 本笔投入) / 总资产——
+        与 risk/position_limit.py 的 `existing_mv + invest` 口径一致（该处
+        为单一事实来源）。旧逻辑只校验本笔，分批加仓每笔都 ≤25% 放行，
+        累计可远超上限（口径漏洞，恢复铁律既有语义）。
+        """
         if account.total_asset <= 0 or ctx.invest_amount <= 0:
             return ChecklistItem(
                 name="仓位预算",
@@ -79,13 +86,23 @@ class ChecklistGate:
                 value="未知",
                 reason="账户总资产/拟投入金额未提供，无法计算占比",
             )
-        pct = ctx.invest_amount / account.total_asset
+        existing_mv = sum(
+            p.market_value for p in account.positions
+            if p.ts_code == signal.ts_code and p.volume > 0
+        )
+        pct = (existing_mv + ctx.invest_amount) / account.total_asset
         approved = pct <= self.MAX_SINGLE_PCT
+        if existing_mv > 0:
+            value = (f"存量 {existing_mv / account.total_asset:.1%} + "
+                     f"本笔 {ctx.invest_amount / account.total_asset:.1%} "
+                     f"= {pct:.1%}（上限25%）")
+        else:
+            value = f"{pct:.1%}（上限25%）"
         return ChecklistItem(
             name="仓位预算",
             approved=approved,
-            value=f"{pct:.1%}（上限25%）",
-            reason="通过" if approved else f"占比 {pct:.1%} 超过 25%",
+            value=value,
+            reason="通过" if approved else f"含存量合计 {pct:.1%} 超过 25%",
         )
 
     def _check_sector(
@@ -212,7 +229,18 @@ class ChecklistGate:
         )
 
     def _check_psychology(self, account: AccountSnapshot) -> ChecklistItem:
-        """8. 心理门禁。"""
+        """8. 心理门禁。
+
+        P0-5（第十一轮）：None = 无数据来源 → "未知"分支（不拦截但标注，
+        不得伪造为通过）；True = 存在情绪信号 → 拒绝。
+        """
+        if account.psychology_alert is None:
+            return ChecklistItem(
+                name="心理门禁",
+                approved=True,
+                value="未知",
+                reason="无心理状态数据来源，未拦截（开仓前请自查情绪信号）",
+            )
         if account.psychology_alert:
             return ChecklistItem(
                 name="心理门禁",

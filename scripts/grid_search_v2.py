@@ -186,6 +186,9 @@ def fetch_pool_data(client: TushareClient, store: DuckDBStore, codes: list[str],
         if df.empty or len(df) < 60:
             continue
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        # 第十一轮 P1-1：前复权（除权日 MA/止损/盈亏口径修正）
+        from lihu_quantify.data.adjustment import adjust_from_store
+        df = adjust_from_store(client, store, code, df, start - timedelta(days=90), end)
         data[code] = df.sort_values("trade_date").reset_index(drop=True)
         if (i + 1) % 50 == 0:
             logger.info(f"[取数] {i+1}/{len(codes)}")
@@ -527,7 +530,7 @@ def main():
     if ra["orig_nb_vals"]:
         print(f"  邻域收益: {min(ra['orig_nb_vals']):.2%} ~ {max(ra['orig_nb_vals']):.2%}"
               f"（全正: {'是' if all(v > 0 for v in ra['orig_nb_vals']) else '否'}）")
-    print(f"\n判定: {'✅ 原参数稳健' if ra['orig_robust'] else '⚠️ 原参数不稳健'}")
+    print(f"\n判定: {'[YES] 原参数稳健' if ra['orig_robust'] else '[NO] 原参数不稳健'}")
     print(f"报告: {report_path}")
     print("\n统计纪律: 本轮为诊断性使用，不据此选参（三数据段已消费，见 docs/决策日志.md）")
     print("\n以上内容仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。")

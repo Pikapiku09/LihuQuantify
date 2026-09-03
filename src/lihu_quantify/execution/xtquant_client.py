@@ -36,6 +36,9 @@ class MiniQMTClient(BrokerBase):
         self._xttrader = None
         self._xtacc = None
         self._connected = False
+        # P2-9-10：取价守卫——连续失败计数（未订阅行情源时 xtdata 静默返回 0）
+        self._price_fail_streak = 0
+        self._price_fail_threshold = 3
 
     def _import_xtquant(self):
         """延迟导入 xtquant，给出清晰错误提示。"""
@@ -177,17 +180,34 @@ class MiniQMTClient(BrokerBase):
             return {"cash": 0, "total_asset": 0, "market_value": 0}
 
     def get_price(self, ts_code: str) -> float:
-        """查最新价（xtdata 行情）。"""
+        """查最新价（xtdata 行情）。
+
+        P2-9-10：未订阅行情源时 xtdata 静默返回 0——连续 N 次取价失败
+        提升为 ERROR 告警（提醒人工检查订阅/客户端状态），但每次仍返回 0，
+        由上层风控（无价不操作）兜底；连续成功则清零计数。
+        """
         try:
             from xtquant import xtdata
             data = xtdata.get_market_data_ex(
                 ["close"], [ts_code], period="tick", count=1
             )
             if ts_code in data and not data[ts_code].empty:
+                self._price_fail_streak = 0
                 return float(data[ts_code]["close"].iloc[-1])
+            self._price_fail_streak += 1
+            if self._price_fail_streak >= self._price_fail_threshold:
+                logger.error(
+                    f"[QMT取价守卫] 连续 {self._price_fail_streak} 次取不到 {ts_code} 收盘价"
+                    f"——请确认已订阅该标的行情源 / QMT 客户端在线"
+                )
             return 0.0
         except Exception as e:
-            logger.warning(f"获取 {ts_code} 最新价失败: {e}")
+            self._price_fail_streak += 1
+            if self._price_fail_streak >= self._price_fail_threshold:
+                logger.error(
+                    f"[QMT取价守卫] 连续 {self._price_fail_streak} 次获取 {ts_code} 最新价失败"
+                    f"（{e}）——请检查 QMT 客户端状态"
+                )
             return 0.0
 
     def close(self) -> None:

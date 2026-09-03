@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -24,67 +23,24 @@ from loguru import logger
 from lihu_quantify.config import get_settings
 from lihu_quantify.data.tushare_client import TushareClient
 from lihu_quantify.data.duckdb_store import DuckDBStore
-from lihu_quantify.strategy.cherry_claw import CherryClaw
 from lihu_quantify.risk.checklist import ChecklistGate, CheckContext
 from lihu_quantify.execution.paper_trade import PaperBroker
 from lihu_quantify.execution.oms import OrderManagementSystem
-from lihu_quantify.indicators.standard import add_all_standard
-from run_backtest import classify_market_state
 
 
-def scan_universe(client: TushareClient, store: DuckDBStore, n: int = 50, days: int = 120):
-    """收盘后扫描股票池，返回 (带信号标的列表, market_states, idx_df)。"""
-    basic = client.query("stock_basic", {"list_status": "L"})
-    if basic.empty:
-        return [], {}, None
-    store.upsert("stock_basic", basic, date_cols=("list_date", "delist_date"))
-    dfb = basic.copy()
-    mask = (
-        ~dfb["ts_code"].str.startswith("688")
-        & ~dfb["ts_code"].str.startswith("300")
-        & ~dfb["ts_code"].str.startswith("301")
-    )
-    if "name" in dfb.columns:
-        mask &= ~dfb["name"].str.contains("ST", na=False)
-    codes = dfb[mask].sort_values("ts_code")["ts_code"].head(n).tolist()
+def scan_universe(n: int = 50, days: int = 120):
+    """收盘后扫描股票池：复用 DailyScanner.collect_signals（P2-9-6）。
 
-    idx = client.query("index_daily", {"ts_code": "000001.SH", "end_date": "20301231"})
-    store.upsert("index_daily", idx)
-    latest = store.get_latest_trade_date()
-    start = latest - timedelta(days=days)
-    logger.info(f"扫描基准日（真实最新交易日）: {latest}")
+    返回 (signals, market_states, None)。signals=[(sig, last_ind), ...]，
+    market_states 仅含 {latest: 当日市场状态}（供市场过滤判断用）。
+    此前的重复 scan_universe（股票池/参数/信号生成）已收敛到 DailyScanner 单一实现。
+    """
+    from lihu_quantify.monitor.scheduler import DailyScanner
 
-    idx_df = idx.copy()
-    idx_df["trade_date"] = pd.to_datetime(idx_df["trade_date"], format="%Y%m%d").dt.date
-    idx_df = idx_df[idx_df["trade_date"] <= latest].sort_values("trade_date").reset_index(drop=True)
-    market_states = classify_market_state(idx_df)
-    state_today = market_states.get(latest, "未知")
-    logger.info(f"当前市场状态: {state_today}（过滤={'放行' if state_today == '上涨' else '拦截新开仓'}）")
-
-    strategy = CherryClaw()  # 参数由调用方传入
-    signals = []
-    for i, code in enumerate(codes):
-        try:
-            df = client.query("daily", {
-                "ts_code": code,
-                "start_date": start.strftime("%Y%m%d"),
-                "end_date": latest.strftime("%Y%m%d"),
-            })
-        except Exception as e:
-            logger.warning(f"{code} 拉取失败: {e}")
-            continue
-        if df.empty or len(df) < 30:
-            continue
-        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
-        sig = strategy.latest_signal(df)
-        if sig is not None:
-            # 附带最新指标行（供 Checklist 追高检查）
-            df_ind = add_all_standard(df.sort_values("trade_date").reset_index(drop=True))
-            sig.reason = sig.reason or ""
-            signals.append((sig, df_ind.iloc[-1]))
-        if (i + 1) % 20 == 0:
-            logger.info(f"扫描进度 {i+1}/{len(codes)}，当前信号 {len(signals)} 个")
-    return signals, market_states, idx_df
+    settings = get_settings("config/settings.yaml")
+    sc = DailyScanner(settings)
+    res = sc.collect_signals(n=n, days=days)
+    return res["signals"], {res["latest"]: res["market_state"]}, None
 
 
 def main():
@@ -128,16 +84,8 @@ def main():
         logger.info(f"止损登记重建：{n_rebuilt} 个")
 
     # ===== 2. 收盘后扫描 =====
-    if args.mode == "paper":
-        signals, market_states, _ = scan_universe(
-            client, store, n=args.n,
-        )
-    else:
-        # 实盘：同样用 Tushare 扫描（数据源独立于交易通道）
-        tc = TushareClient(token=settings.resolved_tushare_token(),
-                           cache_dir=settings.resolved_cache_dir())
-        st = DuckDBStore(settings.resolved_duckdb_path())
-        signals, market_states, _ = scan_universe(tc, st, n=args.n)
+    # paper / live 均用同一扫描路径（数据源独立于交易通道）
+    signals, market_states, _ = scan_universe(n=args.n)
 
     latest_state = market_states.get(max(market_states) if market_states else None, "未知")
 
@@ -145,7 +93,6 @@ def main():
     asset = broker.query_asset()
     total_asset = asset.get("total_asset", 0)
     gate = ChecklistGate(chasing_high_threshold=s.chasing_high_threshold)
-    strategy = CherryClaw(close_to_ma5_max_dev=s.close_to_ma5_max_dev)
 
     print("\n" + "=" * 70)
     print(f"[{mode_tag}] 交易时段报告")
@@ -207,19 +154,14 @@ def main():
 
 
 def broker_snapshot(broker) -> "AccountSnapshot":
-    """从 Broker 查询构造 AccountSnapshot（供 Checklist）。"""
-    from lihu_quantify.types import AccountSnapshot, Position
-    positions = [
-        Position(ts_code=p.ts_code, volume=p.volume, cost=p.cost,
-                 current_price=p.market_value / p.volume if p.volume else 0)
-        for p in broker.query_positions()
-    ]
-    asset = broker.query_asset()
-    return AccountSnapshot(
-        total_asset=asset.get("total_asset", 0),
-        cash=asset.get("cash", 0),
-        positions=positions,
-    )
+    """从 Broker 查询构造 AccountSnapshot（供 Checklist）。
+
+    P0-5（第十一轮）：委托 scheduler.build_account_snapshot——旧实现缺
+    trades/halted_until/psychology_alert，导致 8 项闸门只生效 5 项。
+    """
+    from lihu_quantify.monitor.scheduler import build_account_snapshot
+
+    return build_account_snapshot(broker)
 
 
 if __name__ == "__main__":

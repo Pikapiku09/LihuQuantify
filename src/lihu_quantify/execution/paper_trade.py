@@ -26,6 +26,20 @@ from .base import BrokerBase, OrderResult, PositionInfo
 _ROOT = None
 
 
+def _locale_today() -> _date:
+    """P2-9-5：取配置时区（scheduler.timezone，默认 Asia/Shanghai）下的“今天”。
+
+    避免依赖进程宿主系统时区；解析失败回退系统本地日期。
+    """
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(get_settings().scheduler.timezone)).date()
+    except Exception:
+        return _date.today()
+
+
 def _default_state_file() -> str:
     global _ROOT
     if _ROOT is None:
@@ -331,7 +345,7 @@ class PaperBroker(BrokerBase):
                 break
             if consec >= 3:
                 from datetime import timedelta as _td
-                today = self._as_date(self.trade_day) or _date.today()
+                today = self._as_date(self.trade_day) or _locale_today()
                 until = today + _td(days=30)
                 self._halt_map[ts_code] = until
                 logger.warning(f"[铁律F] {ts_code} 连亏 3 笔，停手至 {until}")

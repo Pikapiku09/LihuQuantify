@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LihuQuantify · 量化监控看板</title>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <!-- 问题2（第九轮）：echarts 只用本地 vendor（CDN+本地双加载会互相覆盖且
+         内网环境 CDN 不可达时阻塞渲染；vendor 版本 5.x 约 1MB 已核对完整） -->
     <style>
         /* ============ 设计系统 ============ */
         :root {
@@ -190,6 +191,11 @@
             color: var(--text-muted);
             margin-top: 8px;
         }
+        /* 评审进度条（100 笔 live 验收卡） */
+        .progress-wrap { height: 6px; background: var(--bg-alt, #eceff3); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+        .progress-fill { height: 100%; background: var(--accent, #4f8cff); border-radius: 3px; transition: width .4s; }
+        .progress-fill.warn { background: #e6a23c; }
+        .progress-fill.ok { background: var(--green, #16a34a); }
 
         /* ============ 状态徽章 ============ */
         .badge {
@@ -205,6 +211,83 @@
         .badge-sideways { background: rgba(245,158,11,0.15); color: var(--amber); }
         .badge-downtrend { background: rgba(239,68,68,0.15); color: var(--red); }
         .badge-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+        /* 热力图维度切换按钮 */
+        .hm-dim-btn {
+            padding: 6px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .hm-dim-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .hm-dim-btn.active {
+            background: var(--accent-glow);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        /* ============ 设置页（第十轮需求1/2/3） ============ */
+        .set-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 16px;
+            padding: 14px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .set-row:last-child { border-bottom: none; }
+        .set-main { flex: 1; min-width: 0; }
+        .set-label { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+        .set-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+        .set-rec {
+            display: inline-block;
+            font-size: 12px;
+            margin-top: 6px;
+            padding: 3px 10px;
+            border-radius: 12px;
+        }
+        .set-badge-ok { color: var(--green); background: rgba(16,185,129,0.12); }
+        .set-badge-warn { color: var(--amber); background: rgba(245,158,11,0.12); }
+        .set-badge-lock { color: var(--text-muted); background: rgba(156,163,175,0.12); }
+        .set-input {
+            width: 100%;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-size: 13px;
+            padding: 8px 12px;
+            margin-top: 8px;
+            outline: none;
+        }
+        .set-input:focus { border-color: var(--accent); }
+        .set-toggle {
+            width: 40px; height: 22px;
+            appearance: none;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.2s;
+            flex-shrink: 0;
+            margin-top: 3px;
+        }
+        .set-toggle::after {
+            content: '';
+            position: absolute;
+            top: 2px; left: 2px;
+            width: 16px; height: 16px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            transition: all 0.2s;
+        }
+        .set-toggle:checked { background: var(--accent); border-color: var(--accent); }
+        .set-toggle:checked::after { left: 20px; background: #fff; }
 
         /* ============ 表格 ============ */
         .table-wrap { overflow-x: auto; }
@@ -275,8 +358,24 @@
         .report-view h1, .report-view h2, .report-view h3 { margin: 20px 0 12px; }
         .report-view h1 { font-size: 20px; color: var(--text-primary); }
         .report-view h2 { font-size: 16px; color: var(--text-primary); }
-        .report-view table { font-size: 13px; margin: 12px 0; }
-        .report-view th, .report-view td { padding: 8px 12px; }
+        /* 需求4（第十轮）：marked 表格样式——边框/斑马纹/表头底色/溢出滚动 */
+        .report-view table {
+            display: block;
+            width: 100%;
+            font-size: 13px;
+            margin: 12px 0;
+            border-collapse: collapse;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .report-view th, .report-view td {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            text-align: left;
+        }
+        .report-view thead th { background: var(--bg-hover); color: var(--text-primary); }
+        .report-view tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+        .report-view tbody tr:hover { background: var(--bg-hover); }
         .report-view code {
             background: var(--bg-hover);
             padding: 2px 6px;
@@ -374,9 +473,9 @@
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zM14 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"/></svg>
                     <span>市场热力图</span>
                 </div>
-                <div role="button" tabindex="0" class="nav-item" onclick="showPage('config', this)">
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('settings', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-                    <span>系统配置</span>
+                    <span>系统设置</span>
                 </div>
             </nav>
         </aside>
@@ -387,6 +486,14 @@
             <div class="page active" id="page-dashboard">
                 <div class="metric-grid" id="metricsGrid">
                     <div class="loading">加载中</div>
+                </div>
+                <!-- 需求5（第十轮）：今日简报卡片（AI 版优先，失败回退规则版，永不为空） -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--purple)"></span>今日简报</div>
+                        <span class="badge" id="aiSummaryDate" style="background:rgba(139,92,246,0.15);color:var(--purple);"></span>
+                    </div>
+                    <div id="aiSummaryText" class="loading">加载中</div>
                 </div>
                 <div class="card">
                     <div class="card-header">
@@ -468,13 +575,26 @@
                 </div>
             </div>
 
-            <!-- ============ 系统配置页（第八轮） ============ -->
-            <div class="page" id="page-config">
+            <!-- ============ 系统设置页（第十轮需求1/2/3） ============ -->
+            <div class="page" id="page-settings">
                 <div class="card">
-                    <div class="card-header">
-                        <div class="card-title"><span class="dot" style="background:var(--purple)"></span>系统配置（只读）</div>
+                    <div class="card-header" style="flex-wrap:wrap;gap:8px;">
+                        <div class="card-title"><span class="dot" style="background:var(--accent)"></span>系统设置</div>
+                        <span class="badge badge-sideways">冻结期：策略/风控/股票池只读</span>
                     </div>
-                    <div id="configContent"><div class="loading">加载中</div></div>
+                    <p id="settingsNote" style="margin:0 0 8px;font-size:12px;color:var(--text-muted);"></p>
+                    <div id="settingsContent"><div class="loading">加载中</div></div>
+                    <div style="display:flex;gap:10px;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid var(--border);flex-wrap:wrap;">
+                        <button class="hm-dim-btn" id="btnPreview" onclick="previewSettings()" disabled>预览变更</button>
+                        <button class="hm-dim-btn active" id="btnApply" onclick="applySettings()" disabled>确认应用</button>
+                        <span id="settingsMsg" style="font-size:13px;color:var(--text-muted);"></span>
+                    </div>
+                </div>
+                <div class="card" id="previewCard" style="display:none;">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--amber)"></span>变更预览（diff）</div>
+                    </div>
+                    <div id="previewDiff"></div>
                 </div>
             </div>
         </main>
@@ -493,6 +613,36 @@
     </div>
 
     <script src="/static/vendor/echarts.min.js"></script>
+    <script src="/static/vendor/marked.min.js"></script>
+
+    <script>
+        // P0-7（第十一轮）：统一 API 鉴权——重写 window.fetch（一处覆盖全部调用点）：
+        // ① localStorage 令牌自动为 /api/* 附 Bearer 头；
+        // ② 401 → 首次弹令牌输入框，存储后刷新（静态页/静态资源不受影响）。
+        (function () {
+            const _fetch = window.fetch.bind(window);
+            window.fetch = function (url, opts) {
+                opts = opts || {};
+                const isApi = String(url).indexOf('/api/') === 0;
+                const token = localStorage.getItem('lihu_web_token');
+                if (isApi && token) {
+                    opts.headers = Object.assign({}, opts.headers || {},
+                        { 'Authorization': 'Bearer ' + token });
+                }
+                return _fetch(url, opts).then(res => {
+                    if (res.status === 401 && isApi
+                            && !localStorage.getItem('lihu_web_token')) {
+                        const t = prompt('看板 API 受保护（LIHU_WEB_TOKEN）：请输入访问令牌');
+                        if (t) {
+                            localStorage.setItem('lihu_web_token', t.trim());
+                            location.reload();
+                        }
+                    }
+                    return res;
+                });
+            };
+        })();
+    </script>
 
     <script>
         // ============ 页面切换 ============
@@ -505,8 +655,8 @@
             if (name === 'reports') loadReports();
             if (name === 'backtest') loadBacktest();
             if (name === 'grid') loadGrid();
-            if (name === 'heatmap') loadHeatmap();
-            if (name === 'config') loadConfig();
+            if (name === 'heatmap') { if (hmChart) hmChart.resize(); loadHeatmap(); }
+            if (name === 'settings') loadSettings();
         }
 
         // ============ 工具 ============
@@ -573,13 +723,41 @@
                 { label: '持仓数', value: acc.positions?.length || 0, sub: '当前持仓' },
                 { label: '停手票', value: Object.keys(acc.halt_map || {}).length, sub: '连亏3笔停手30天' },
             ];
+            // 评审进度卡（live 100 笔验收；统计口径=配对轮次，见 review_progress.py）
+            const stageText = s => ({ accumulating: '积累中', ready_checkpoint50: '可预检', ready_review: '可评审' }[s] || s);
+            const rv = data.review || {};
+            const closed = rv.closed_rounds ?? 0, tgt = rv.target ?? 100;
+            const pct = Math.min(100, Math.round(closed / tgt * 100));
+            const fillCls = closed >= tgt ? 'ok' : (closed >= 50 ? 'warn' : '');
+            cards.push({
+                label: '评审进度',
+                value: `${closed} / ${tgt} 轮`,
+                sub: rv.win_rate != null
+                    ? `胜率 ${fmt.pct(rv.win_rate)} · 盈亏比 ${(rv.pl_ratio ?? 0).toFixed(2)} · ${stageText(rv.stage)}`
+                    : `尚无平仓轮 · 已实现 ${fmt.moneySign(rv.realized_pnl ?? 0)}`,
+                bar: `<div class="progress-wrap"><div class="progress-fill ${fillCls}" style="width:${pct}%"></div></div>`,
+            });
             document.getElementById('metricsGrid').innerHTML = cards.map(c => `
                 <div class="metric-card">
                     <div class="metric-label">${c.label}</div>
                     <div class="metric-value ${c.cls || 'neutral'}">${c.value}</div>
                     <div class="metric-sub">${c.sub}</div>
+                    ${c.bar || ''}
                 </div>
             `).join('');
+
+            // 需求5（第十轮）：今日简报——AI 版优先，失败/未配置回退规则版
+            // （brief 永不为空；旧数据无 brief → 回退显示 ai_summary）。
+            // 纯文本渲染（textContent，不套 markdown 解析，防注入）。
+            const aiEl = document.getElementById('aiSummaryText');
+            const aiDate = document.getElementById('aiSummaryDate');
+            aiEl.classList.remove('loading');
+            aiEl.style.cssText = 'font-size:14px;line-height:1.9;color:var(--text-secondary);white-space:pre-wrap;';
+            const brief = data.brief || data.ai_summary;
+            aiEl.textContent = brief || '暂无（等待首次巡检生成）';
+            aiDate.textContent = brief
+                ? `交易日 ${data.ai_summary_date || '-'} · ${(data.brief_is_ai || data.ai_summary) ? 'AI 版' : '规则版'}`
+                : '';
 
             // 持仓表格（第六轮清单2：名称/现价/市值/浮盈亏/盈亏%，红涨绿跌）
             const tbody = document.querySelector('#positionsTable tbody');
@@ -676,22 +854,17 @@
             }
         }
 
-        // 简易 Markdown → HTML（修复H.1：渲染前先转义，防 XSS）
+        // 需求4（第十轮）：marked 渲染（GFM 表格/任务列表）；渲染前整体转义防注入。
+        // marked 缺失（vendor 加载失败）→ 纯文本 <pre> 兜底，绝不输出未转义 HTML。
         function mdToHtml(md) {
             const safe = String(md ?? '')
-                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            return safe
-                .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-                .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-                .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*(.*?)\*/g, '<em>$1</em>')
-                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-                .replace(/^&gt; (.*$)/gim, '<blockquote>$1</blockquote>')
-                .replace(/^\s*- \[([x ])\] (.*)$/gim, '<div style="padding-left:8px">• [$1] $2</div>')
-                .replace(/^\s*-\s(.*)$/gim, '<div style="padding-left:8px">• $1</div>')
-                .replace(/\n\n/g, '<br><br>')
-                .replace(/\n/g, '<br>');
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            if (typeof marked !== 'undefined' && marked.parse) {
+                try { return marked.parse(safe, { gfm: true, breaks: true, silent: true }); }
+                catch (e) { /* 落入兜底 */ }
+            }
+            return '<pre style="white-space:pre-wrap;font-family:inherit;">' + safe + '</pre>';
         }
 
         // ============ 回测页（修复C：权益曲线 ECharts + 当前配置口径） ============
@@ -888,6 +1061,8 @@
                 const res = await fetch(`/api/heatmap?dim=${hmDim}`);
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
+                    // 先销毁实例再写占位（innerHTML 会移除 ECharts canvas，不清实例会导致后续永久空白）
+                    if (hmChart) { hmChart.dispose(); hmChart = null; }
                     el.innerHTML = `<div class="empty-state" style="padding:60px 0;">${esc(err.detail || '数据不可用')}</div>`;
                     meta.textContent = '-';
                     return;
@@ -896,15 +1071,21 @@
                 // 日级数据：日期未变且非强制 → 跳过重绘（避免闪动）
                 if (!force && d.trade_date === hmLastDate && hmChart) return;
                 hmLastDate = d.trade_date;
-                meta.textContent = `${d.trade_date} · ${d.count} 只`;
+                const fd = (d.trade_date || '').replace(/^(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+                meta.textContent = `${fd} · ${d.count} 只`;
                 renderHeatmap(d);
-                // 自动刷新（X 秒轮询；数据本身随每日巡检更新）
+                // 自动刷新（X 秒轮询；页面隐藏/切走时暂停，不空转）
                 if (!hmTimer) {
                     const seconds = 30;
                     document.getElementById('heatmapRefreshNote').textContent = `每 ${seconds}s 自动检查更新`;
-                    hmTimer = setInterval(() => loadHeatmap(false), seconds * 1000);
+                    hmTimer = setInterval(() => {
+                        const page = document.getElementById('page-heatmap');
+                        if (document.hidden || !page.classList.contains('active')) return;
+                        loadHeatmap(false);
+                    }, seconds * 1000);
                 }
             } catch (e) {
+                if (hmChart) { hmChart.dispose(); hmChart = null; }
                 el.innerHTML = '<div class="empty-state" style="padding:60px 0;">后端未启动</div>';
             }
         }
@@ -916,8 +1097,13 @@
                 return;
             }
             if (!hmChart) {
+                el.innerHTML = '';   // 清掉可能的错误占位文本
                 hmChart = echarts.init(el);
-                window.addEventListener('resize', () => hmChart && hmChart.resize());
+                // 仅在热力图页可见时 resize（隐藏页 resize 会把图表压成 0×0）
+                window.addEventListener('resize', () => {
+                    const page = document.getElementById('page-heatmap');
+                    if (hmChart && page.classList.contains('active')) hmChart.resize();
+                });
             }
             const data = d.children.map(g => ({
                 name: g.name,
@@ -945,7 +1131,7 @@
                         }
                         return `<b>${esc(v.name)}</b><br>` +
                             `平均涨跌：${v.avg_pct != null ? v.avg_pct.toFixed(2) + '%' : '-'}<br>` +
-                            `成交额合计：${(v.value / 100000000).toFixed(2)} 亿`;
+                            `成交额合计：${(v.value / 100000).toFixed(2)} 亿`;
                     },
                 },
                 series: [{
@@ -956,7 +1142,10 @@
                         show: true, formatter: p => {
                             const pct = p.data.pct_chg != null ? p.data.pct_chg : p.data.avg_pct;
                             const pctTxt = pct != null ? `${pct > 0 ? '+' : ''}${pct.toFixed(1)}%` : '';
-                            return `{n|${p.name}}\n{p|${pctTxt}}`;
+                            // 问题2（第九轮）：rich 标签转义——name 含 { } | 会
+                            // 破坏富文本 {n|...} 语法导致标签渲染异常（乱码样）
+                            const safeName = String(p.name ?? '').replace(/[{}|]/g, '');
+                            return `{n|${safeName}}\n{p|${pctTxt}}`;
                         },
                         rich: {
                             n: { fontSize: 11, color: '#fff', fontWeight: 600 },
@@ -1015,43 +1204,186 @@
             document.getElementById('hmDetailModal').style.display = 'none';
         }
 
-        // ============ 系统配置页（第八轮：只读展示） ============
-        async function loadConfig() {
-            const el = document.getElementById('configContent');
+        // ============ 系统设置页（第十轮需求1/2/3：分组+建议+diff 预览+确认） ============
+        let _setBase = null;      // GET /api/settings 原始返回
+        let _setDraft = {};       // changes 草稿：key → 新值
+        let _setSecrets = {};     // secrets 草稿：name → 明文（仅提交用，不回显）
+
+        async function loadSettings() {
+            const el = document.getElementById('settingsContent');
+            el.innerHTML = '<div class="loading">加载中</div>';
             try {
-                const res = await fetch('/api/config');
+                const res = await fetch('/api/settings');
                 const d = await res.json();
-                if (d.error) { el.innerHTML = `<div class="empty-state">${esc(d.error)}</div>`; return; }
-                const section = (title, obj, notes = {}) => `
-                    <h3 style="margin:14px 0 8px;font-size:14px;">${title}</h3>
-                    <div class="table-wrap"><table>
-                        <thead><tr><th>参数</th><th>当前值</th><th>说明</th></tr></thead>
-                        <tbody>${Object.entries(obj).map(([k, v]) => `
-                            <tr><td>${esc(k)}</td><td><code>${esc(String(v))}</code></td>
-                            <td style="color:var(--text-muted)">${esc(notes[k] || '')}</td></tr>`).join('')}
-                        </tbody>
-                    </table></div>`;
-                el.innerHTML =
-                    `<p style="margin:0 0 4px;font-size:13px;color:var(--text-muted)">${esc(d.note || '')}</p>` +
-                    `<p style="margin:0 0 4px;font-size:13px;color:var(--text-muted)">操作日志：${esc(d.log_files || '')}</p>` +
-                    section('智能资金控制（capital_guard）', d.capital_guard || {}, {
-                        enabled: '总开关',
-                        min_cash_threshold: '可用现金低于此值 → 跳过全部买入尝试',
-                        top_n_enabled: '资金紧张时按评分只买前 N 只',
-                        top_n: '候选保留数上限',
-                    }) +
-                    section('热力图（heatmap）', d.heatmap || {}, {
-                        enabled: '总开关', refresh_seconds: '前端轮询间隔（数据为日级）',
-                    }) +
-                    section('调度（scheduler）', d.scheduler || {}, {
-                        daily_scan_cron: '每日巡检时间（cron）', timezone: '时区',
-                    }) +
-                    section('策略（strategy）', d.strategy || {}) +
-                    section('风控（risk）', d.risk || {}) +
-                    `<p style="margin:12px 0 0;font-size:12px;color:var(--text-muted)">初始资金：${d.init_capital ?? '-'}（回测/看板参考口径）</p>`;
+                if (d.error) {
+                    el.innerHTML = `<div class="empty-state">${esc(d.error)}</div>`;
+                    return;
+                }
+                _setBase = d; _setDraft = {}; _setSecrets = {};
+                document.getElementById('settingsNote').textContent = d.note || '';
+                renderSettings(d);
+                refreshSettingsButtons();
+                setSettingsMsg('');
             } catch (e) {
                 el.innerHTML = '<div class="empty-state">后端未启动</div>';
             }
+        }
+
+        function renderSettings(d) {
+            const el = document.getElementById('settingsContent');
+            const order = ['通知', 'AI 总结', '热力图', '资金控制', '策略与风控'];
+            const byGroup = {};
+            for (const [key, m] of Object.entries(d.metadata || {})) {
+                (byGroup[m.group] = byGroup[m.group] || []).push([key, m]);
+            }
+            let html = '';
+            for (const g of order) {
+                const items = byGroup[g] || [];
+                if (!items.length) continue;
+                html += `<h3 style="margin:18px 0 4px;font-size:14px;color:var(--text-primary);border-bottom:1px solid var(--border);padding-bottom:8px;">${esc(g)}</h3>`;
+                for (const [key, m] of items) {
+                    const badgeCls = {ok: 'set-badge-ok', warn: 'set-badge-warn', lock: 'set-badge-lock'}[m.badge] || 'set-badge-lock';
+                    if (!m.editable) {
+                        // 冻结期锁定组：键值只读表
+                        const obj = (d.locked || {})[key] || {};
+                        html += `<div class="set-row"><div class="set-main">
+                            <div class="set-label">🔒 ${esc(m.label)}</div>
+                            <div class="set-desc">${esc(m.description || '')}</div>
+                            <div class="set-rec ${badgeCls}">${esc(m.recommendation || '')}</div>
+                            <div class="table-wrap" style="margin-top:8px;"><table><tbody>
+                                ${Object.entries(obj).map(([k, v]) =>
+                                    `<tr><td><code>${esc(k)}</code></td><td><code>${esc(String(v))}</code></td></tr>`).join('')}
+                            </tbody></table></div>
+                        </div></div>`;
+                    } else if (typeof (d.settings || {})[key] === 'boolean') {
+                        html += `<div class="set-row"><div class="set-main">
+                            <div class="set-label">${esc(m.label)}</div>
+                            <div class="set-desc">${esc(m.description || '')}</div>
+                            <div class="set-rec ${badgeCls}">${esc(m.recommendation || '')}</div>
+                        </div>
+                        <input type="checkbox" class="set-toggle" ${d.settings[key] ? 'checked' : ''}
+                               onchange="onSetChange('${key}', this.checked)"></div>`;
+                    } else {
+                        html += `<div class="set-row"><div class="set-main">
+                            <div class="set-label">${esc(m.label)}</div>
+                            <div class="set-desc">${esc(m.description || '')}</div>
+                            <div class="set-rec ${badgeCls}">${esc(m.recommendation || '')}</div>
+                            <input type="text" class="set-input" value="${esc(d.settings[key] ?? '')}"
+                                   placeholder="https://hc-ping.com/<uuid>"
+                                   oninput="onSetChange('${key}', this.value)">
+                        </div></div>`;
+                    }
+                }
+                if (g === 'AI 总结') html += _secretRows(d);
+            }
+            el.innerHTML = html;
+        }
+
+        // 密钥输入（掩码显示当前值；写入 data/secrets.json，两容器共享）
+        function _secretRows(d) {
+            const sec = d.secrets || {};
+            return `<div class="set-row"><div class="set-main">
+                <div class="set-label">AI API Key</div>
+                <div class="set-desc">当前：${esc(sec.ai_summary_api_key || '未配置')}（存 data/secrets.json，下次巡检生效）</div>
+                <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+                    <input type="password" class="set-input" id="secAiKey" placeholder="sk-..." style="flex:1;min-width:220px;margin-top:0;"
+                           oninput="onSecretInput('ai_summary_api_key', this.value)">
+                    <button class="hm-dim-btn" style="margin-top:0;" onclick="testAiKey()">测试连接</button>
+                </div>
+                <div id="aiKeyTestResult" style="font-size:12px;margin-top:4px;color:var(--text-muted);"></div>
+            </div></div>
+            <div class="set-row"><div class="set-main">
+                <div class="set-label">邮件授权码（SMTP auth_code）</div>
+                <div class="set-desc">当前：${esc(sec.email_auth_code || '未配置')}；需同时在下方"通知"组开启邮件通知并配置发件邮箱</div>
+                <input type="password" class="set-input" id="secEmailCode" placeholder="授权码（非登录密码）"
+                       oninput="onSecretInput('email_auth_code', this.value)">
+            </div></div>`;
+        }
+
+        function onSetChange(key, val) {
+            _setDraft[key] = val;
+            refreshSettingsButtons();
+        }
+
+        function onSecretInput(name, val) {
+            if (val) _setSecrets[name] = val;
+            else delete _setSecrets[name];
+            refreshSettingsButtons();
+        }
+
+        function refreshSettingsButtons() {
+            const has = Object.keys(_setDraft).length || Object.keys(_setSecrets).length;
+            document.getElementById('btnPreview').disabled = !has;
+            document.getElementById('btnApply').disabled = true;
+            document.getElementById('previewCard').style.display = 'none';
+        }
+
+        function previewSettings() {
+            const meta = (_setBase || {}).metadata || {};
+            const rows = Object.entries(_setDraft).map(([k, v]) => {
+                const m = meta[k] || {};
+                const oldV = ((_setBase || {}).settings || {})[k];
+                const warn = m.badge === 'warn'
+                    ? `<div style="color:var(--amber);font-size:12px;margin-top:2px;">⚠️ ${esc(m.recommendation || '')}</div>` : '';
+                return `<div style="padding:8px 0;border-bottom:1px dashed var(--border);">
+                    <div>${esc(m.label || k)}：<code>${esc(String(oldV))}</code> → <code>${esc(String(v))}</code></div>${warn}</div>`;
+            }).join('');
+            const secs = Object.keys(_setSecrets).map(k => {
+                const label = k === 'ai_summary_api_key' ? 'AI API Key' : '邮件授权码';
+                return `<div style="padding:8px 0;border-bottom:1px dashed var(--border);">
+                    <div>${label}：更新为 <code>******</code>（明文仅写入 data/secrets.json，审计只记掩码）</div></div>`;
+            }).join('');
+            document.getElementById('previewDiff').innerHTML = (rows + secs)
+                || '<div class="empty-state">无变更</div>';
+            document.getElementById('previewCard').style.display = '';
+            document.getElementById('btnApply').disabled = false;
+            setSettingsMsg('请核对以上变更，再点"确认应用"。');
+        }
+
+        async function applySettings() {
+            setSettingsMsg('保存中...');
+            try {
+                const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({confirm: true, changes: _setDraft, secrets: _setSecrets}),
+                });
+                const d = await res.json();
+                if (!res.ok) {
+                    setSettingsMsg(`保存失败：${d.detail || res.status}`, true);
+                    return;
+                }
+                setSettingsMsg(`✅ ${d.effective || '已保存'}`);
+                await loadSettings();
+            } catch (e) {
+                setSettingsMsg('保存失败：后端未启动', true);
+            }
+        }
+
+        async function testAiKey() {
+            const out = document.getElementById('aiKeyTestResult');
+            out.textContent = '测试中...';
+            out.style.color = 'var(--text-muted)';
+            try {
+                const key = (document.getElementById('secAiKey').value || '').trim();
+                const res = await fetch('/api/settings/test_ai_key', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({api_key: key}),
+                });
+                const d = await res.json();
+                out.textContent = (d.ok ? '✅ ' : '❌ ') + (d.detail || '');
+                out.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+            } catch (e) {
+                out.textContent = '❌ 请求失败（后端未启动）';
+                out.style.color = 'var(--red)';
+            }
+        }
+
+        function setSettingsMsg(msg, isErr) {
+            const el = document.getElementById('settingsMsg');
+            el.textContent = msg || '';
+            el.style.color = isErr ? 'var(--red)' : 'var(--text-muted)';
         }
 
         // 初始加载

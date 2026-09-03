@@ -60,13 +60,31 @@ class SimulatedBroker:
         self.commission_rate = commission_rate
         self.stamp_tax_rate = stamp_tax_rate
         self.slippage = slippage
+        self.limit_pct = 0.10   # 主板 ±10%（P1-2；ST/创业板不细分，代码留接口）
+
+    @staticmethod
+    def _pre_close_of(next_bar: pd.Series) -> float | None:
+        """取前收盘价（涨跌停建模用）。缺失则回退前一根 close 不可得 → None。"""
+        pre = next_bar.get("pre_close", None)
+        if pre is None or (isinstance(pre, float) and pd.isna(pre)):
+            # 无 pre_close 字段：用 open 无法判定涨跌停，返回 None（不做停板检查）
+            return None
+        f = float(pre)
+        return f if f > 0 else None
 
     def fill(self, order: Order, next_bar: pd.Series) -> Fill | None:
         """在 T+1 日（next_bar）撮合订单。
 
         市价单：以 next_bar.open ± slippage 成交
-        限价单：触及 limit_price 才成交
+        限价单：触及 limit_price 才成交（成交价与 open 比较，见 P1-3）
         成交量必须为 100 的整数倍。
+
+        P1-2（第十一轮）：涨跌停/停牌无法成交建模——
+            - 买单：next_bar.low >= 涨停价（一字板）→ 拒单
+            - 卖单：next_bar.high <= 跌停价（一字跌停）→ 拒单
+            - 停牌：volume==0 或 open 缺失/0 → 拒单（当日单当日废，不顺延）
+            主板涨跌停 ±10%（round(pre_close × 1.1, 2)）；ST/创业板不细分，
+            limit_pct 参数预留（简化假设，代码注释注明）。
         """
         if order.volume <= 0 or order.volume % self.LOT_SIZE != 0:
             return None
@@ -76,16 +94,35 @@ class SimulatedBroker:
         low = float(next_bar.get("low", open_price))
         fill_date = next_bar.get("trade_date")
 
+        # —— 停牌：成交量显式为 0 或 open 缺失/0 → 无法成交，当日单当日废 ——
+        # （无 vol 字段的 bar 视为有成交量，保持既有合成测试行为不变）
+        vol_today = next_bar.get("volume", next_bar.get("vol"))
+        if vol_today is not None and float(vol_today) <= 0:
+            return None
+        if pd.isna(open_price) or open_price <= 0:
+            return None
+
+        # —— 涨跌停：一字板无法成交 ——
+        pre_close = self._pre_close_of(next_bar)
+        if pre_close is not None:
+            limit_up = round(pre_close * (1 + self.limit_pct), 2)
+            limit_down = round(pre_close * (1 - self.limit_pct), 2)
+            # P0 之外：涨停一字板（low>=涨停价）买单无法成交；跌停一字板（high<=跌停价）卖单无法成交
+            if order.side == "buy" and low >= limit_up:
+                return None
+            if order.side == "sell" and high <= limit_down:
+                return None
+
         if order.order_type == "limit":
-            # 限价买：limit_price >= low 才能成交，成交价 = min(limit, high)
+            # 限价买：limit_price >= low 才能成交，成交价 = min(limit, open)（P1-3）
             if order.side == "buy":
                 if order.limit_price < low:
                     return None
-                price = min(order.limit_price, high)
+                price = min(order.limit_price, open_price)
             else:  # 卖
                 if order.limit_price > high:
                     return None
-                price = max(order.limit_price, low)
+                price = max(order.limit_price, open_price)
         else:
             # 市价单：开盘价 ± 滑点
             slip = open_price * self.slippage

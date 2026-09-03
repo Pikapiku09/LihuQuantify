@@ -315,11 +315,12 @@ def test_email_capital_module():
 
 
 # ============================================================
-# 6. 热力图（纯函数 + 端点）
+# 6. 热力图（问题3第九轮：数据源 = scheduler 写的 heatmap_snapshot.json，
+#    web 不再读 DuckDB——锁库降级根因修复）
 # ============================================================
 
 def _make_cache(tmp_path):
-    """造 Tushare 响应格式缓存：2 只最新日 + 1 只陈旧日（应被过滤）。"""
+    """造 Tushare 响应格式缓存：detail 弹窗近 10 日行情仍读此处。"""
     cache = tmp_path / "cache"
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -335,23 +336,42 @@ def _make_cache(tmp_path):
 
     write("600000.SH", "600000_SH", [("20260827", 1.5), ("20260828", 3.2)])
     write("000001.SZ", "000001_SZ", [("20260827", -1.0), ("20260828", -2.5)])
-    write("300750.SZ", "300750_SZ", [("20260826", 5.0), ("20260827", 1.0)])
     return cache
 
 
-def test_heatmap_rows_latest_day_only(tmp_path, monkeypatch):
+def _make_snapshot(tmp_path, rows):
+    """造热力图快照（scheduler 巡检落盘格式，UTF-8 + 中文不转义）。
+
+    注意：web 侧 DATA_DIR 已是 <root>/data，快照直接写 tmp_path 下。
+    """
+    (tmp_path / "heatmap_snapshot.json").write_text(
+        json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+
+
+_SNAP_ROWS = [
+    {"ts_code": "600000.SH", "name": "浦发银行", "industry": "银行",
+     "close": 10.0, "pct_chg": 3.2, "amount": 501000.0, "trade_date": "20260828"},
+    {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行",
+     "close": 12.0, "pct_chg": -2.5, "amount": 502000.0, "trade_date": "20260828"},
+]
+
+
+def test_heatmap_rows_reads_snapshot(tmp_path, monkeypatch):
     import web.server as ws
 
     monkeypatch.setattr(ws, "DATA_DIR", tmp_path)
-    _make_cache(tmp_path)
+    monkeypatch.setattr(ws, "_hm_cache", {"sig": None, "rows": []})
+    _make_snapshot(tmp_path, _SNAP_ROWS)
+
     rows = ws._heatmap_rows()
-    # 陈旧缓存（止于 0827）被过滤，仅保留最新交易日 2 只
-    assert {r["ts_code"] for r in rows} == {"600000.SH", "000001.SZ"}
-    top = rows[0]   # 成交额大者在前
-    assert top["ts_code"] == "000001.SZ"
-    assert top["pct_chg"] == -2.5 and top["trade_date"] == "20260828"
-    # 行业映射：无 DuckDB → 降级"未知"，名称回退代码
-    assert all(r["industry"] in ("未知",) or r["industry"] for r in rows)
+    # 名称/行业直接来自快照（无 DuckDB → 调度器锁库期间不再降级为代码/"未知"）
+    by_code = {r["ts_code"]: r for r in rows}
+    assert by_code["600000.SH"]["name"] == "浦发银行"
+    assert by_code["000001.SZ"]["industry"] == "银行"
+    # 快照不存在 → 抛异常（端点转 503"等待巡检生成"）
+    (tmp_path / "heatmap_snapshot.json").unlink()
+    with pytest.raises(Exception):
+        ws._heatmap_rows()
 
 
 def test_heatmap_endpoint_dims_and_detail(tmp_path, monkeypatch):
@@ -359,16 +379,20 @@ def test_heatmap_endpoint_dims_and_detail(tmp_path, monkeypatch):
     import web.server as ws
 
     monkeypatch.setattr(ws, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(ws, "_hm_cache", {"sig": None, "rows": []})
     _make_cache(tmp_path)
+    _make_snapshot(tmp_path, _SNAP_ROWS)
     client = fastapi_testclient.TestClient(ws.app)
 
-    # 默认行业维度（无行业数据 → 全部"未知"组）
+    # 默认行业维度：行业分组来自快照
     r = client.get("/api/heatmap")
     assert r.status_code == 200
     d = r.json()
     assert d["trade_date"] == "20260828" and d["count"] == 2
-    leaves = [l for g in d["children"] for l in g["children"]]
-    assert {l["code"] for l in leaves} == {"600000.SH", "000001.SZ"}
+    assert {g["name"] for g in d["children"]} == {"银行"}
+    leaves = {l["code"]: l for g in d["children"] for l in g["children"]}
+    assert {c for c in leaves} == {"600000.SH", "000001.SZ"}
+    assert leaves["600000.SH"]["name"] == "浦发银行"
 
     # 涨跌幅维度：+3.2 → "⑤ 上涨 2~5%"；-2.5 → "② 下跌 -5%~-2%"
     r = client.get("/api/heatmap?dim=pct_bucket")
@@ -379,12 +403,21 @@ def test_heatmap_endpoint_dims_and_detail(tmp_path, monkeypatch):
     # 非法维度
     assert client.get("/api/heatmap?dim=xxx").status_code == 400
 
-    # 详情：近 10 日（本缓存 2 行）
+    # 快照缺失 → 503（等待巡检生成，非锁库话术）
+    (tmp_path / "heatmap_snapshot.json").unlink()
+    r = client.get("/api/heatmap")
+    assert r.status_code == 503
+    assert "巡检" in r.json()["detail"]
+    _make_snapshot(tmp_path, _SNAP_ROWS)
+
+    # 详情：近 10 日行情读缓存 + 名称/行业来自快照（无 DuckDB）
     r = client.get("/api/heatmap/detail?code=600000.SH")
     assert r.status_code == 200
     detail = r.json()
     assert len(detail["bars"]) == 2
     assert detail["bars"][-1]["pct_chg"] == 3.2
+    assert detail["info"]["name"] == "浦发银行"
+    assert detail["info"]["industry"] == "银行"
     # 不在池内
     assert client.get("/api/heatmap/detail?code=999999.SH").status_code == 404
 
@@ -401,3 +434,86 @@ def test_config_endpoint(tmp_path, monkeypatch):
     assert d["capital_guard"]["top_n"] == 5
     # 脱敏：不含 token
     assert "token" not in json.dumps(d)
+
+
+# ============================================================
+# 7. 第九轮：热力图快照落盘（scheduler）+ /api/health + AI 总结上看板
+# ============================================================
+
+def test_heatmap_snapshot_latest_day_filter(tmp_path, monkeypatch):
+    """_write_heatmap_snapshot：陈旧交易日剔除、名称/行业映射、成交额降序。"""
+    from lihu_quantify.monitor import scheduler as sched_mod
+    from lihu_quantify.monitor.scheduler import DailyScanner
+
+    monkeypatch.setattr(sched_mod, "_ROOT", tmp_path)
+    s = DailyScanner.__new__(DailyScanner)
+    s._write_heatmap_snapshot(
+        [
+            {"ts_code": "A.SH", "close": 1.0, "pct_chg": 1.0,
+             "amount": 10.0, "trade_date": "2026-08-27"},
+            {"ts_code": "B.SZ", "close": 2.0, "pct_chg": 2.0,
+             "amount": 20.0, "trade_date": "2026-08-28"},
+            {"ts_code": "C.SH", "close": 3.0, "pct_chg": -1.0,
+             "amount": 30.0, "trade_date": "2026-08-28"},
+        ],
+        name_map={"B.SZ": "B名", "C.SH": "C名"},   # A.SH 无名称 → 回退代码
+        sector_map={"C.SH": "白酒"},                # B.SZ 无行业 → "未知"
+    )
+    rows = json.loads(
+        (tmp_path / "data" / "heatmap_snapshot.json").read_text(encoding="utf-8"))
+    assert [r["ts_code"] for r in rows] == ["C.SH", "B.SZ"]   # 最新日 + 降序
+    by_code = {r["ts_code"]: r for r in rows}
+    assert by_code["B.SZ"]["name"] == "B名" and by_code["B.SZ"]["industry"] == "未知"
+    assert by_code["C.SH"]["industry"] == "白酒"
+
+
+def test_scan_writes_heatmap_snapshot(tmp_path, monkeypatch):
+    """巡检落盘快照：覆盖全池（含无信号票），名称来自 _universe name_map。"""
+    s, broker = _make_scanner(tmp_path, monkeypatch, init=100_000.0)
+    _wire_scan(tmp_path, monkeypatch, s,
+               {"600000.SH": None, "000001.SZ": _sig("000001.SZ", 20.0)},
+               closes={"600000.SH": 10.0, "000001.SZ": 20.0})
+    _run_scan(s)
+
+    snap = tmp_path / "data" / "heatmap_snapshot.json"
+    assert snap.exists()
+    rows = json.loads(snap.read_text(encoding="utf-8"))
+    assert {r["ts_code"] for r in rows} == {"600000.SH", "000001.SZ"}
+    by_code = {r["ts_code"]: r for r in rows}
+    assert by_code["600000.SH"]["name"] == "股600000"   # 无信号票也进快照
+    assert by_code["000001.SZ"]["close"] == 20.0
+    assert by_code["600000.SH"]["industry"] == "未知"   # sector_map 空 → 未知
+
+
+def test_health_endpoint():
+    """问题4（第九轮）：/api/health（start_lihu.bat 健康检查用）。"""
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    import web.server as ws
+
+    client = fastapi_testclient.TestClient(ws.app)
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
+def test_dashboard_ai_summary(tmp_path, monkeypatch):
+    """问题1（第九轮）：/api/dashboard 暴露 ai_summary；未生成 → None 不报错。"""
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    import web.server as ws
+
+    monkeypatch.setattr(ws, "DATA_DIR", tmp_path)
+    (tmp_path / "last_scan.json").write_text(json.dumps({
+        "trade_date": "2026-08-28",
+        "summary": {"trade_date": "2026-08-28",
+                    "ai_summary": "测试总结：今日市场平稳。"},
+    }, ensure_ascii=False), encoding="utf-8")
+    client = fastapi_testclient.TestClient(ws.app)
+
+    d = client.get("/api/dashboard").json()
+    assert d["ai_summary"] == "测试总结：今日市场平稳。"
+    assert d["ai_summary_date"] == "2026-08-28"
+
+    # 未配置 key / 生成失败 → None（前端显示"暂无"，不报错）
+    (tmp_path / "last_scan.json").unlink()
+    d2 = client.get("/api/dashboard").json()
+    assert d2["ai_summary"] is None

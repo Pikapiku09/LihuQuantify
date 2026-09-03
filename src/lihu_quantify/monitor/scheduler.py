@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -22,25 +23,23 @@ from ..config import CapitalGuardConfig, Settings
 from ..data.tushare_client import TushareClient
 from ..data.duckdb_store import DuckDBStore
 from ..indicators.standard import add_all_standard
+from ..market import classify_market_state  # P2-9-4：包内引入，消除 sys.path hack
 from ..strategy.cherry_claw import CherryClaw
 from ..risk.checklist import ChecklistGate, CheckContext
 from ..execution.paper_trade import PaperBroker
 from ..execution.oms import OrderManagementSystem
-from ..types import AccountSnapshot, Position
+from ..types import AccountSnapshot, Position, TradeRecord
 from .ai_summary import build_ai_summary
 from .alerts import Alerter
 from .report import ReportGenerator
 
-# 复用市场状态分类（run_backtest.py）
-import sys
-
 # _ROOT = 项目根目录：src/lihu_quantify/monitor/scheduler.py 向上 3 级
+# 用于锚定 data/ 与 outputs/ 相对路径（测试常 monkeypatch 此变量做目录隔离）。
+# P2-9-4：市场状态分类已由包内 lihu_quantify.market 引入，不再用 sys.path hack。
 _ROOT = Path(__file__).resolve().parents[3]
-for _p in (_ROOT, str(_ROOT / "src")):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
 
-from run_backtest import classify_market_state  # noqa: E402
+# 第十轮需求1：settings.yaml 默认路径（与 run_scheduler.py / get_settings 一致）
+_DEFAULT_SETTINGS_PATH = "config/settings.yaml"
 
 
 def _json_safe(obj):
@@ -54,12 +53,63 @@ def _json_safe(obj):
     return obj
 
 
+def _num_or_none(v):
+    """问题3（第九轮）：bar 值 → float（NaN/缺失 → None，保证 JSON 可序列化）。"""
+    try:
+        f = float(v)
+        return None if f != f else f   # NaN 自不等
+    except (TypeError, ValueError):
+        return None
+
+
 # 止损原因 → 日报显示文案
 _STOP_REASON_LABEL = {
     "price_stop": "价格止损",
     "ma_break": "MA10 破位",
     "trailing_stop": "移动止盈",   # 修复4(第六轮)
 }
+
+
+def build_account_snapshot(broker) -> AccountSnapshot:
+    """P0-5（第十一轮）：从 broker 构造完整 AccountSnapshot（单一事实来源）。
+
+    此前 scheduler._snapshot / run_live.broker_snapshot 各自构造且缺
+    trades / halted_until / psychology_alert → checklist 的交易频率、
+    连亏停手、心理门禁三项恒不生效（8 项闸门实际只剩 5 项）。统一补全：
+      - trades：PaperBroker.trades（dict 流水 → TradeRecord，日期用
+        broker._as_date 解析，解析失败回退当日）
+      - halted_until：账户级连亏停手到期日（按票停手由 scan 预筛负责）
+      - psychology_alert：无数据来源 → None（checklist 走"未知"分支，
+        不拦截但标注，不伪造为通过）
+    """
+    positions = [
+        Position(
+            ts_code=p.ts_code, volume=p.volume, cost=p.cost,
+            current_price=p.market_value / p.volume if p.volume else 0,
+        )
+        for p in broker.query_positions()
+    ]
+    asset = broker.query_asset()
+    trades: list[TradeRecord] = []
+    for t in getattr(broker, "trades", None) or []:
+        d = (broker._as_date(t.get("date"))
+             if hasattr(broker, "_as_date") else t.get("date"))
+        trades.append(TradeRecord(
+            ts_code=t["ts_code"],
+            trade_date=d if isinstance(d, date) else date.today(),
+            side=t["side"], price=t["price"], volume=t["volume"],
+            pnl=t.get("pnl", 0) or 0, reason=t.get("reason", ""),
+            commission=t.get("commission", 0) or 0,
+            stamp_tax=t.get("stamp_tax", 0) or 0,
+        ))
+    return AccountSnapshot(
+        total_asset=asset.get("total_asset", 0),
+        cash=asset.get("cash", 0),
+        positions=positions,
+        trades=trades,
+        halted_until=getattr(broker, "halted_until", None),
+        psychology_alert=None,
+    )
 
 
 def _signal_score(bar) -> float:
@@ -181,6 +231,29 @@ def _build_daily_summary(
             if today < until_d:
                 halted[code] = str(until_d)
 
+    # 评审进度（100 笔验收；复用月度复盘同款 FIFO 配对口径）
+    from .review_progress import review_stats as _review_stats
+    summary_review = _review_stats(getattr(broker, "trades", []) or [])
+
+    # 需求5（第十轮）：规则版简报（确定性兜底——AI 未配置/失败时永不为空）。
+    # summary["brief"] = ai_summary or brief_rule（_scan_impl 中赋值）。
+    _scale = entry_scale if entry_scale is not None else 1.0
+    _filter = ("block（禁止开新仓）" if _scale == 0.0
+               else "reduce（新仓减半）" if _scale == 0.5 else "off（正常开仓）")
+    _cum = (total_asset / init_cap - 1) if init_cap else None
+    _day = (total_asset - prev_total_asset) \
+        if (prev_total_asset is not None and prev_total_asset > 0) else None
+    _cum_s = f"{_cum:+.2%}" if _cum is not None else "-"
+    _day_s = f"{_day:+,.0f}" if _day is not None else "-"
+    brief_rule = (
+        f"今日巡检完成：{signals} 信号，{len(executed)} 成交，{len(rejected)} 拦截；"
+        f"市场{market_state}（{_filter}）；"
+        f"总资产 {total_asset:,.0f}，"
+        f"累计 {_cum_s}，"
+        f"今日 {_day_s}；"
+        f"持仓 {len(positions_detail)} 只。"
+    )
+
     return {
         "trade_date": latest,
         "market_state": market_state,
@@ -199,6 +272,8 @@ def _build_daily_summary(
         "alerts": alerts,
         "report": report_path,
         "mode": mode,
+        "brief_rule": brief_rule,
+        "review": summary_review,
     }
 
 
@@ -223,12 +298,21 @@ class DailyScanner:
         """
         self.settings = settings
         self.mode = mode
+        # 第十轮需求1：配置热生效——scan() 每次巡检前从此路径重载 settings.yaml
+        self._settings_path = _DEFAULT_SETTINGS_PATH
         # 第四轮清单1：邮件通道（enabled+配置齐全才生效；否则 None=不启用）
+        # 第十轮需求1：授权码解析顺序 = data/secrets.json → env/yaml（设置界面可写）
         from .alerts import build_email_alerter
 
-        _email = build_email_alerter(
-            getattr(getattr(settings, "alert", None), "email", None)
-        ) if getattr(settings, "alert", None) else None
+        _alert = getattr(settings, "alert", None)
+        _email_cfg = getattr(_alert, "email", None) if _alert else None
+        if _email_cfg is not None:
+            try:
+                _email_cfg = _email_cfg.model_copy(
+                    update={"auth_code": settings.resolved_email_auth_code()})
+            except Exception:
+                pass
+        _email = build_email_alerter(_email_cfg)
         self.alerter = alerter or Alerter(
             serverchan_key=getattr(getattr(settings, "alert", None), "serverchan_key", ""),
             email=_email,
@@ -244,6 +328,8 @@ class DailyScanner:
         self.client = TushareClient(
             token=settings.resolved_tushare_token(),
             cache_dir=settings.resolved_cache_dir(),
+            cache_mtime_ttl=getattr(settings.tushare, "cache_ttl_seconds", 43200),
+            rate_limit_interval=getattr(settings.tushare, "rate_limit_interval", 0.3),
         )
         self.store = DuckDBStore(settings.resolved_duckdb_path())
         self.broker = broker or PaperBroker(
@@ -291,7 +377,7 @@ class DailyScanner:
                 mask &= ~dfb["name"].str.contains("ST", na=False)
             if "list_date" in dfb.columns:
                 list_dates = pd.to_datetime(dfb["list_date"], errors="coerce").dt.date
-                cutoff = date.today() - timedelta(days=u.min_list_days)
+                cutoff = self._latest_trade_date() - timedelta(days=u.min_list_days)
                 mask &= list_dates.apply(lambda d: bool(d) and d <= cutoff)
             candidates = dfb[mask].sort_values("ts_code")["ts_code"].tolist()
             codes = []
@@ -314,15 +400,26 @@ class DailyScanner:
                 name_map[row["ts_code"]] = str(nm).strip() if pd.notna(nm) else ""
         return codes, sector_map, name_map
 
+    def _latest_trade_date(self) -> date:
+        """P2-9-5：最新交易日（交易所日历锚定），取不到时回退系统“今天”。"""
+        try:
+            latest = self.store.get_latest_trade_date()
+            if isinstance(latest, date):
+                return latest
+        except Exception:
+            pass
+        return date.today()
+
     def _passes_liquidity(self, code: str) -> bool:
         """修复H.4：近 20 日日均成交额 ≥ 阈值（缓存命中时开销极小）。"""
         min_amount = self.settings.universe.min_avg_amount_20d / 1e3   # 元 → 千元
         try:
-            start = date.today() - timedelta(days=45)
+            latest = self._latest_trade_date()
+            start = latest - timedelta(days=45)
             df = self.client.query("daily", {
                 "ts_code": code,
                 "start_date": start.strftime("%Y%m%d"),
-                "end_date": date.today().strftime("%Y%m%d"),
+                "end_date": latest.strftime("%Y%m%d"),
             }, use_cache=True)
             if df.empty or len(df) < 5:
                 return False
@@ -360,6 +457,7 @@ class DailyScanner:
         心跳（第四轮清单2）：开始 /start，成功 ping，异常 /fail
         （healthchecks.io 侧"每日 17:30 前未收到成功 ping → 告警"实现缺席通知）。
         """
+        self._reload_settings()   # 第十轮需求1：配置热生效（设置页保存 → 本次巡检即用）
         s, r = self.settings.strategy, self.settings.risk
         latest, market_state = self._market_state()
         last = self._read_last_scan()
@@ -398,6 +496,50 @@ class DailyScanner:
         self.heartbeat.success()
         self._send_digest(summary)
         return summary
+
+    def collect_signals(self, n: int = 50, days: int = 120) -> dict:
+        """P2-9-6：抽取"股票池 + 信号扫描"供 run_live 复用（替代其重复 scan_universe）。
+
+        DailyScanner 是股票池/参数/信号生成的单一实现；run_live 只在交互式
+        打印流程里需要信号与市场状态，无需执行巡检完整副作用（落盘/止损/cron），
+        故抽出本方法，统一 CherryClaw 参数构造（修掉 run_live 裸构造分叉）。
+
+        Returns:
+            {"latest": date, "market_state": str, "codes": [...],
+             "signals": [(sig, last_ind), ...]}   # last_ind 为含指标的末行
+        """
+        latest, market_state = self._market_state()
+        s, r = self.settings.strategy, self.settings.risk
+        strategy = CherryClaw(
+            ma_periods=tuple(s.ma_periods),
+            golden_cross_max_freshness=s.golden_cross_max_freshness_days,
+            volume_ratio_threshold=s.volume_ratio_threshold,
+            entity_ratio_threshold=s.entity_ratio_threshold,
+            close_to_ma5_max_dev=s.close_to_ma5_max_dev,
+            max_position_pct=r.max_single_position,
+            stop_loss_force_pct=r.stop_loss_force,
+        )
+        codes, _, _ = self._universe(n)
+        start = latest - timedelta(days=days)
+        signals: list[tuple] = []
+        for code in codes:
+            try:
+                df = self.client.query("daily", {
+                    "ts_code": code,
+                    "start_date": start.strftime("%Y%m%d"),
+                    "end_date": latest.strftime("%Y%m%d"),
+                })
+            except Exception as e:
+                logger.warning(f"{code} 拉取失败: {e}")
+                continue
+            if df.empty or len(df) < 30:
+                continue
+            df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+            sig = strategy.latest_signal(df.sort_values("trade_date").reset_index(drop=True))
+            if sig is not None:
+                df_ind = add_all_standard(df.sort_values("trade_date").reset_index(drop=True))
+                signals.append((sig, df_ind.iloc[-1]))
+        return {"latest": latest, "market_state": market_state, "codes": codes, "signals": signals}
 
     def _scan_impl(
         self, latest: date, market_state: str, n: int, days: int, s, r,
@@ -439,6 +581,7 @@ class DailyScanner:
         codes, sector_map, name_map = self._universe(n)
         start = latest - timedelta(days=days)
         signals: list[tuple] = []   # (signal, last_bar)
+        hm_quotes: list[dict] = []   # 问题3（第九轮）：最新 bar → 热力图快照
         for code in codes:
             try:
                 df = self.client.query("daily", {
@@ -449,10 +592,22 @@ class DailyScanner:
             except Exception as e:
                 self.alerter.alert_api_error(f"daily:{code}", str(e))
                 continue
-            if df.empty or len(df) < 30:
+            if df.empty:
                 continue
             df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
             df = df.sort_values("trade_date").reset_index(drop=True)
+            # 问题3（第九轮）：全池收集最新 bar（不足 30 根的票也进快照，
+            # 热力图覆盖面 = 巡检池，而非仅有信号的票）
+            last_q = df.iloc[-1]
+            hm_quotes.append({
+                "ts_code": code,
+                "close": _num_or_none(last_q.get("close")),
+                "pct_chg": _num_or_none(last_q.get("pct_chg")),
+                "amount": _num_or_none(last_q.get("amount")),
+                "trade_date": str(last_q.get("trade_date")),
+            })
+            if len(df) < 30:
+                continue
             sig = strategy.latest_signal(df)
             if sig is not None:
                 df_ind = add_all_standard(df)
@@ -460,6 +615,9 @@ class DailyScanner:
                 # 需求1（第八轮）：信号评分（资金紧张时 top-N 排序用）
                 signals.append((sig, last_ind, _signal_score(last_ind)))
         logger.info(f"[巡检] 扫描信号 {len(signals)} 个")
+
+        # 问题3（第九轮）：热力图快照落盘（web 唯一数据源，切断 DuckDB 依赖）
+        self._write_heatmap_snapshot(hm_quotes, name_map, sector_map)
 
         # 市场参考信号（修复A：reduce=非上涨段仓位减半；block=禁止）
         if market_state != "上涨" and s.market_filter:
@@ -619,10 +777,18 @@ class DailyScanner:
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
         #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
         #      结果随 last_scan.json 持久化） ----
+        # 第十轮需求1：api_key 解析顺序 = data/secrets.json → 环境变量 → 空
+        # （设置界面写 secrets.json，下次巡检即生效，不依赖 compose env）
+        try:
+            _ai_key = self.settings.resolved_ai_summary_api_key()
+        except Exception:
+            _ai_key = getattr(getattr(self.settings, "ai_summary", None), "api_key", "")
         summary["ai_summary"] = build_ai_summary(
-            summary, getattr(self.settings, "ai_summary", None),
-            getattr(getattr(self.settings, "ai_summary", None), "api_key", ""),
+            summary, getattr(self.settings, "ai_summary", None), _ai_key,
         )
+        # 需求5（第十轮）：双层简报——AI 成功用 AI 版，失败/未配置自动回退规则版
+        summary["brief"] = (summary.get("ai_summary")
+                            or summary.pop("brief_rule", "") or "")
         stop_orders = [
             {"ts_code": st.ts_code, "stop_price": st.stop_price,
              "volume": st.volume, "triggered": st.triggered}
@@ -663,10 +829,84 @@ class DailyScanner:
 
     # ===== 工具 =====
 
+    def _reload_settings(self) -> None:
+        """需求1（第十轮）：配置热生效——每次巡检前重载 settings.yaml。
+
+        背景：get_settings 为 lru_cache 单例 + 本对象启动时捕获 settings，
+        改 yaml 对运行中的调度器不生效。此处清缓存重载，使设置页的修改在
+        下一次巡检（16:30 cron 或手动 --run-now）生效，无需重启容器。
+
+        守卫：__new__ 构造的测试 stub（无 _settings_path）与 MagicMock
+        settings 不热载（同 capital_guard 的 isinstance 守卫约定）。
+        通知通道就地更新属性而非换对象（保留告警历史与测试注入的 mock）。
+        加载失败（yaml 语法错等）→ 沿用旧配置并告警（坏配置不杀死巡检）。
+        """
+        path = getattr(self, "_settings_path", None)
+        if not path:
+            return
+        try:
+            from ..config import Settings as _SettingsCls, get_settings
+
+            if not isinstance(self.settings, _SettingsCls):
+                return
+            get_settings.cache_clear()
+            fresh = get_settings(path)
+            self.settings = fresh
+            # 通知通道就地更新（不换对象）
+            from .alerts import build_email_alerter
+
+            _alert = getattr(fresh, "alert", None)
+            if _alert is not None:
+                self.alerter.serverchan_key = \
+                    getattr(_alert, "serverchan_key", "") or ""
+                _email_cfg = getattr(_alert, "email", None)
+                if _email_cfg is not None:
+                    try:
+                        _email_cfg = _email_cfg.model_copy(
+                            update={"auth_code": fresh.resolved_email_auth_code()})
+                    except Exception:
+                        pass
+                self.alerter.email = build_email_alerter(_email_cfg)
+            self.heartbeat.url = getattr(
+                getattr(fresh, "heartbeat", None), "healthchecks_url", "") or ""
+        except Exception as e:
+            logger.warning(f"[配置热载] 失败，沿用旧配置: {e}")
+
+    def _write_heatmap_snapshot(
+        self, quotes: list[dict], name_map: dict, sector_map: dict
+    ) -> None:
+        """问题3（第九轮）：写 data/heatmap_snapshot.json（热力图唯一数据源）。
+
+        根因：web 直读 DuckDB stock_basic 取名称/行业，而本进程常驻持有
+        写锁 → web 只读连接必败 → 静默降级（名称回退代码、行业"未知"）。
+        此处巡检时用 _universe 的 name_map/sector_map（scheduler 侧数据
+        齐全，无需读库）生成 UTF-8 快照（ensure_ascii=False），编码链路
+        单一可控，同时根治乱码问题（问题2）。
+        schema：[{ts_code, name, industry, close, pct_chg, amount, trade_date}]
+        """
+        rows = [{
+            "ts_code": q["ts_code"],
+            "name": (name_map or {}).get(q["ts_code"]) or q["ts_code"],
+            "industry": (sector_map or {}).get(q["ts_code"]) or "未知",
+            "close": q["close"], "pct_chg": q["pct_chg"],
+            "amount": q["amount"], "trade_date": q["trade_date"],
+        } for q in quotes]
+        # 只保留最新交易日（长期停牌等陈旧 bar 剔除，避免混合日期误导）
+        if rows:
+            max_td = max(r["trade_date"] for r in rows)
+            rows = [r for r in rows if r["trade_date"] == max_td]
+        rows.sort(key=lambda r: -(r.get("amount") or 0))
+        path = _ROOT / "data" / "heatmap_snapshot.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+            logger.info(f"[热力图] 快照已写入 {len(rows)} 只（{max_td if rows else '-'}）")
+        except (OSError, TypeError) as e:
+            logger.warning(f"[热力图] 快照写入失败: {e}")
+
     def _read_last_scan(self) -> Optional[dict]:
         """读 data/last_scan.json（幂等保护，第四轮清单6）。损坏/不存在 → None。"""
-        import json
-
         path = _ROOT / "data" / "last_scan.json"
         try:
             if path.exists():
@@ -677,7 +917,6 @@ class DailyScanner:
 
     def _write_last_scan(self, trade_date, summary: dict) -> None:
         """写 data/last_scan.json（巡检成功后；第四轮清单6）。"""
-        import json
         from datetime import datetime
 
         path = _ROOT / "data" / "last_scan.json"
@@ -709,19 +948,9 @@ class DailyScanner:
             logger.warning(f"[邮件] 每日综合日报发送失败: {e}")
 
     def _snapshot(self) -> AccountSnapshot:
-        positions = [
-            Position(
-                ts_code=p.ts_code, volume=p.volume, cost=p.cost,
-                current_price=p.market_value / p.volume if p.volume else 0,
-            )
-            for p in self.broker.query_positions()
-        ]
-        asset = self.broker.query_asset()
-        return AccountSnapshot(
-            total_asset=asset.get("total_asset", 0),
-            cash=asset.get("cash", 0),
-            positions=positions,
-        )
+        """P0-5（第十一轮）：委托 build_account_snapshot（补全 trades/
+        halted_until/psychology_alert，恢复 checklist 8 项闸门）。"""
+        return build_account_snapshot(self.broker)
 
     def _check_stops_with_alert(
         self, oms: OrderManagementSystem, latest: date
@@ -744,14 +973,17 @@ class DailyScanner:
         → T 收盘买入"，纸面原顺序"买入 → 卖出"导致当日止损回笼资金
         无法用于同轮买入（2026-08-27 曾因"可用 4429"拒绝 44 个信号、
         48k 资金闲置一天）。本方法移至买入循环之前调用，与回测口径对齐。
+
+        P0-3（第十一轮）：失败单不再被静默清空——卖单成功才从 pending
+        移除；失败/无开盘价 → 保留并累加 failed_count，连续 ≥3 次升级
+        ERROR 告警（触发即时邮件通道），防止持仓失去止损保护。
         """
         pending_file = _ROOT / "data" / "pending_stops.json"
         executed_stops: list[dict] = []   # 今日开盘执行的止损
+        remaining: list[dict] = []        # P0-3：未成交保留（失败/无开盘价）
 
         if pending_file.exists():
             try:
-                import json
-
                 pending = json.loads(pending_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 pending = []
@@ -760,32 +992,53 @@ class DailyScanner:
                 volume = item["volume"]
                 # 取今日开盘价
                 open_price = self._fetch_open(code, latest)
-                if open_price and open_price > 0:
-                    # 修复4(第六轮)：原因（中文标签）传给交易记录
-                    reason_label = _STOP_REASON_LABEL.get(
-                        item.get("reason", "price_stop"), "止损离场"
-                    )
-                    result = self.broker.sell(
-                        code, round(open_price - 0.01, 2), volume,
-                        reason=reason_label,
-                    )
-                    if result.success:
-                        self.alerter.alert_stop_loss(code, open_price, item["stop_price"])
-                        logger.info(f"[止损执行] {code} 次日开盘 {open_price:.2f} 成交"
-                                    f"（{reason_label}）")
-                        executed_stops.append({
-                            "ts_code": code, "volume": volume,
-                            "stop_price": item.get("stop_price", 0),
-                            "open_price": open_price,
-                            "reason": item.get("reason", "price_stop"),
-                        })
+                if not open_price or open_price <= 0:
+                    # P0-3：无开盘价（停牌/数据缺失）→ 保留，不丢弃
+                    item["failed_count"] = item.get("failed_count", 0) + 1
+                    remaining.append(item)
+                    logger.warning(f"[止损保留] {code} 无开盘价"
+                                   f"（failed_count={item['failed_count']}），待下次执行")
+                    continue
+                # 修复4(第六轮)：原因（中文标签）传给交易记录
+                reason_label = _STOP_REASON_LABEL.get(
+                    item.get("reason", "price_stop"), "止损离场"
+                )
+                result = self.broker.sell(
+                    code, round(open_price - 0.01, 2), volume,
+                    reason=reason_label,
+                )
+                if result.success:
+                    self.alerter.alert_stop_loss(code, open_price, item["stop_price"])
+                    logger.info(f"[止损执行] {code} 次日开盘 {open_price:.2f} 成交"
+                                f"（{reason_label}）")
+                    executed_stops.append({
+                        "ts_code": code, "volume": volume,
+                        "stop_price": item.get("stop_price", 0),
+                        "open_price": open_price,
+                        "reason": item.get("reason", "price_stop"),
+                    })
+                else:
+                    # P0-3：失败保留 + 计数；≥3 次升级 ERROR（即时邮件）
+                    item["failed_count"] = item.get("failed_count", 0) + 1
+                    remaining.append(item)
+                    if item["failed_count"] >= 3:
+                        logger.error(
+                            f"[止损连续失败] {code}: {result.msg}"
+                            f"（第 {item['failed_count']} 次），持仓失去止损保护")
+                        self.alerter.send(
+                            f"止损单连续 {item['failed_count']} 次执行失败：{code}",
+                            f"失败原因：{result.msg}。该持仓已连续 "
+                            f"{item['failed_count']} 个交易日无法止损离场，"
+                            f"请人工核查（持仓状态/资金/行情数据）。",
+                            level="error",
+                        )
                     else:
-                        logger.error(f"[止损执行失败] {code}: {result.msg}")
-                        # 保留待执行
-                        continue
-            # 清空（全部处理或失败的保留）
+                        logger.error(f"[止损执行失败] {code}: {result.msg}"
+                                     f"（failed_count={item['failed_count']}，保留待执行）")
+            # P0-3：只写剩余未成交单（成功单已移除；remaining 空 → "[]"）
             try:
-                pending_file.write_text("[]", encoding="utf-8")
+                pending_file.write_text(
+                    json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
             except OSError:
                 pass
         return executed_stops
@@ -836,8 +1089,10 @@ class DailyScanner:
             # MA10 破位（修复D）：取最新 MA10
             ma10 = self._fetch_ma10(code, latest)
             # 修复4(第六轮)：更新高水位（移动止盈基准；当日新仓买入价已起算）
+            # P2-9-8：循环内 save=False（避免每票触新高就全量落盘+全持仓取价），
+            # 循环结束后统一落盘一次。
             if hasattr(self.broker, "update_high_water") and close > 0:
-                self.broker.update_high_water(code, close)
+                self.broker.update_high_water(code, close, save=False)
             if close > 0 and close <= stop.stop_price:
                 new_pending.append({
                     "ts_code": code, "volume": stop.volume,
@@ -869,14 +1124,18 @@ class DailyScanner:
                     )
         if new_pending:
             try:
-                import json
-
                 pending_file.parent.mkdir(parents=True, exist_ok=True)
                 pending_file.write_text(
                     json.dumps(new_pending, ensure_ascii=False), encoding="utf-8"
                 )
             except OSError as e:
                 logger.warning(f"待执行止损写入失败: {e}")
+        # P2-9-8：高水位统一落盘（循环内已 save=False）
+        if getattr(self.broker, "_save_state", None) is not None:
+            try:
+                self.broker._save_state()
+            except Exception as e:
+                logger.warning(f"[高水位落盘] 失败: {e}")
         return new_pending
 
     def _fetch_open(self, ts_code: str, trade_date: date) -> float:
@@ -991,14 +1250,14 @@ def _append_filter_stats(record: dict) -> None:
 
     data/filter_stats.json = [{"date","market_state","signals","filter_mode",
                                 "entry_scale","executed"}, ...]（按日期去重覆盖）
+    P0-4（第十一轮）：json 顶部统一导入——原局部 `import json as _json` 与
+    except 子句的 json.JSONDecodeError 不一致，损坏文件时 NameError 崩溃。
     """
-    import json as _json
-
     path = _ROOT / "data" / "filter_stats.json"
     records = []
     try:
         if path.exists():
-            records = _json.loads(path.read_text(encoding="utf-8"))
+            records = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         records = []
     # 同日覆盖
@@ -1008,9 +1267,26 @@ def _append_filter_stats(record: dict) -> None:
     records = sorted(records, key=lambda r: r.get("date", ""))[-400:]
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
+        path.write_text(json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
     except OSError as e:
         logger.warning(f"[过滤统计] 写入失败: {e}")
+
+
+def _monthly_anchor(scanner: "DailyScanner") -> date:
+    """P2-9-5：月度复盘日期锚定最新交易日；DB 不可得回退配置时区“今天”。"""
+    try:
+        latest = scanner.store.get_latest_trade_date()
+        if isinstance(latest, date):
+            return latest
+    except Exception:
+        pass
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(scanner.settings.scheduler.timezone)).date()
+    except Exception:
+        return date.today()
 
 
 def _monthly_review(scanner: DailyScanner) -> None:
@@ -1020,7 +1296,8 @@ def _monthly_review(scanner: DailyScanner) -> None:
     日历不可得时幂等回退（monthly_YYYYMM.md 已存在即跳过）。
     修复G(第三轮)：新增"过滤命中统计"栏目。
     """
-    today = date.today()
+    # P2-9-5：日期纪律——锚定最新交易日（交易所日历），非本机时钟。
+    today = _monthly_anchor(scanner)
     out = _ROOT / "outputs" / "reports" / f"monthly_{today.strftime('%Y%m')}.md"
 
     # ---- 修复D：月末判定 ----
@@ -1040,23 +1317,12 @@ def _monthly_review(scanner: DailyScanner) -> None:
     init_cap = getattr(broker, "init_capital", total_asset)
 
     # 按 买入-卖出 轮次统计胜率/盈亏比
-    from ..backtest.metrics import _pair_rounds
-    from ..types import TradeRecord
-    recs = []
-    for t in trades:
-        d = broker._as_date(t.get("date")) if hasattr(broker, "_as_date") else t.get("date")
-        recs.append(TradeRecord(
-            ts_code=t["ts_code"], trade_date=d or date.today(),
-            side=t["side"], price=t["price"], volume=t["volume"],
-            commission=t.get("commission", 0), stamp_tax=t.get("stamp_tax", 0),
-        ))
-    rounds = _pair_rounds(recs)
-    wins = [r for r in rounds if r > 0]
-    losses = [r for r in rounds if r < 0]
-    win_rate = len(wins) / len(rounds) if rounds else 0
-    avg_win = sum(wins) / len(wins) if wins else 0
-    avg_loss = abs(sum(losses) / len(losses)) if losses else 0
-    pl_ratio = avg_win / avg_loss if avg_loss else 0
+    # （收敛到 review_progress.review_stats——与看板/日报/邮件评审进度同源同口径）
+    from .review_progress import review_stats as _review_stats
+    _rv = _review_stats(trades)
+    rounds_count = _rv["closed_rounds"]
+    win_rate = _rv["win_rate"] if _rv["win_rate"] is not None else 0
+    pl_ratio = _rv["pl_ratio"] if _rv["pl_ratio"] is not None else 0
 
     total_fees = sum(t.get("commission", 0) + t.get("stamp_tax", 0) for t in trades)
 
@@ -1066,9 +1332,7 @@ def _monthly_review(scanner: DailyScanner) -> None:
     try:
         stats_path = _ROOT / "data" / "filter_stats.json"
         if stats_path.exists():
-            import json as _json
-
-            all_stats = _json.loads(stats_path.read_text(encoding="utf-8"))
+            all_stats = json.loads(stats_path.read_text(encoding="utf-8"))
             filter_stats = [s for s in all_stats if str(s.get("date", "")).startswith(month_prefix)]
     except (json.JSONDecodeError, OSError):
         filter_stats = []
@@ -1093,7 +1357,7 @@ def _monthly_review(scanner: DailyScanner) -> None:
         "## 二、交易统计",
         "",
         f"- 交易笔数（买入+卖出）: {len(trades)}",
-        f"- 胜率（按轮次）: {win_rate:.1%}（{len(rounds)} 轮）",
+        f"- 胜率（按轮次）: {win_rate:.1%}（{rounds_count} 轮）",
         f"- 盈亏比: {pl_ratio:.2f}",
         "",
         "## 三、市场过滤命中统计（修复G）",

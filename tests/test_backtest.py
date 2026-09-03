@@ -59,14 +59,31 @@ def test_broker_limit_buy_not_triggered():
     assert fill is None
 
 
-def test_broker_limit_buy_triggered():
+def test_broker_limit_buy_triggered(monkeypatch):
     broker = SimulatedBroker()
-    # 限价买 102，low=99 <= 102 <= high=105，成交
+    # 限价买 102，low=99 <= 102，触发。P1-3（十一轮）：成交价 = min(limit, open)=min(102,100)=100
+    # （open 优于限价时以 open 成交，避免买贵——旧公式 min(limit, high) 会按 105 假限价成交）
     order = Order(ts_code="600519.SH", side="buy", volume=100, order_type="limit", limit_price=102)
     next_bar = pd.Series({"open": 100, "high": 105, "low": 99, "close": 103})
     fill = broker.fill(order, next_bar)
     assert fill is not None
-    assert fill.price == 102  # 限价
+    assert fill.price == 100  # min(102, open=100)
+
+
+def test_broker_limit_sell_triggered_open_better():
+    """P1-3（十一轮）：卖限价，open 优于限价时以 open 成交。"""
+    broker = SimulatedBroker()
+    order = Order(ts_code="600519.SH", side="sell", volume=100, order_type="limit", limit_price=98)
+    # 限价卖 98，high=105 >= 98 触发；open=100 > 98 → 成交价 = max(98, 100) = 100
+    next_bar = pd.Series({"open": 100, "high": 105, "low": 99, "close": 103})
+    fill = broker.fill(order, next_bar)
+    assert fill is not None
+    assert fill.price == 100
+    # 反向：open=95 低于限价 98 → 以限价 98 成交
+    bar2 = pd.Series({"open": 95, "high": 100, "low": 94, "close": 99})
+    fill2 = broker.fill(order, bar2)
+    assert fill2 is not None
+    assert fill2.price == 98
 
 
 def test_broker_volume_must_be_100_multiple():

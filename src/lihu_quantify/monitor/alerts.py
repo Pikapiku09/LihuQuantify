@@ -31,7 +31,11 @@
 
 from __future__ import annotations
 
+import json
 import smtplib
+import time
+from datetime import datetime
+from pathlib import Path
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -118,6 +122,52 @@ class Alerter:
         self.email = email
         # 告警历史（去重 + 供报告读取）
         self.history: list[dict] = []
+        # P2-9-7：实通道连续失败自检（内存计数 + 落盘 data/alert_status.json）
+        self._consec_fail_chan = 0
+        # P2-9-7：自检文件路径可覆盖（默认 data/alert_status.json，测试注入 tmp_path）
+        self._alert_status_path_override: Optional[Path] = None
+
+    # P2-9-7：实通道（Server酱/邮件）连续失败自检文件
+    @property
+    def _alert_status_path(self) -> Path:
+        if self._alert_status_path_override is not None:
+            return self._alert_status_path_override
+        root = Path(__file__).resolve().parents[3]
+        return root / "data" / "alert_status.json"
+
+    def _write_alert_status(self, ok: bool, title: str, channels: list[str]) -> None:
+        """连续失败 ≥3 → 写自检文件；恢复成功 → 记录 OK。"""
+        if not ok:
+            self._consec_fail_chan += 1
+        else:
+            self._consec_fail_chan = 0
+        if not ok and self._consec_fail_chan < 3:
+            return  # 未达阈值不落盘（避免频繁 IO）
+        try:
+            self._alert_status_path.parent.mkdir(parents=True, exist_ok=True)
+            self._alert_status_path.write_text(
+                json.dumps({
+                    "ok": ok,
+                    "consec_fail": self._consec_fail_chan,
+                    "channels": channels,
+                    "last_title": title,
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning(f"[告警自检] 落盘失败: {e}")
+
+    def _send_email_error(self, subject: str, body: str) -> bool:
+        """ERROR 级邮件即时发送，失败指数退避重试 2 次（1s/2s）。"""
+        delay = 1
+        for attempt in range(1, 4):  # 1 + 2 次重试
+            if self.email.send(subject, body):
+                return True
+            if attempt < 3:
+                time.sleep(delay)
+                delay *= 2
+        return False
 
     def send(
         self,
@@ -125,27 +175,46 @@ class Alerter:
         detail: str = "",
         level: str = LEVEL_INFO,
     ) -> bool:
-        """发送告警（控制台 + Server酱 + 邮件）。返回是否成功（至少控制台成功即 True）。"""
+        """发送告警（控制台 + Server酱 + 邮件）。返回各实通道的实际结果。
+
+        P2-9-7：不再无条件 return True——收集 Server酱/邮件的真实成败，
+        ERROR 级邮件带 2 次指数退避重试；实通道连续失败 ≥3 次写自检文件
+        （data/alert_status.json），供人工巡检告警通道是否失联。
+        """
         if not self.enabled:
             return False
         record = {"title": title, "detail": detail, "level": level}
         self.history.append(record)
 
-        # 控制台 + 日志（永远执行）
+        # 控制台 + 日志（永远执行）。只用 loguru（stderr 默认 backslashreplace）：
+        # 原 print 走 stdout，Windows GBK 控制台遇 ✓/⚠ 等字符直接
+        # UnicodeEncodeError 崩溃巡检（2026-09-01 本机补跑 8/28 实测）
         tag = {"info": "INFO", "warn": "WARN", "error": "ERROR"}.get(level, "INFO")
         logger.log("WARNING" if level != LEVEL_INFO else "INFO",
                    f"[告警:{tag}] {title} {('| ' + detail) if detail else ''}")
-        print(f"[告警:{tag}] {title}" + (f" | {detail}" if detail else ""))
+
+        # 实通道结果收集（控制台不算"实通道"，仅用于兜底日志）
+        real_ok: list[bool] = []
+        real_channels: list[str] = []
 
         # Server酱微信推送
         if self.serverchan_key:
-            self._push_serverchan(title, detail)
-        # 邮件通道（第五轮：仅 ERROR 系统故障即时发；WARN/INFO 进每日日报，
-        # 确保每交易日只发一封综合简报，避免碎片邮件轰炸）
+            sc_ok = self._push_serverchan(title, detail)
+            real_ok.append(sc_ok)
+            real_channels.append("serverchan")
+
+        # 邮件通道（第五轮：仅 ERROR 即时发；WARN/INFO 进每日日报，避免碎片轰炸）
         if self.email is not None and level == LEVEL_ERROR:
             subject = f"{_LEVEL_PREFIX.get(level, '')} LihuQuantify: {title}"
-            self.email.send(subject, detail or title)
-        return True
+            email_ok = self._send_email_error(subject, detail or title)
+            real_ok.append(email_ok)
+            real_channels.append("email")
+
+        if real_ok:
+            # 至少一个实通道成功 → 连续失败清零；否则计数并可能落盘
+            self._write_alert_status(any(real_ok), title, real_channels)
+            return any(real_ok)
+        return True  # 无实通道配置 → 回退原语义（仅控制台）
 
     def _push_serverchan(self, title: str, detail: str) -> bool:
         """Server酱推送（失败不影响主流程）。"""

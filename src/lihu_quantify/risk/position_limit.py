@@ -9,18 +9,19 @@
 from __future__ import annotations
 
 from ..types import AccountSnapshot
+from .limits import MAX_SECTOR_POSITION, MAX_SINGLE_POSITION
 
 
 class PositionLimiter:
     """仓位/板块硬约束。"""
 
-    MAX_SINGLE = 0.25
-    MAX_SECTOR = 0.40
+    MAX_SINGLE = MAX_SINGLE_POSITION          # P2-9-3：常量收敛 → risk/limits.py
+    MAX_SECTOR = MAX_SECTOR_POSITION
 
     def __init__(
         self,
-        max_single: float = 0.25,
-        max_sector: float = 0.40,
+        max_single: float = MAX_SINGLE_POSITION,
+        max_sector: float = MAX_SECTOR_POSITION,
     ):
         self.max_single = max_single
         self.max_sector = max_sector

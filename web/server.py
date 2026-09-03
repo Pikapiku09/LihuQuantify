@@ -23,6 +23,7 @@ from typing import Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,8 +43,35 @@ except Exception:  # 日志失败不阻断看板
 
 app = FastAPI(title="LihuQuantify Monitor", version="0.1.0")
 
+# P2-7（第十一轮）：gzip 压缩（echarts.min.js ~1MB 未压缩传输的问题）。
+# minimum_size 默认 1000，1KB 以下不压缩（更小反而负收益）。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # 静态文件（web/static/）
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
+
+
+# ============================================================
+# P0-7（第十一轮）：最小 API 鉴权（Bearer Token）
+#
+# 环境变量 LIHU_WEB_TOKEN 非空时，所有 /api/* 请求必须带
+# Authorization: Bearer <token>，否则 401。空值 = 不启用（本机
+# 127.0.0.1 直跑零配置行为不变）。
+# 豁免：看板页面本身（/ 与 /static/*）——页面可打开，API 401 时
+# 前端弹令牌输入框（一次存储 localStorage），便于手机/局域网首次访问。
+# ============================================================
+
+@app.middleware("http")
+async def _bearer_auth(request, call_next):
+    import os
+
+    token = os.environ.get("LIHU_WEB_TOKEN", "")
+    if token and request.url.path.startswith("/api/"):
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {token}":
+            return JSONResponse({"detail": "未授权：缺少或错误的 Bearer Token"
+                                         "（LIHU_WEB_TOKEN）"}, status_code=401)
+    return await call_next(request)
 
 
 # ============================================================
@@ -119,6 +147,18 @@ def _live_metrics(state: dict, scan_summary: dict, total_asset: float) -> dict:
     }
 
 
+def _dashboard_review(state: dict) -> dict:
+    """评审进度（100 笔 live 验收）：直接读 paper_state.trades 现算
+    （比 last_scan 更新更实时）。字段结构见 review_progress.review_stats。"""
+    try:
+        from lihu_quantify.monitor.review_progress import review_stats
+
+        return review_stats(state.get("trades") or [])
+    except Exception:
+        return {"closed_rounds": 0, "target": 100, "remaining": 100,
+                "win_rate": None, "pl_ratio": None, "stage": "accumulating"}
+
+
 def _read_stop_registry() -> dict:
     return _read_json(DATA_DIR / "stop_registry.json")
 
@@ -186,6 +226,12 @@ async def index():
     return index_path.read_text(encoding="utf-8")
 
 
+@app.get("/api/health")
+async def health():
+    """问题4（第九轮）：健康检查（start_lihu.bat 先探测，通了才开浏览器）。"""
+    return {"ok": True}
+
+
 @app.get("/api/dashboard")
 async def dashboard():
     """仪表盘聚合数据（修复C：总资产读 asset 快照，非 init_capital）。
@@ -222,6 +268,16 @@ async def dashboard():
             "halt_map": state.get("halt_map", {}),
         },
         "live": _live_metrics(state, scan_summary, total_asset),
+        # 评审进度（100 笔 live 验收；口径=配对轮次，见 review_progress.py）
+        "review": _dashboard_review(state),
+        # 问题1（第九轮）：AI 收盘总结上看板（纯展示，前端 textContent 渲染；
+        # 未配置 key/生成失败 → None → 前端显示"暂无"，不报错）
+        "ai_summary": scan_summary.get("ai_summary"),
+        "ai_summary_date": scan_summary.get("trade_date"),
+        # 需求5（第十轮）：今日简报（AI 版优先，失败自动回退规则版，永不为空；
+        # 旧 last_scan 无该字段 → 前端回退显示 ai_summary）
+        "brief": scan_summary.get("brief"),
+        "brief_is_ai": bool(scan_summary.get("ai_summary")),
         "stop_registry": registry,
         "pending_stops": pending,
         "recent_trades": recent_trades,
@@ -400,7 +456,10 @@ async def grid():
 
 
 # ============================================================
-# 第八轮需求2：热力图（日级刷新，基于 DuckDB 巡检缓存）
+# 第八轮需求2：热力图（日级刷新）
+# 问题3（第九轮）：数据源改为 scheduler 写的 heatmap_snapshot.json，
+# 彻底切断 web 对 DuckDB 的依赖（调度器常驻持有写锁 → 只读连接必败
+# → 名称/行业静默降级为代码/"未知"，即用户反馈的"只显示代码"根因）。
 # ============================================================
 
 def _pct_bucket(p: float) -> str:
@@ -432,75 +491,34 @@ def _amount_bucket(a: float) -> str:
     return "④ 放量 ≥10亿"
 
 
-def _heatmap_rows() -> list[dict]:
-    """最新交易日行情：读 data/cache/daily_*.json（巡检取数缓存，日级刷新）。
+# 进程内缓存：看板每 30s 轮询，快照文件未变（size/mtime）→ 直接复用上次
+# 解析结果，巡检重写快照后自动失效重算（问题3：单文件，无需全目录扫描）
+_hm_cache: dict = {"sig": None, "rows": []}
 
-    同票多缓存文件取最新 bar；行业/名称映射读 DuckDB stock_basic
-    （调度器巡检锁库时降级为"未知"）。
+
+def _heatmap_rows() -> list[dict]:
+    """问题3（第九轮）：读 data/heatmap_snapshot.json（scheduler 巡检写入）。
+
+    快照由 scheduler 用 name_map/sector_map 生成（UTF-8、ensure_ascii=False），
+    编码链路单一可控（问题2 乱码根治）；web 不再读 DuckDB（锁库降级根因）。
+    读失败/不存在 → 抛异常（端点转 503 提示等待巡检）。
     """
     import json as _json
 
-    cache_dir = DATA_DIR / "cache"
-    files = list(cache_dir.glob("daily_*.json"))
-    if not files:
-        return []
-    best: dict[str, dict] = {}
-    for fp in files:
-        try:
-            resp = _json.loads(fp.read_text(encoding="utf-8"))
-            data = (resp.get("data") or {})
-            fields = data.get("fields") or []
-            items = data.get("items") or []
-            if not fields or not items or "trade_date" not in fields:
-                continue
-            idx = {f: i for i, f in enumerate(fields)}
-            latest = max(items, key=lambda r: str(r[idx["trade_date"]]))
-            ts_code = latest[idx["ts_code"]] if "ts_code" in idx else None
-            if not ts_code:
-                continue
-            td = str(latest[idx["trade_date"]])
-            prev = best.get(ts_code)
-            if prev is None or td > prev["trade_date"]:
-                best[ts_code] = {
-                    "trade_date": td,
-                    "close": latest[idx["close"]] if "close" in idx else None,
-                    "pct_chg": latest[idx["pct_chg"]] if "pct_chg" in idx else None,
-                    "amount": latest[idx["amount"]] if "amount" in idx else None,
-                }
-        except Exception:
-            continue
-
-    industry_map: dict[str, tuple] = {}
+    path = DATA_DIR / "heatmap_snapshot.json"
+    if not path.exists():
+        raise FileNotFoundError("热力图快照未生成（等待首次巡检写入）")
+    sig = (str(path), path.stat().st_size, path.stat().st_mtime)
+    if _hm_cache["sig"] == sig:
+        return _hm_cache["rows"]
     try:
-        import duckdb
-
-        con = duckdb.connect(str(DATA_DIR / "lihu_quant.duckdb"), read_only=True)
-        try:
-            dfb = con.execute(
-                "SELECT ts_code, name, industry FROM stock_basic"
-            ).df()
-        finally:
-            con.close()
-        industry_map = {str(r["ts_code"]): (r["name"], r["industry"])
-                        for _, r in dfb.iterrows()}
-    except Exception:
-        pass
-
-    rows = []
-    for code, b in best.items():
-        name, industry = industry_map.get(code, (code, ""))
-        rows.append({
-            "ts_code": code,
-            "name": name or code,
-            "industry": industry or "未知",
-            "close": b["close"], "pct_chg": b["pct_chg"],
-            "amount": b["amount"], "trade_date": b["trade_date"],
-        })
-    # 只保留最新交易日（陈旧缓存文件剔除，避免混合日期误导）
-    if rows:
-        max_td = max(r["trade_date"] for r in rows)
-        rows = [r for r in rows if r["trade_date"] == max_td]
-    rows.sort(key=lambda r: -(r.get("amount") or 0))
+        rows = _json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"热力图快照读取失败: {e}")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("热力图快照为空")
+    _hm_cache["sig"] = sig
+    _hm_cache["rows"] = rows
     return rows
 
 
@@ -509,17 +527,17 @@ async def heatmap(dim: str = "industry"):
     """热力图 treemap 数据（ECharts children 结构，红涨绿跌由前端着色）。
 
     维度：industry（行业）| pct_bucket（涨跌幅档）| amount_bucket（成交额档）。
-    数据范围 = 巡检覆盖的股票池（daily_quotes 最新交易日），日级刷新。
-    调度器巡检期间 DuckDB 被锁 → 503（前端提示稍后重试）。
+    问题3（第九轮）：数据 = data/heatmap_snapshot.json（scheduler 巡检写入，
+    含名称/行业，无 DuckDB 依赖）；未生成/读取失败 → 503（前端提示稍后重试）。
     """
     if dim not in ("industry", "pct_bucket", "amount_bucket"):
         raise HTTPException(400, "dim 须为 industry | pct_bucket | amount_bucket")
     try:
         rows = _heatmap_rows()
     except Exception as e:
-        raise HTTPException(503, f"行情库暂时不可读（调度器巡检中会短暂锁库）：{e}")
+        raise HTTPException(503, f"{e}（每日 16:30 巡检后生成）")
     if not rows:
-        raise HTTPException(503, "行情库为空（等待首次巡检写入）")
+        raise HTTPException(503, "热力图快照为空（等待巡检生成）")
 
     def group_key(r: dict) -> str:
         if dim == "pct_bucket":
@@ -564,8 +582,14 @@ async def heatmap(dim: str = "industry"):
 
 @app.get("/api/heatmap/detail")
 async def heatmap_detail(code: str):
-    """热力图点击 → 个股详情（缓存日线近 10 日 + 基础信息）。"""
-    if not code or "." not in code:
+    """热力图点击 → 个股详情（缓存日线近 10 日 + 基础信息）。
+
+    P2-9-12（第十一轮）：code 入参改为正则白名单 `^\\d{6}\\.(SH|SZ)$`，
+    防止任意字符串拼接到 glob 路径（旧逻辑仅查 "." in code）。
+    """
+    import re
+
+    if not code or not re.fullmatch(r"\d{6}\.(SH|SZ)", code):
         raise HTTPException(400, "code 须为 ts_code 格式（如 600000.SH）")
     import json as _json
 
@@ -573,8 +597,9 @@ async def heatmap_detail(code: str):
     files = sorted((DATA_DIR / "cache").glob(f"daily_{safe_code}_*.json"))
     if not files:
         raise HTTPException(404, f"{code} 无本地行情（不在巡检覆盖范围）")
-    # 取文件名 end_date 最大的缓存（最新一次拉取）
-    fp = max(files, key=lambda p: p.stem.split("_")[2] if len(p.stem.split("_")) > 3 else "")
+    # 取最近一次拉取的缓存（按文件 mtime；文件名解析不可靠——
+    # 交易所段/日期段位置随 ts_code 变化，且同票可能存在多个日期段缓存）
+    fp = max(files, key=lambda p: p.stat().st_mtime)
     try:
         resp = _json.loads(fp.read_text(encoding="utf-8"))
         fields = (resp.get("data") or {}).get("fields") or []
@@ -594,23 +619,16 @@ async def heatmap_detail(code: str):
         "pct_chg": r[idx["pct_chg"]] if "pct_chg" in idx else None,
         "amount": r[idx["amount"]] if "amount" in idx else None,
     } for r in items[-10:]]
-    # 名称/行业（DuckDB 只读，锁库降级）
-    info = {"ts_code": code, "name": code, "industry": "未知", "area": ""}
+    # 名称/行业：读热力图快照（问题3：不再依赖 DuckDB——调度器锁库时旧实现
+    # 必降级为代码/"未知"；快照由 scheduler 侧 name_map/sector_map 生成）
+    info = {"ts_code": code, "name": code, "industry": "未知"}
     try:
-        import duckdb
-
-        con = duckdb.connect(str(DATA_DIR / "lihu_quant.duckdb"), read_only=True)
-        try:
-            dfb = con.execute(
-                "SELECT ts_code, name, industry, area FROM stock_basic "
-                "WHERE ts_code = ?", [code]
-            ).df()
-        finally:
-            con.close()
-        if not dfb.empty:
-            r0 = dfb.iloc[0]
-            info = {"ts_code": code, "name": r0["name"] or code,
-                    "industry": r0["industry"] or "未知", "area": r0["area"] or ""}
+        for r in _heatmap_rows():
+            if r.get("ts_code") == code:
+                info = {"ts_code": code,
+                        "name": r.get("name") or code,
+                        "industry": r.get("industry") or "未知"}
+                break
     except Exception:
         pass
     return {"info": info, "bars": bars}
@@ -640,6 +658,315 @@ async def config_view():
         }
     except Exception as e:
         return {"error": f"配置读取失败：{e}"}
+
+
+# ============================================================
+# 第十轮需求1/2/3：系统设置读写（元数据 + 冻结期锁 + 确认 + 原子写 + 审计）
+# ============================================================
+
+def _settings_yaml() -> Path:
+    return ROOT / "config" / "settings.yaml"
+
+
+def _fresh_settings():
+    """读当前配置（不走 lru_cache，保证设置页即时反映文件内容）。"""
+    sys.path.insert(0, str(ROOT / "src"))
+    from lihu_quantify.config import load_yaml_config, Settings
+
+    return Settings(**load_yaml_config(str(_settings_yaml())))
+
+
+# 可编辑键（白名单）。strategy.*/risk.*/universe.* 冻结期锁定（硬约束）。
+_EDITABLE_KEYS: dict[str, type] = {
+    "ai_summary.enabled": bool,
+    "heatmap.enabled": bool,
+    "alert.email.enabled": bool,
+    "capital_guard.enabled": bool,        # ⚠️ 可改但强警告
+    "capital_guard.top_n_enabled": bool,  # ⚠️ 可改但强警告
+    "heartbeat.healthchecks_url": str,
+}
+
+# 元数据：label 中文名 / description 说明 / recommendation 建议 /
+# badge（ok=建议开启 | warn=冻结期谨慎 | lock=冻结期锁定）/ editable / group
+_SETTINGS_META: dict[str, dict] = {
+    "alert.email.enabled": {
+        "label": "邮件通知", "group": "通知", "badge": "ok", "editable": True,
+        "description": "事件与每日综合日报邮件（需配置发件邮箱与授权码）",
+        "recommendation": "✅ 建议开启（配置授权码后，事件+日报通知）",
+    },
+    "heartbeat.healthchecks_url": {
+        "label": "缺席心跳（healthchecks.io）", "group": "通知", "badge": "ok",
+        "editable": True, "type": "str",
+        "description": "进程死亡/巡检缺席时外部告警；留空 = 不启用",
+        "recommendation": "✅ 建议配置（进程死亡缺席告警，免费）",
+    },
+    "ai_summary.enabled": {
+        "label": "AI 收盘总结", "group": "AI 总结", "badge": "ok", "editable": True,
+        "description": "纯展示层，不影响交易决策；每日一次 LLM 调用生成今日简报",
+        "recommendation": "✅ 建议开启（纯展示层，不影响交易，每日约 0.002 元）",
+    },
+    "heatmap.enabled": {
+        "label": "市场热力图", "group": "热力图", "badge": "ok", "editable": True,
+        "description": "看板热力图页（日级刷新，基于巡检快照，无副作用）",
+        "recommendation": "✅ 建议开启（纯展示，无副作用）",
+    },
+    "capital_guard.enabled": {
+        "label": "资金守卫", "group": "资金控制", "badge": "warn", "editable": True,
+        "description": "可用现金低于阈值时跳过全部买入尝试（汇总一条告警）",
+        "recommendation": "⚠️ 冻结期建议关闭（改变开仓节奏，100 笔评审后再评估）",
+    },
+    "capital_guard.top_n_enabled": {
+        "label": "Top-N 信号筛选", "group": "资金控制", "badge": "warn", "editable": True,
+        "description": "资金紧张时按信号评分只尝试前 N 只（会改变买入选择）",
+        "recommendation": "⚠️ 冻结期建议关闭（改变选择逻辑，100 笔评审后再评估）",
+    },
+    "strategy": {
+        "label": "策略参数", "group": "策略与风控", "badge": "lock", "editable": False,
+        "description": "CherryClaw 三层过滤参数",
+        "recommendation": "🔒 冻结期锁定，只读（100 笔评审后解锁）",
+    },
+    "risk": {
+        "label": "风控参数", "group": "策略与风控", "badge": "lock", "editable": False,
+        "description": "止损/仓位/停手铁律",
+        "recommendation": "🔒 冻结期锁定，只读（100 笔评审后解锁）",
+    },
+    "universe": {
+        "label": "股票池参数", "group": "策略与风控", "badge": "lock", "editable": False,
+        "description": "分层抽样池构建参数",
+        "recommendation": "🔒 冻结期锁定，只读（100 笔评审后解锁）",
+    },
+}
+
+_SECRET_KEYS = ("ai_summary_api_key", "email_auth_code")
+
+
+def _secrets_file() -> Path:
+    return DATA_DIR / "secrets.json"
+
+
+def _read_secrets() -> dict:
+    return _read_json(_secrets_file())
+
+
+def _mask(v) -> str:
+    v = str(v or "")
+    if not v:
+        return ""
+    return (v[:3] + "*" * 6 + v[-4:]) if len(v) > 8 else "*" * len(v)
+
+
+def _yaml_fmt(v) -> str:
+    import json as _json
+
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return _json.dumps(v, ensure_ascii=False)   # str → 带引号转义
+
+
+def _yaml_get(data: dict, dotted: str):
+    cur = data
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def _yaml_set_value(text: str, dotted: str, value) -> tuple[str, bool]:
+    """按点路径修改 yaml 已有标量键（行级手术，保留全部注释与缩进）。
+
+    只改值不改结构：未命中键（不存在/非标量行）→ 返回 (原文, False)。
+    """
+    import re as _re
+
+    parts = dotted.split(".")
+    stack: list[tuple[int, str]] = []
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        m = _re.match(
+            r"^(\s*)([A-Za-z_][\w\-]*):(\s*)([^#]*?)(\s*#.*)?$", line)
+        if not m:
+            continue   # 列表项/空行/文本行不动栈
+        indent, name = len(m.group(1)), m.group(2)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, name))
+        if [s[1] for s in stack] == parts and m.group(4).strip():
+            lines[i] = (f"{m.group(1)}{name}:{m.group(3)}"
+                        f"{_yaml_fmt(value)}{m.group(5) or ''}")
+            return "\n".join(lines), True
+    return text, False
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """原子写：临时文件 + os.replace（防写一半崩溃留下损坏配置）。"""
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _audit(items: list[dict]) -> None:
+    """追加审计记录到 data/settings_history.jsonl（时间/改动项/旧值→新值）。"""
+    from datetime import datetime
+
+    path = DATA_DIR / "settings_history.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            for it in items:
+                it = {"ts": datetime.now().isoformat(timespec="seconds"), **it}
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise HTTPException(500, f"审计记录写入失败：{e}")
+
+
+@app.get("/api/settings")
+async def settings_view():
+    """设置页数据：当前值 + 元数据（中文名/说明/建议/可改/分组）+ 密钥掩码。"""
+    try:
+        st = _fresh_settings()
+    except Exception as e:
+        return {"error": f"配置读取失败：{e}"}
+
+    values = {
+        "ai_summary.enabled": st.ai_summary.enabled,
+        "heatmap.enabled": st.heatmap.enabled,
+        "alert.email.enabled": st.alert.email.enabled,
+        "heartbeat.healthchecks_url": st.heartbeat.healthchecks_url,
+        "capital_guard.enabled": st.capital_guard.enabled,
+        "capital_guard.top_n_enabled": st.capital_guard.top_n_enabled,
+    }
+    sec = _read_secrets()
+    return {
+        "settings": values,
+        # 冻结期锁定的参数组（只读展示）
+        "locked": {
+            "strategy": st.strategy.model_dump(),
+            "risk": st.risk.model_dump(),
+            "universe": st.universe.model_dump(),
+        },
+        "metadata": _SETTINGS_META,
+        "secrets": {
+            "ai_summary_api_key": _mask(sec.get("ai_summary_api_key")),
+            "email_auth_code": _mask(sec.get("email_auth_code")),
+        },
+        "note": ("保存后于下次巡检生效（每日 16:30 或手动 --run-now），无需重启容器。"
+                 "策略/风控/股票池参数冻结期锁定（100 笔纸面样本评审后解锁）。"),
+    }
+
+
+@app.post("/api/settings")
+async def settings_update(payload: dict):
+    """保存设置。硬约束：
+
+    - 必须带 "confirm": true（防误触，前端"预览变更→确认应用"两步）；
+    - 仅接受白名单键（_EDITABLE_KEYS）；strategy/risk/universe 一律 400；
+    - settings.yaml 行级手术修改 + 原子写（保留注释）；
+    - 密钥写 data/secrets.json（两容器共享卷）；
+    - 全量审计到 data/settings_history.jsonl。
+    """
+    if not isinstance(payload, dict) or payload.get("confirm") is not True:
+        raise HTTPException(400, '缺少 "confirm": true（防误触，请走"预览变更→确认应用"流程）')
+
+    changes = payload.get("changes") or {}
+    secrets = payload.get("secrets") or {}
+    if not isinstance(changes, dict) or not isinstance(secrets, dict):
+        raise HTTPException(400, "changes/secrets 须为对象")
+    if not changes and not secrets:
+        raise HTTPException(400, "无变更内容")
+
+    # 白名单 + 类型校验（冻结期锁：锁键一律拒绝）
+    for key, val in changes.items():
+        if key not in _EDITABLE_KEYS:
+            raise HTTPException(400, f"{key} 冻结期锁定或不存在，禁止修改"
+                                     f"（strategy.*/risk.*/universe.* 只读）")
+        want = _EDITABLE_KEYS[key]
+        if want is bool and not isinstance(val, bool):
+            raise HTTPException(400, f"{key} 须为布尔值")
+        if want is str and not isinstance(val, str):
+            raise HTTPException(400, f"{key} 须为字符串")
+    for key in secrets:
+        if key not in _SECRET_KEYS:
+            raise HTTPException(400, f"未知密钥项 {key}")
+    for key, val in secrets.items():
+        if not isinstance(val, str):
+            raise HTTPException(400, f"{key} 须为字符串")
+
+    audit: list[dict] = []
+    applied: list[str] = []
+
+    # ---- settings.yaml：行级手术 + 原子写 ----
+    if changes:
+        import yaml as _yaml
+
+        path = _settings_yaml()
+        if not path.exists():
+            raise HTTPException(500, f"settings.yaml 不存在：{path}")
+        text = path.read_text(encoding="utf-8")
+        data = _yaml.safe_load(text) or {}
+        for key, val in changes.items():
+            old = _yaml_get(data, key)
+            new_text, hit = _yaml_set_value(text, key, val)
+            if not hit:
+                raise HTTPException(400, f"{key} 在 settings.yaml 中未命中（结构变更请联系管理员）")
+            text = new_text
+            audit.append({"item": key, "old": old, "new": val})
+            applied.append(key)
+        _atomic_write(path, text)
+
+    # ---- secrets.json：合并写入（原子） ----
+    if secrets:
+        merged = _read_secrets()
+        for key, val in secrets.items():
+            merged[key] = val
+            # 审计只记掩码占位，绝不落明文
+            audit.append({"item": f"secrets.{key}", "old": "***",
+                          "new": "***" if val else "（清空）"})
+        _atomic_write(_secrets_file(), json.dumps(merged, ensure_ascii=False, indent=1))
+        applied.extend(f"secrets.{k}" for k in secrets)
+
+    _audit(audit)
+
+    # web 自身也用最新配置（/api/config 等即时反映）
+    try:
+        sys.path.insert(0, str(ROOT / "src"))
+        from lihu_quantify.config import get_settings
+
+        get_settings.cache_clear()
+    except Exception:
+        pass
+
+    return {"ok": True, "applied": applied,
+            "effective": "已保存，将于下次巡检生效（16:30 或 --run-now），无需重启容器"}
+
+
+@app.post("/api/settings/test_ai_key")
+def settings_test_ai_key(payload: dict):
+    """需求3（第十轮）：测试 AI key 有效性（一次极小请求：GET /models）。
+
+    P2-7（第十一轮）：原 async def 内同步 requests.get(timeout=10) 网络不通时
+    阻塞整个事件循环 10s → 改同步 def，FastAPI 自动丢线程池，不阻塞其他请求。
+    """
+    import requests
+
+    key = str((payload or {}).get("api_key") or "").strip()
+    if not key:
+        key = str(_read_secrets().get("ai_summary_api_key") or "").strip()
+    if not key:
+        return {"ok": False, "detail": "未提供 key（且 secrets.json 无存储）"}
+    try:
+        st = _fresh_settings()
+        base = str(st.ai_summary.api_base).rstrip("/")
+        r = requests.get(f"{base}/models",
+                         headers={"Authorization": f"Bearer {key}"}, timeout=10)
+        if r.status_code == 200:
+            return {"ok": True, "detail": "key 有效（服务可达）"}
+        return {"ok": False, "detail": f"HTTP {r.status_code}：key 无效或无权限"}
+    except Exception as e:
+        return {"ok": False, "detail": f"连接失败：{e}"}
 
 
 def main():

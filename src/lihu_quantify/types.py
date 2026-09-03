@@ -84,7 +84,9 @@ class AccountSnapshot:
     positions: list[Position] = field(default_factory=list)
     trades: list[TradeRecord] = field(default_factory=list)
     halted_until: Optional[date] = None   # 连亏停手到期日
-    psychology_alert: bool = False        # 心理门禁信号（用户透露必须赚/报复/焦虑）
+    # P0-5（第十一轮）：心理门禁信号改为三态——None=无数据来源（checklist 走
+    # "未知"分支，不拦截但标注）；True=存在情绪信号（拒绝）；False=已确认正常
+    psychology_alert: Optional[bool] = None
 
     @property
     def position_value(self) -> float:

@@ -93,7 +93,7 @@ def add_all_standard(df: pd.DataFrame) -> pd.DataFrame:
     df["body_ratio"] = df["body"] / (df["high"] - df["low"]).replace(0, np.nan)
     # 收红（close > open）
     df["is_red"] = df["close"] > df["open"]
-    # 量比（当根 vol / 5 日均 vol）
+    # 量比（当根 vol / 前 5 日均 vol，不含当根——标准定义，P1-6 十一轮修正）
     df["vol_ma5"] = df["vol"].rolling(5).mean()
-    df["vol_ratio"] = df["vol"] / df["vol_ma5"].replace(0, np.nan)
+    df["vol_ratio"] = df["vol"] / df["vol_ma5"].shift(1).replace(0, np.nan)
     return df

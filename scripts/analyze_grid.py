@@ -24,8 +24,7 @@ from loguru import logger
 from lihu_quantify.config import get_settings
 from lihu_quantify.data.tushare_client import TushareClient
 from lihu_quantify.data.duckdb_store import DuckDBStore
-
-from run_backtest import classify_market_state
+from lihu_quantify.market import classify_market_state
 
 
 def main():

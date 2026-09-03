@@ -21,6 +21,8 @@ from typing import Optional
 
 from loguru import logger
 
+from ..risk.limits import MAX_SINGLE_POSITION  # P2-9-3：铁律常量收敛
+
 
 def _fmt_money(v) -> str:
     if v is None:
@@ -130,6 +132,14 @@ class ReportGenerator:
             day_pnl = total_asset - prev
             lines.append(f"| 今日盈亏 | {_fmt_pnl(day_pnl)}（{_fmt_pct(day_pnl / prev)}） |")
         lines.append(f"| 累计盈亏 | {_fmt_pnl(cum_pnl)}（{_fmt_pct(cum_pnl / init_cap if init_cap else 0)}） |")
+        # 评审进度（100 笔 live 验收；口径=配对轮次，同月度复盘）
+        _review = rich.get("review") or {}
+        if _review:
+            _cr = _review.get("closed_rounds") or 0
+            _tgt = _review.get("target") or 100
+            _wr = f"{_review['win_rate']:.1%}" if _review.get("win_rate") is not None else "-"
+            _pr = f"{_review['pl_ratio']:.2f}" if _review.get("pl_ratio") is not None else "-"
+            lines.append(f"| 评审进度 | {_cr}/{_tgt} 轮（胜率 {_wr}，盈亏比 {_pr}） |")
         lines.append("")
 
         # ---- 二、当前持仓 ----
@@ -336,14 +346,14 @@ class ReportGenerator:
         if missing_stop:
             issues.append(f"止损登记缺失: {[p['ts_code'] for p in missing_stop]}")
 
-        over_pos = [p for p in positions if total_asset > 0 and p["market_value"] / total_asset > 0.25]
+        over_pos = [p for p in positions if total_asset > 0 and p["market_value"] / total_asset > MAX_SINGLE_POSITION]
         if not over_pos:
-            lines.append("- [x] 单票市值占比 ≤25%")
+            lines.append(f"- [x] 单票市值占比 ≤{MAX_SINGLE_POSITION:.0%}")
         else:
             detail = ", ".join(f"{p['ts_code']}({p['market_value']/total_asset:.1%})" for p in over_pos)
             lines.append(f"- [ ] ⚠️ 超仓位: {detail}")
         if over_pos:
-            issues.append(f"单票超25%: {[p['ts_code'] for p in over_pos]}")
+            issues.append(f"单票超{MAX_SINGLE_POSITION:.0%}: {[p['ts_code'] for p in over_pos]}")
 
         avg_down = []
         for e in executed:

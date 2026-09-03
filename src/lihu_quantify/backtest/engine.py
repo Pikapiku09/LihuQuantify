@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Optional
 
@@ -146,6 +146,20 @@ class EventDrivenEngine:
                     next_bar = prepared[order.ts_code].iloc[i]
                     fill = self.broker.fill(order, next_bar)
                     if fill is not None:
+                        # P1-4（第十一轮）：撮合时二次确认现金（双保险）——多单同日撮合时，
+                        # 订单生成期的估算可能彼此重叠，"下单前估算"只防单笔，这里按实际成交
+                        # 价对【当前剩余现金】缩量整手，任何路径都不透支。
+                        if order.side == "buy":
+                            per_lot = fill.price * 100 * (1 + self.broker.commission_rate)
+                            max_lots = int(portfolio.cash // per_lot) if per_lot > 0 else 0
+                            vol2 = min(order.volume, max_lots * 100)
+                            if vol2 < 100:
+                                continue
+                            if vol2 != order.volume:
+                                order = replace(order, volume=vol2)
+                                fill = self.broker.fill(order, next_bar)
+                                if fill is None:
+                                    continue
                         portfolio.apply_fill(fill)
                 pending_orders = []
 
@@ -235,6 +249,21 @@ class EventDrivenEngine:
                 price = signal.suggested_price or float(last_bar["close"])
                 target_value = signal.suggested_position_pct * portfolio.total_asset * entry_scale
                 volume = int(target_value / price / 100) * 100
+                if volume < 100:
+                    continue
+                # P1-4（第十一轮）：买入现金充足性校验（防 T+1 跳空高开透支）。
+                # 以下一根 T+1 开盘价（买价 = open - 滑点）估算单股成本，现金不足原量
+                # → 按 cash // (估单手成本) 向下取整缩量；缩到不足 1 手 → 拒单。
+                est_price = price
+                ni = i + 1
+                if ni < len(df):
+                    nb = df.iloc[ni]
+                    nb_open = float(nb.get("open", 0))
+                    if nb_open > 0 and not pd.isna(nb_open):
+                        est_price = nb_open * (1 - self.broker.slippage)
+                per_lot = est_price * 100 * (1 + self.broker.commission_rate)
+                max_lots = int(portfolio.cash // per_lot) if per_lot > 0 else 0
+                volume = min(volume, max_lots * 100)
                 if volume < 100:
                     continue
                 pending_orders.append(Order(

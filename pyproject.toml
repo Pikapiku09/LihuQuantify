@@ -44,8 +44,8 @@ qmt = [
     # 使用时把 MiniQMT 的 bin.x64 加入 PYTHONPATH
 ]
 
-[project.scripts]
-lihu = "lihu_quantify.cli:main"
+# P0-2（第十一轮）：删除 [project.scripts] —— lihu_quantify.cli 不存在（死入口，
+# pip 安装后 lihu 命令 ModuleNotFoundError）。实际入口是根目录 run_*.py。
 
 [tool.setuptools.packages.find]
 where = ["src"]

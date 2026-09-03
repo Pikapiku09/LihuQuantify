@@ -115,6 +115,9 @@ def fetch_data(client: TushareClient, store: DuckDBStore, codes: list[str], year
         if df.empty:
             continue
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        # 第十一轮 P1-1：前复权（除权日 MA/止损/盈亏口径修正）
+        from lihu_quantify.data.adjustment import adjust_from_store
+        df = adjust_from_store(client, store, code, df, start, latest)
         data[code] = df.sort_values("trade_date").reset_index(drop=True)
         if (i + 1) % 10 == 0:
             logger.info(f"已拉取 {i+1}/{len(codes)} 只，{code}: {len(df)} 根")
@@ -166,7 +169,7 @@ def main():
         commission_rate=b.commission, stamp_tax_rate=b.stamp_tax, slippage=b.slippage,
     )
     # 市场状态参考信号（修复A：默认 reduce 减仓模式）
-    from run_backtest import classify_market_state
+    from lihu_quantify.market import classify_market_state
     market_states = classify_market_state(idx_df) if s.market_filter else None
     engine = EventDrivenEngine(
         strategy=strategy, broker=broker, max_single=r.max_single_position,

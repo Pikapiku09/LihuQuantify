@@ -102,9 +102,9 @@ indicators:
 
 # 智能资金控制（第八轮需求1：仅影响买入尝试的组织方式，不动闸门/铁律/仓位上限）
 capital_guard:
-  enabled: true
+  enabled: false                         # 冻结期：关闭（100笔评审后再评估开启）
   min_cash_threshold: 5000               # 可用现金低于此值 → 本轮跳过买入（汇总告警，不逐票刷"资金不足"）
-  top_n_enabled: true                    # 资金紧张（过闸信号数 > 可买槽数）时按评分只买前 N 只
+  top_n_enabled: false                   # 冻结期：关闭（评分筛选=策略变更，评审后再开）
   top_n: 5                               # 候选保留数上限
 
 # 看板热力图（第八轮需求2：日级刷新，基于 DuckDB 巡检缓存，无新增数据源依赖）

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -10,11 +11,34 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 第十轮需求1：密钥文件（两容器共享 data/ 卷；设置界面写入，调度器读取）。
+# 相对路径与 duckdb/cache 同约定（容器内 cwd=/app）。
+SECRETS_FILE = "data/secrets.json"
+
+
+def read_secrets(path: str = SECRETS_FILE) -> dict:
+    """读 data/secrets.json（不存在/损坏 → 空 dict，绝不抛异常）。
+
+    存 {"ai_summary_api_key": "...", "email_auth_code": "..."}；
+    与 .env 相比的优势：NAS 上两个容器都挂载 data/，改 key 无需改 compose。
+    """
+    try:
+        p = Path(path)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
 
 class TushareConfig(BaseModel):
     token: str = ""
     token_file: str = "E:/Dsh_WorkSapce/Dify_Agents/.dsh-invest/tushare.token"
     cache_dir: str = "./data/cache"
+    # P2-9-3（第十一轮）：cache_ttl 缓存有效期、rate_limits 限速（config 与实现对齐）
+    cache_ttl_seconds: int = 43200            # 12h 缓存有效期
+    rate_limit_interval: float = 0.3          # 同一 API 相邻请求最小间隔（秒）
 
 
 class DuckDBConfig(BaseModel):
@@ -44,9 +68,17 @@ class StrategyConfig(BaseModel):
     volume_ratio_threshold: float = 1.0
     entity_ratio_threshold: float = 0.40
     close_to_ma5_max_dev: float = 0.015
-    chasing_high_threshold: float = 0.08   # 追高阈值（乖离10日线）
     market_filter: bool = True   # 市场状态参考信号开关
     market_filter_mode: str = "reduce"   # reduce=减仓 | block=禁止（已判脆弱弃用）
+
+    @property
+    def chasing_high_threshold(self) -> float:
+        """追高阈值：单一事实来源 = risk.chasing_high_threshold（P2-9 收敛双定义）。
+
+        Strategy 不再独立持有该值，调用方仍以 `s.chasing_high_threshold` 访问
+        即得 risk 段数值；改阈值只动 settings.yaml `risk:` 段。
+        """
+        return get_settings().risk.chasing_high_threshold
 
 
 class RiskConfig(BaseModel):
@@ -65,7 +97,7 @@ class RiskConfig(BaseModel):
 
 class BacktestConfig(BaseModel):
     commission: float = 0.00025
-    stamp_tax: float = 0.0001
+    stamp_tax: float = 0.0005   # P2-9-1：2023.8 后卖出印花税万 5（原代码误为 0.0001，对齐 settings.yaml）
     slippage: float = 0.001
 
 
@@ -112,9 +144,9 @@ class CapitalGuardConfig(BaseModel):
       - 过闸信号数 > 可买槽数（cash/单笔预算）且 top_n_enabled
                                         → 按信号评分排序，只买前 top_n 只
     """
-    enabled: bool = True
+    enabled: bool = False
     min_cash_threshold: float = 5000.0   # 可用现金低于此值 → 跳过买入
-    top_n_enabled: bool = True           # 资金紧张时启用 top-N 筛选
+    top_n_enabled: bool = False          # 资金紧张时启用 top-N 筛选（冻结期默认关）
     top_n: int = 5                       # 保留的候选数量上限
 
 
@@ -218,6 +250,24 @@ class Settings(BaseSettings):
         path = Path(p)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def resolved_ai_summary_api_key(self) -> str:
+        """第十轮需求1：AI key 解析顺序 = data/secrets.json → 环境变量 → 空。
+
+        设置界面写 secrets.json（两容器共享 data/ 卷）→ 调度器下次巡检即生效，
+        不再依赖 compose env 映射（.env 的 key 可能根本没进容器）。
+        """
+        key = read_secrets().get("ai_summary_api_key")
+        if key and str(key).strip():
+            return str(key).strip()
+        return (self.ai_summary.api_key or "").strip()
+
+    def resolved_email_auth_code(self) -> str:
+        """第十轮需求1：邮件授权码解析顺序 = data/secrets.json → 环境变量/yaml → 空。"""
+        code = read_secrets().get("email_auth_code")
+        if code and str(code).strip():
+            return str(code).strip()
+        return (self.alert.email.auth_code or "").strip()
 
 
 def load_yaml_config(yaml_path: Path | str = "config/settings.yaml") -> dict:

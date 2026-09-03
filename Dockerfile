@@ -9,7 +9,7 @@ ENV TZ=Asia/Shanghai \
     PYTHONPATH=/app/src
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata curl \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
@@ -31,4 +31,9 @@ COPY config/ ./config/
 COPY run_scheduler.py run_backtest.py ./
 
 # 运行时路径锚点：scheduler.py 的 _ROOT 解析为 /app（data/outputs 挂载点）
+# HEALTHCHECK（P2-9-11）：web 服务健康探活（/api/health 已存在）；scheduler 容器
+# 无 web，如需自愈请在其上叠加 compose healthcheck 或关闭。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/api/health || exit 1
+
 CMD ["python", "run_scheduler.py", "--mode", "paper"]

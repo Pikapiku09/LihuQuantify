@@ -50,26 +50,34 @@ class CherryClaw(StrategyBase):
         self.stop_loss_mgr = StopLossManager(force_pct=stop_loss_force_pct)
 
     def _prepare_indicators(self, df: pd.DataFrame) -> dict:
-        """添加全部标准指标。"""
-        df_with_ind = add_all_standard(df)
+        """添加全部标准指标。
+
+        P2-6（第十一轮）：若 df 已含所需指标列（引擎已 add_all_standard 过），
+        则跳过重复计算（此前同一 df 被算两遍全套 MA/MACD/BOLL/RSI）。
+        """
+        needed = {"ma5", "ma10", "ma20", "ma20_slope", "ma5_x_ma10",
+                  "vol_ratio", "body_ratio", "is_red"}
+        if df is not None and needed.issubset(df.columns):
+            return {"df": df}
+        df_with_ind = add_all_standard(df) if df is not None else df
         return {"df": df_with_ind}
 
     def pre_filter(self, df: pd.DataFrame) -> bool:
-        """前置硬过滤：返回 True 表示通过。检查数据充分性。"""
+        """前置硬过滤：返回 True 表示通过。仅检查数据充分性与板块排除。
+
+        P1-5（第十一轮）：移除 `df["amount"].tail(20)` 未来流动性过滤——
+        那会用整段序列的【最后】20 根来判断未来是否入选（前视偏差）。
+        均额与上市天数的逐 bar 动态判断已移入 `_evaluate`（按当根滚动）。
+        """
         if df is None or len(df) < 30:
             return False
         ts_code = str(df["ts_code"].iloc[0]) if "ts_code" in df.columns else ""
-        # 排除科创/创业板
+        # 排除科创/创业板/北交所
         if any(ts_code.startswith(p) for p in self.EXCLUDED_PREFIX):
             return False
-        # 上市天数（用数据长度近似）
+        # 上市天数（数据长度近似 + 若注入 list_date 则取精确判断，见 _evaluate）
         if len(df) < self.MIN_LIST_DAYS:
             return False
-        # 近 20 日日均成交额 ≥ 1 亿（amount 单位千元，1亿元=1e5千元）
-        if len(df) >= 20:
-            avg_amount_20d = df["amount"].tail(20).mean()
-            if avg_amount_20d < self.MIN_AVG_AMOUNT_20D / 1e3:   # 1e8元 → 1e5千元
-                return False
         return True
 
     def _three_layer_filter(self, row: pd.Series) -> tuple[bool, str]:
@@ -118,7 +126,11 @@ class CherryClaw(StrategyBase):
         return [l1, l2, l3, l4]
 
     def _evaluate(self, df: pd.DataFrame, indicators: dict) -> list[Signal]:
-        """对带指标的 DataFrame 逐 bar 评估，返回通过过滤的买入信号。"""
+        """对带指标的 DataFrame 评估，返回通过过滤的买入信号。
+
+        P2-6（第十一轮）：由逐行 Python 循环改为向量化布尔掩码一次性输出全部
+        Signal（全部条件均为列级布尔表达式），提升回测性能；语义与前者完全等价。
+        """
         df_ind = indicators.get("df", df)
         if df_ind is None or df_ind.empty:
             return []
@@ -127,21 +139,62 @@ class CherryClaw(StrategyBase):
             return []
 
         ts_code = str(df_ind["ts_code"].iloc[0]) if "ts_code" in df_ind.columns else ""
-        signals: list[Signal] = []
 
-        for i in range(len(df_ind)):
-            row = df_ind.iloc[i]
-            # 前几根指标未就绪，跳过
-            if pd.isna(row.get("ma5")) or pd.isna(row.get("ma20")) or pd.isna(row.get("vol_ratio")):
-                continue
-            passed, reason = self._three_layer_filter(row)
-            if not passed:
-                continue
+        # —— P1-5：逐 bar 滚动 20 日均额（无前视）。amount 单位千元；阈值 1e8 元 = 1e5 千元 ——
+        rolling_amount = None
+        if "amount" in df_ind.columns:
+            rolling_amount = df_ind["amount"].rolling(20).mean()
+
+        # 指标未就绪的行剔除（前几根）
+        ready = (
+            df_ind["ma5"].notna()
+            & df_ind["ma20"].notna()
+            & df_ind["vol_ratio"].notna()
+        ) if {"ma5", "ma20", "vol_ratio"}.issubset(df_ind.columns) else pd.Series(
+            True, index=df_ind.index
+        )
+        mask = ready.copy()
+
+        # P1-5：滚动均额过滤（当根往前 20 日，不用未来）
+        if rolling_amount is not None:
+            mask &= rolling_amount.notna() & (rolling_amount >= self.MIN_AVG_AMOUNT_20D / 1e3)
+
+        # P1-5：上市天数（DataFrame 元数据注入 list_date 时精确逐日判定）
+        list_date = getattr(df_ind, "attrs", {}).get("list_date", None)
+        if list_date is not None:
+            try:
+                ld = pd.to_datetime(list_date).date()
+            except Exception:
+                ld = None
+            if ld is not None:
+                _tds = pd.to_datetime(df_ind["trade_date"]).dt.date
+                days_listed = pd.Series(
+                    [(d - ld).days if d else self.MIN_LIST_DAYS for d in _tds],
+                    index=df_ind.index,
+                )
+                mask &= days_listed >= self.MIN_LIST_DAYS
+
+        # —— 三层过滤（全部列级布尔） ——
+        # 第 1 层：金叉新鲜度 ≤7 且 MA5>MA10
+        f = df_ind["ma5_x_ma10"]
+        mask &= f.notna() & (f <= self.golden_cross_max_freshness)
+        mask &= df_ind["ma5"] > df_ind["ma10"]
+        # 第 2 层：量比≥阈值 + 实体占比≥阈值 + 收红
+        mask &= df_ind["vol_ratio"] >= self.volume_ratio_threshold
+        mask &= df_ind["body_ratio"] >= self.entity_ratio_threshold
+        mask &= df_ind["is_red"]
+        # 第 3 层：收盘贴近 MA5 + MA20 斜率向上
+        mask &= (df_ind["close"] / df_ind["ma5"] - 1).abs() <= self.close_to_ma5_max_dev
+        mask &= df_ind["ma20_slope"] > 0
+
+        signals: list[Signal] = []
+        idx = df_ind.index[mask.fillna(False).to_numpy()]
+        for i in idx:
+            row = df_ind.loc[i]
             close = float(row["close"])
             ma10 = float(row.get("ma10", close))
             stop_loss = self.stop_loss_mgr.calc_stop_price(close, ma10)
             targets = self._calc_targets(row)
-            trade_date = row.get("trade_date")
             signals.append(Signal(
                 kind="buy",
                 ts_code=ts_code,
@@ -150,8 +203,8 @@ class CherryClaw(StrategyBase):
                 take_profit=targets,
                 suggested_position_pct=self.max_position_pct,
                 strategy_name=self.name,
-                reason=f"三层过滤通过：{reason}",
-                trade_date=trade_date,
+                reason="三层过滤通过",
+                trade_date=row.get("trade_date"),
             ))
         return signals
 

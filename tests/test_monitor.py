@@ -58,12 +58,12 @@ def test_alerter_serverchan_push_mock():
 
 
 def test_alerter_serverchan_push_failure_not_fatal():
-    """Server酱推送失败不影响主流程。"""
+    """Server酱推送失败不阻断主流程（P2-9-7：返回实通道失败结果）。"""
     alerter = Alerter(serverchan_key="SCT_bad")
     with patch("lihu_quantify.monitor.alerts.requests") as mock_req:
         mock_req.post.side_effect = Exception("网络异常")
-        ok = alerter.send("推送失败测试")   # 仍应返回 True（控制台成功）
-        assert ok is True
+        ok = alerter.send("推送失败测试")   # 实通道全失败 → 返回 False，但不抛异常
+        assert ok is False
 
 
 # ============ ReportGenerator ============

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,28 +21,38 @@ from lihu_quantify.execution.xtquant_client import MiniQMTClient
 from lihu_quantify.types import Signal
 
 
-_TEST_STATE_DIR = Path(__file__).parent / ".test_state"
 _COUNTER = [0]
+# P2-8（第十一轮）：隔离持久化改走 pytest 托管临时目录（tmp_path_factory 会话级），
+# 取代旧的 tests/.test_state 残留目录；测试结束后由 pytest 统一清理，不再泄漏。
+_TMP_STATE_DIR: Path | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _state_tmpdir(tmp_path_factory):
+    """模块级 autouse fixture：提供一个 pytest 托管的临时目录给本模块所有 PaperBroker/OMS。
+
+    依赖 _paper/_oms 的测试在 fixture 执行后才构造对象，故此处拿到目录即可。
+    """
+    global _TMP_STATE_DIR
+    _TMP_STATE_DIR = tmp_path_factory.mktemp("exec_state")
+    return _TMP_STATE_DIR
 
 
 def _unique_path(prefix: str) -> str:
-    """每次生成唯一状态文件路径（避免测试间共享残留）。"""
-    _TEST_STATE_DIR.mkdir(exist_ok=True)
+    """在当前模块的临时目录生成唯一路径（前缀+序号，进程无关）。"""
     _COUNTER[0] += 1
-    import os
-
-    return str(_TEST_STATE_DIR / f"{prefix}_{os.getpid()}_{_COUNTER[0]}.json")
+    return str(_TMP_STATE_DIR / f"{prefix}_{_COUNTER[0]}.json")
 
 
-def _paper(tmp_path=None, **kwargs) -> PaperBroker:
-    """构建隔离持久化的 PaperBroker（每次唯一文件）。"""
+def _paper(**kwargs) -> PaperBroker:
+    """构建隔离持久化的 PaperBroker（每次唯一文件，位于 pytest 临时目录）。"""
     if "state_file" not in kwargs:
         kwargs["state_file"] = _unique_path("paper")
     return PaperBroker(**kwargs)
 
 
-def _oms(pb, tmp_path=None, **kwargs) -> OrderManagementSystem:
-    """构建隔离持久化的 OMS（每次唯一文件）。"""
+def _oms(pb, **kwargs) -> OrderManagementSystem:
+    """构建隔离持久化的 OMS（每次唯一文件，位于 pytest 临时目录）。"""
     if "registry_file" not in kwargs:
         kwargs["registry_file"] = _unique_path("registry")
     return OrderManagementSystem(pb, **kwargs)

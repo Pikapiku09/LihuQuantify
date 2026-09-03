@@ -23,6 +23,7 @@ from loguru import logger
 from lihu_quantify.config import get_settings
 from lihu_quantify.data.tushare_client import TushareClient
 from lihu_quantify.data.duckdb_store import DuckDBStore
+from lihu_quantify.market import classify_market_state  # P2-9-4：迁入包内，scheduler 复用
 from lihu_quantify.strategy.cherry_claw import CherryClaw
 from lihu_quantify.backtest.broker import SimulatedBroker
 from lihu_quantify.backtest.engine import EventDrivenEngine
@@ -54,28 +55,19 @@ def fetch_data(client: TushareClient, store: DuckDBStore, codes: list[str], days
             logger.warning(f"{code} 无数据，跳过")
             continue
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        # 第十一轮 P1-1：前复权（除权日 MA/止损/盈亏口径修正）
+        from lihu_quantify.data.adjustment import adjust_from_store
+        df = adjust_from_store(client, store, code, df, start, latest)
         data[code] = df.sort_values("trade_date").reset_index(drop=True)
-        logger.info(f"{code}: {len(df)} 根日线")
+        logger.info(f"{code}: {len(df)} 根日线（前复权）")
     return data, idx_df
 
 
 def classify_market_state(idx_df: pd.DataFrame, window: int = 20) -> dict:
-    """修复6：用 000001.SH 20 日涨跌幅把交易日分三段。返回 {trade_date: state}。"""
-    if idx_df is None or idx_df.empty:
-        return {}
-    df = idx_df.sort_values("trade_date").reset_index(drop=True).copy()
-    df["ret_20d"] = df["close"].pct_change(window) * 100
-    states = {}
-    for _, row in df.iterrows():
-        if pd.isna(row["ret_20d"]):
-            states[row["trade_date"]] = "未知"
-        elif row["ret_20d"] >= 3:
-            states[row["trade_date"]] = "上涨"
-        elif row["ret_20d"] <= -3:
-            states[row["trade_date"]] = "下跌"
-        else:
-            states[row["trade_date"]] = "震荡"
-    return states
+    """薄引用：实现迁至 lihu_quantify.market（见 P2-9-4）。"""
+    from lihu_quantify.market import classify_market_state as _impl
+
+    return _impl(idx_df, window)
 
 
 def print_result(result, codes, idx_df):

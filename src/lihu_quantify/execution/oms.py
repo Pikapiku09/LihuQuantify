@@ -164,6 +164,10 @@ class OrderManagementSystem:
             return buy_result, None
 
         # 登记止损（程序化条件单）
+        if not signal.stop_loss or signal.stop_loss <= 0:
+            # P2-9-9-3：止损价非法 → 不登记（否则恒不触发，持仓失去保护）
+            logger.error(f"[OMS] {signal.ts_code} 止损价非法(≤0)，未登记止损，需人工处理")
+            return buy_result, None
         stop = StopOrder(
             ts_code=signal.ts_code,
             volume=volume,
@@ -171,6 +175,14 @@ class OrderManagementSystem:
             buy_order_id=buy_result.order_id,
             reason=f"买入@{buy_price:.2f} 止损@{signal.stop_loss:.2f}",
         )
+        # P2-9-9-1：同票二次买入——不覆盖旧止损（否则旧仓位失去保护），
+        # 累计监控数量并取更保守止损价（registry 仍以 ts_code 为键，保持既约）。
+        existing = self.stop_registry.get(signal.ts_code)
+        if existing is not None and not existing.triggered:
+            stop.volume = existing.volume + stop.volume
+            stop.stop_price = min(existing.stop_price, stop.stop_price)
+            stop.buy_order_id = existing.buy_order_id or stop.buy_order_id
+            logger.info(f"[OMS] {signal.ts_code} 已有未触发止损，累计监控 {stop.volume} 股")
         self.stop_registry[signal.ts_code] = stop
         self._save_registry()   # 修复B.2：持久化
         logger.info(
@@ -243,23 +255,29 @@ class OrderManagementSystem:
         positions = self.broker.query_positions()
         count = 0
         for p in positions:
-            if p.ts_code in self.stop_registry:
+            total_vol = p.volume + p.frozen
+            if total_vol <= 0:
                 continue
             cost = p.cost if p.cost > 0 else 0
+            if cost <= 0:
+                # P2-9-9-3：成本非法 → 止损价恒为 0，永不触发，跳过登记并告警
+                logger.error(f"[OMS] {p.ts_code} 成本异常(≤0)，跳过止损登记，需人工处理")
+                continue
+            # P2-9-9-2：已有登记且数量与持仓一致 → 复用（保留原始止损价）；
+            # 数量不一致或已触发 → 重算。
+            existing = self.stop_registry.get(p.ts_code)
+            if existing is not None and not existing.triggered and existing.volume == total_vol:
+                continue
             if stop_price_fn is not None:
                 sp = stop_price_fn(p.ts_code, cost)
             else:
                 sp = round(cost * 0.92, 2)   # 成本 -8%
-            # query_positions 返回的 volume 是可用量；崩溃恢复场景下
-            # 挂单冻结的量也应监控，这里用可用量 + 冻结量
-            total_vol = p.volume + p.frozen
-            if total_vol <= 0:
-                continue
-            self.stop_registry[p.ts_code] = StopOrder(
-                ts_code=p.ts_code, volume=total_vol, stop_price=sp,
-                reason=f"重建（成本{cost:.2f}）",
-            )
-            count += 1
+            if sp > 0:
+                self.stop_registry[p.ts_code] = StopOrder(
+                    ts_code=p.ts_code, volume=total_vol, stop_price=sp,
+                    reason=f"重建（成本{cost:.2f}）",
+                )
+                count += 1
         if count:
             logger.info(f"[OMS] 从持仓重建 {count} 个止损登记")
             self._save_registry()   # 修复B.2：重建后持久化

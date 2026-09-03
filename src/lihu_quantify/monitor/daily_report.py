@@ -144,6 +144,14 @@ def _render_overview(d: dict) -> str:
         day_pct = day_pnl / prev
         rows.insert(3, ("今日盈亏",
                         _pnl_span(day_pnl, f"{_money(day_pnl, sign=True)}（{_pct(day_pct)}）")))
+    # 评审进度（100 笔 live 验收；口径=配对轮次，同月度复盘）
+    _rv = d.get("review") or {}
+    if _rv:
+        _cr = _rv.get("closed_rounds") or 0
+        _tgt = _rv.get("target") or 100
+        _wr = f"{_rv['win_rate']:.1%}" if _rv.get("win_rate") is not None else "-"
+        _pr = f"{_rv['pl_ratio']:.2f}" if _rv.get("pl_ratio") is not None else "-"
+        rows.append(("评审进度", f"{_cr}/{_tgt} 轮 · 胜率 {_wr} · 盈亏比 {_pr}"))
     body = _table(
         ["指标", "数值"],
         [[_td(k), _td(v, num=True)] for k, v in rows],
@@ -374,6 +382,26 @@ def _render_capital(d: dict) -> str:
     return _section("七、资金利用", "".join(parts))
 
 
+def _render_brief(d: dict) -> str:
+    """需求5（第十轮）：今日简报（门面层）——插在邮件顶部，明细表格下移。
+
+    brief = AI 收盘总结（AI 版）或规则版兜底（scheduler 生成，永不为空）；
+    旧数据无 brief 字段 → 整块省略（向下兼容）。
+    """
+    text = (d.get("brief") or "").strip()
+    if not text:
+        return ""
+    tag = "AI 版" if (d.get("ai_summary") or "").strip() else "规则版"
+    body = (
+        '<div style="background:#eff6ff;border-left:4px solid #3b82f6;'
+        'padding:10px 12px;border-radius:0 6px 6px 0;font-size:13px;'
+        f'color:#1f2937;line-height:1.8;white-space:pre-wrap;">{_esc(text)}</div>'
+        f'<p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">'
+        f'今日简报（{tag}）；审计明细见下方各节与完整 .md 报告。</p>'
+    )
+    return _section("今日简报", body)
+
+
 def _render_ai_summary(d: dict) -> str:
     """第八轮清单：AI 收盘总结（纯展示层；None/空 → 整节省略）。
 
@@ -416,6 +444,7 @@ def build_daily_report_email(d: dict) -> tuple[str, str]:
     )
 
     sections = "".join([
+        _render_brief(d),        # 需求5（第十轮）：简报门面层置顶
         _render_overview(d),
         _render_positions(d),
         _render_operations(d),

@@ -43,4 +43,5 @@ services:
     volumes:
       - ./data:/app/data               # 只读展示 scheduler 写入的状态（共享同一卷）
       - ./outputs:/app/outputs
+      - ./config:/app/config           # 第十轮需求1：设置页写 settings.yaml（原子写+审计）
     command: python -m web.server

@@ -9,6 +9,9 @@
 #   - 绝不在路由器上把 8000 端口映射到公网；远程访问用 Tailscale/ZeroTier 组网。
 #   - tushareMcp.json（token）与 .env（邮件授权码）不进 git，仅本机挂载。
 
+# 兼容性：version 字段兼容 NAS 上的 Compose V1（1.28.x）；V2 CLI 亦接受。
+version: "3.8"
+
 services:
   scheduler:
     build: .

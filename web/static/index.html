@@ -1145,7 +1145,13 @@
                             // 问题2（第九轮）：rich 标签转义——name 含 { } | 会
                             // 破坏富文本 {n|...} 语法导致标签渲染异常（乱码样）
                             const safeName = String(p.name ?? '').replace(/[{}|]/g, '');
-                            return `{n|${safeName}}\n{p|${pctTxt}}`;
+                            // 修复（第十二轮）：treemap 父节点（行业层）不解析 rich 富文本，
+                            // {n|...} 会原样显示；只有叶子（个股，带 code）用富文本，
+                            // 父节点改纯文本（行业名已在 upperLabel 顶栏显示，中央为补充信息）
+                            if (p.data.code) {
+                                return `{n|${safeName}}\n{p|${pctTxt}}`;
+                            }
+                            return pctTxt ? `${safeName} ${pctTxt}` : safeName;
                         },
                         rich: {
                             n: { fontSize: 11, color: '#fff', fontWeight: 600 },

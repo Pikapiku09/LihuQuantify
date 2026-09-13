@@ -159,6 +159,33 @@ def _dashboard_review(state: dict) -> dict:
                 "win_rate": None, "pl_ratio": None, "stage": "accumulating"}
 
 
+def _shadow_reviews() -> dict:
+    """影子账本评审进度聚合（第十二轮）：glob data/paper_state_*.json
+    （排除主 paper_state.json 与 .bak 备份），每账本现算 review_stats。
+
+    统计纪律：影子同期相关，仅作跨池稳健性对照——评审进度以主账本为准。
+    读文件失败跳过该账本（看板永不因影子文件缺失/损坏报错）。
+    """
+    out: dict = {}
+    try:
+        from lihu_quantify.monitor.review_progress import review_stats
+
+        for p in sorted(DATA_DIR.glob("paper_state_*.json")):
+            if ".bak" in p.name:
+                continue
+            name = p.stem.removeprefix("paper_state_")
+            try:
+                state = _read_json(p)
+                if not state:
+                    continue
+                out[name] = review_stats(state.get("trades") or [], name=name)
+            except Exception:
+                continue   # 单账本损坏不影响其他
+    except Exception:
+        return {}
+    return out
+
+
 def _read_stop_registry() -> dict:
     return _read_json(DATA_DIR / "stop_registry.json")
 
@@ -270,6 +297,8 @@ async def dashboard():
         "live": _live_metrics(state, scan_summary, total_asset),
         # 评审进度（100 笔 live 验收；口径=配对轮次，见 review_progress.py）
         "review": _dashboard_review(state),
+        # 影子账本评审进度（第十二轮）：{"s43": {...}, ...}；仅跨池对照参考
+        "review_shadows": _shadow_reviews(),
         # 问题1（第九轮）：AI 收盘总结上看板（纯展示，前端 textContent 渲染；
         # 未配置 key/生成失败 → None → 前端显示"暂无"，不报错）
         "ai_summary": scan_summary.get("ai_summary"),

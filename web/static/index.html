@@ -729,12 +729,18 @@
             const closed = rv.closed_rounds ?? 0, tgt = rv.target ?? 100;
             const pct = Math.min(100, Math.round(closed / tgt * 100));
             const fillCls = closed >= tgt ? 'ok' : (closed >= 50 ? 'warn' : '');
+            // 影子账本合计（第十二轮：跨池稳健性对照，不计入评审进度）
+            const shadows = data.review_shadows || {};
+            const shadowTxt = Object.entries(shadows)
+                .map(([k, v]) => `${k} ${v.closed_rounds ?? 0}轮`)
+                .join(' · ');
+            const shadowSub = shadowTxt ? ` · 影子 ${shadowTxt}` : '';
             cards.push({
                 label: '评审进度',
                 value: `${closed} / ${tgt} 轮`,
-                sub: rv.win_rate != null
+                sub: (rv.win_rate != null
                     ? `胜率 ${fmt.pct(rv.win_rate)} · 盈亏比 ${(rv.pl_ratio ?? 0).toFixed(2)} · ${stageText(rv.stage)}`
-                    : `尚无平仓轮 · 已实现 ${fmt.moneySign(rv.realized_pnl ?? 0)}`,
+                    : `尚无平仓轮 · 已实现 ${fmt.moneySign(rv.realized_pnl ?? 0)}`) + shadowSub,
                 bar: `<div class="progress-wrap"><div class="progress-fill ${fillCls}" style="width:${pct}%"></div></div>`,
             });
             document.getElementById('metricsGrid').innerHTML = cards.map(c => `

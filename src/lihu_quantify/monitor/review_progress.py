@@ -32,7 +32,7 @@ def _as_date(v) -> Optional[_dt.date]:
     return None
 
 
-def review_stats(trades: list[dict]) -> dict:
+def review_stats(trades: list[dict], name: str = "main") -> dict:
     """从成交流水算评审指标。trades 元素须含 ts_code/trade_date 或 date/side/
     price/volume/commission/stamp_tax；date 字段 date 或 ISO str 均可。"""
     recs = []
@@ -54,6 +54,7 @@ def review_stats(trades: list[dict]) -> dict:
     avg_loss = abs(sum(losses) / len(losses)) if losses else None
     pl_ratio = avg_win / avg_loss if (avg_win is not None and avg_loss) else None
     return {
+        "name": name,                # 账本名（main=主账本；影子为 BookSpec.name）
         "closed_rounds": closed,
         "target": REVIEW_TARGET,
         "remaining": max(0, REVIEW_TARGET - closed),

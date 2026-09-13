@@ -25,7 +25,7 @@ from loguru import logger
 
 from lihu_quantify.config import get_settings
 from lihu_quantify.monitor.log_setup import setup_file_logging
-from lihu_quantify.monitor.scheduler import DailyScanner, setup_scheduler
+from lihu_quantify.monitor.scheduler import BookSpec, DailyScanner, setup_scheduler
 
 
 def main():
@@ -49,13 +49,28 @@ def main():
         sys.exit(1)
 
     if args.run_now:
-        logger.info(f"[--run-now] 立即执行一次巡检（force={args.force}）")
+        logger.info(f"[--run-now] 立即执行一次巡检（force={args.force}，含影子账本）")
         scanner = DailyScanner(settings, mode=args.mode)
         summary = scanner.scan(n=args.n, force=args.force)
         print(f"\n巡检摘要: 基准日 {summary['trade_date']}，"
               f"市场 {summary['market_state']}，信号 {summary['signals']}，"
               f"执行 {len(summary['executed'])}，拦截 {len(summary['rejected'])}")
         print(f"报告: {summary['report']}")
+        # 第十二轮：影子账本顺序补跑（主先影子后，影子命中当日缓存；
+        # 异常隔离——影子失败不影响主账本已完成的巡检）
+        for sb in getattr(settings, "shadow_books", []) or []:
+            try:
+                s2 = settings.model_copy(deep=True)
+                s2.universe.pool_seed = sb.seed
+                sc = DailyScanner(s2, mode=args.mode,
+                                  book=BookSpec(name=sb.name, pool_seed=sb.seed,
+                                                silent=True))
+                sm = sc.scan(n=args.n)
+                print(f"影子 {sb.name}: 基准日 {sm['trade_date']}，"
+                      f"信号 {sm['signals']}，执行 {len(sm['executed'])}，"
+                      f"拦截 {len(sm['rejected'])} → {sm['report']}")
+            except Exception as e:
+                logger.error(f"[影子{sb.name}] 巡检异常（跳过）: {e}")
 
     sched = setup_scheduler(settings, mode=args.mode, n=args.n)
     logger.info("进入调度等待（Ctrl+C 退出）...")

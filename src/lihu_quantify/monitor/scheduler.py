@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -277,8 +278,41 @@ def _build_daily_summary(
     }
 
 
+@dataclass
+class BookSpec:
+    """账本规格：main=主账本（现行行为），其余为影子账本（第十二轮）。
+
+    影子账本隔离：paper_state / stop_registry / pending_stops 状态文件后缀、
+    分层池 seed、报告目录（shadow_<name>/）；silent=True 时不发邮件、
+    不调 AI 摘要、不 ping 心跳、不写 last_scan.json（防日报轰炸+幂等污染）。
+    """
+
+    name: str = "main"
+    pool_seed: int = 42
+    silent: bool = False          # 影子=True：无邮件/AI 摘要/心跳/last_scan 写入
+
+    @property
+    def is_main(self) -> bool:
+        return self.name == "main"
+
+    def suffix(self) -> str:
+        return "" if self.is_main else f"_{self.name}"
+
+
 class DailyScanner:
     """每日巡检（可独立调用，也可被 Scheduler 调度）。"""
+
+    # 类属性兜底：__new__ 构造的测试 stub 无 __init__ 时回落主账本行为
+    book = BookSpec()
+
+    @property
+    def _pending_file(self) -> Path:
+        """pending_stops 路径（动态读 _ROOT + BookSpec 后缀，测试 monkeypatch 生效）。"""
+        return _ROOT / "data" / f"pending_stops{self.book.suffix()}.json"
+
+    @property
+    def _state_label(self) -> str:
+        return "主" if self.book.is_main else f"影子{self.book.name}"
 
     def __init__(
         self,
@@ -287,6 +321,7 @@ class DailyScanner:
         alerter: Optional[Alerter] = None,
         reporter: Optional[ReportGenerator] = None,
         mode: str = "paper",
+        book: Optional[BookSpec] = None,
     ):
         """
         Args:
@@ -295,35 +330,54 @@ class DailyScanner:
             alerter: 告警器（None=新建，key 取 settings.alert）
             reporter: 报告生成器（None=新建 outputs/reports/）
             mode: paper / live
+            book: 账本规格（None=主账本，现行行为；影子见 BookSpec）
         """
         self.settings = settings
         self.mode = mode
+        self.book = book or BookSpec(pool_seed=getattr(
+            settings.universe, "pool_seed", 42))
         # 第十轮需求1：配置热生效——scan() 每次巡检前从此路径重载 settings.yaml
         self._settings_path = _DEFAULT_SETTINGS_PATH
         # 第四轮清单1：邮件通道（enabled+配置齐全才生效；否则 None=不启用）
         # 第十轮需求1：授权码解析顺序 = data/secrets.json → env/yaml（设置界面可写）
-        from .alerts import build_email_alerter
+        # 第十二轮：影子账本 Alerter(enabled=False)——send() 全静默但
+        # history 仍累积（影子报告可见拦截原因），17 处调用点零改动；
+        # enabled 标志在热载后就地更新属性也不复活（enabled 不被热载覆盖）。
+        _email = None
+        if not self.book.silent:
+            from .alerts import build_email_alerter
 
-        _alert = getattr(settings, "alert", None)
-        _email_cfg = getattr(_alert, "email", None) if _alert else None
-        if _email_cfg is not None:
-            try:
-                _email_cfg = _email_cfg.model_copy(
-                    update={"auth_code": settings.resolved_email_auth_code()})
-            except Exception:
-                pass
-        _email = build_email_alerter(_email_cfg)
+            _alert = getattr(settings, "alert", None)
+            _email_cfg = getattr(_alert, "email", None) if _alert else None
+            if _email_cfg is not None:
+                try:
+                    _email_cfg = _email_cfg.model_copy(
+                        update={"auth_code": settings.resolved_email_auth_code()})
+                except Exception:
+                    pass
+            _email = build_email_alerter(_email_cfg)
         self.alerter = alerter or Alerter(
             serverchan_key=getattr(getattr(settings, "alert", None), "serverchan_key", ""),
             email=_email,
+            enabled=not self.book.silent,
         )
         # 第四轮清单2：缺席心跳（healthchecks.io；url 空=全部 no-op）
+        # 第十二轮：影子账本心跳 no-op（防三份 ping）
         from .heartbeat import Heartbeat
 
-        self.heartbeat = Heartbeat(
-            getattr(getattr(settings, "heartbeat", None), "healthchecks_url", "")
-        )
-        self.reporter = reporter or ReportGenerator(_ROOT / "outputs" / "reports")
+        if self.book.silent:
+            self.heartbeat = Heartbeat("")
+        else:
+            self.heartbeat = Heartbeat(
+                getattr(getattr(settings, "heartbeat", None), "healthchecks_url", "")
+            )
+        # 第十二轮：影子报告目录 shadow_<name>/（ReportGenerator 不自动建目录，此处建）
+        if reporter is None and not self.book.is_main:
+            _shadow_dir = _ROOT / "outputs" / "reports" / f"shadow_{self.book.name}"
+            _shadow_dir.mkdir(parents=True, exist_ok=True)
+            self.reporter = ReportGenerator(_shadow_dir)
+        else:
+            self.reporter = reporter or ReportGenerator(_ROOT / "outputs" / "reports")
         # 数据通道（独立于交易通道）
         self.client = TushareClient(
             token=settings.resolved_tushare_token(),
@@ -333,7 +387,9 @@ class DailyScanner:
         )
         self.store = DuckDBStore(settings.resolved_duckdb_path())
         self.broker = broker or PaperBroker(
-            init_capital=settings.init_capital, tushare_client=self.client
+            init_capital=settings.init_capital, tushare_client=self.client,
+            state_file=None if self.book.is_main
+            else str(_ROOT / f"data/paper_state{self.book.suffix()}.json"),
         )
 
     # ===== 数据准备 =====
@@ -362,7 +418,7 @@ class DailyScanner:
                 self.client, self.store,
                 target_n=getattr(u, "pool_size", 200) or n,
                 layers=getattr(u, "pool_layers", 5),
-                seed=getattr(u, "pool_seed", 42),
+                seed=self.book.pool_seed,
                 min_list_days=u.min_list_days,
                 min_avg_amount=u.min_avg_amount_20d,
             )
@@ -461,7 +517,10 @@ class DailyScanner:
         s, r = self.settings.strategy, self.settings.risk
         latest, market_state = self._market_state()
         last = self._read_last_scan()
-        if not force:
+        # 第十二轮：影子账本跳过幂等检查——last_scan 是主账本的（影子不写），
+        # 编排层保证主账本当日已扫才跑影子；prev_total_asset 仍取主账本快照
+        # （同为收盘价口径，作影子"今日盈亏"对比基线）。
+        if not force and not self.book.silent:
             if last and str(last.get("trade_date")) == str(latest):
                 logger.info(f"[幂等] {latest} 已巡检过（{last.get('finished_at', '?')}），跳过。"
                             f"如需重跑：--force")
@@ -475,7 +534,7 @@ class DailyScanner:
         prev_total_asset = None
         if last and str(last.get("trade_date")) != str(latest):
             prev_total_asset = (last.get("summary") or {}).get("total_asset")
-        logger.info(f"[巡检] 基准日 {latest}，市场状态 {market_state}")
+        logger.info(f"[巡检] [{self._state_label}] 基准日 {latest}，市场状态 {market_state}")
         self.heartbeat.start()
         try:
             summary = self._scan_impl(
@@ -484,17 +543,19 @@ class DailyScanner:
             )
         except Exception as e:
             self.heartbeat.fail()
-            logger.exception(f"[巡检异常] {latest}: {e}")
-            if self.alerter.email is not None:
+            logger.exception(f"[巡检异常] [{self._state_label}] {latest}: {e}")
+            if self.alerter.email is not None and not self.book.silent:
                 self.alerter.email.send(
                     f"🚨 LihuQuantify 巡检异常 {latest}",
                     f"{type(e).__name__}: {e}\n\n详见容器/进程日志。",
                 )
             raise
         # 幂等写入 + 心跳成功 + 每日摘要邮件
-        self._write_last_scan(latest, summary)
+        # （第十二轮：影子不写 last_scan/不发日报——防三份日报轰炸+幂等污染）
+        if not self.book.silent:
+            self._write_last_scan(latest, summary)
+            self._send_digest(summary)
         self.heartbeat.success()
-        self._send_digest(summary)
         return summary
 
     def collect_signals(self, n: int = 50, days: int = 120) -> dict:
@@ -563,7 +624,16 @@ class DailyScanner:
 
         # 崩溃恢复：无止损登记的持仓重建（默认成本-8%；修复B：文件已有
         # 原始止损价时优先保留，rebuild 只补缺失）
-        oms = OrderManagementSystem(self.broker)
+        # 第十二轮：主账本保持原调用签名（现有测试 mock 兼容）；
+        # 影子账本 stop_registry 落独立文件（None=现行默认路径）
+        if self.book.is_main:
+            oms = OrderManagementSystem(self.broker)
+        else:
+            oms = OrderManagementSystem(
+                self.broker,
+                registry_file=str(
+                    _ROOT / f"data/stop_registry{self.book.suffix()}.json"),
+            )
         positions_before = self.broker.query_positions()
         if positions_before:
             oms.rebuild_stops_from_positions()
@@ -614,10 +684,12 @@ class DailyScanner:
                 last_ind = df_ind.iloc[-1]
                 # 需求1（第八轮）：信号评分（资金紧张时 top-N 排序用）
                 signals.append((sig, last_ind, _signal_score(last_ind)))
-        logger.info(f"[巡检] 扫描信号 {len(signals)} 个")
+        logger.info(f"[巡检] [{self._state_label}] 扫描信号 {len(signals)} 个")
 
         # 问题3（第九轮）：热力图快照落盘（web 唯一数据源，切断 DuckDB 依赖）
-        self._write_heatmap_snapshot(hm_quotes, name_map, sector_map)
+        # 第十二轮：影子不写（共享文件，避免影子池覆盖主快照）
+        if not self.book.silent:
+            self._write_heatmap_snapshot(hm_quotes, name_map, sector_map)
 
         # 市场参考信号（修复A：reduce=非上涨段仓位减半；block=禁止）
         if market_state != "上涨" and s.market_filter:
@@ -779,13 +851,17 @@ class DailyScanner:
         #      结果随 last_scan.json 持久化） ----
         # 第十轮需求1：api_key 解析顺序 = data/secrets.json → 环境变量 → 空
         # （设置界面写 secrets.json，下次巡检即生效，不依赖 compose env）
-        try:
-            _ai_key = self.settings.resolved_ai_summary_api_key()
-        except Exception:
-            _ai_key = getattr(getattr(self.settings, "ai_summary", None), "api_key", "")
-        summary["ai_summary"] = build_ai_summary(
-            summary, getattr(self.settings, "ai_summary", None), _ai_key,
-        )
+        # 第十二轮：影子账本不调 AI（省 API 费 + 防影子摘要混入主日报）
+        if self.book.silent:
+            summary["ai_summary"] = None
+        else:
+            try:
+                _ai_key = self.settings.resolved_ai_summary_api_key()
+            except Exception:
+                _ai_key = getattr(getattr(self.settings, "ai_summary", None), "api_key", "")
+            summary["ai_summary"] = build_ai_summary(
+                summary, getattr(self.settings, "ai_summary", None), _ai_key,
+            )
         # 需求5（第十轮）：双层简报——AI 成功用 AI 版，失败/未配置自动回退规则版
         summary["brief"] = (summary.get("ai_summary")
                             or summary.pop("brief_rule", "") or "")
@@ -817,14 +893,16 @@ class DailyScanner:
         )
         summary["report"] = str(report_path)
         # 修复G(第三轮)：过滤命中统计（月度复盘读取）
-        _append_filter_stats({
-            "date": str(latest),
-            "market_state": market_state,
-            "signals": len(signals),
-            "filter_mode": s.market_filter_mode if s.market_filter else "off",
-            "entry_scale": 0.0 if block_mode else reduce_scale,
-            "executed": len(executed),
-        })
+        # 第十二轮：影子不写（防同日重复条目污染主账本统计）
+        if not self.book.silent:
+            _append_filter_stats({
+                "date": str(latest),
+                "market_state": market_state,
+                "signals": len(signals),
+                "filter_mode": s.market_filter_mode if s.market_filter else "off",
+                "entry_scale": 0.0 if block_mode else reduce_scale,
+                "executed": len(executed),
+            })
         return summary
 
     # ===== 工具 =====
@@ -978,7 +1056,8 @@ class DailyScanner:
         移除；失败/无开盘价 → 保留并累加 failed_count，连续 ≥3 次升级
         ERROR 告警（触发即时邮件通道），防止持仓失去止损保护。
         """
-        pending_file = _ROOT / "data" / "pending_stops.json"
+        # 第十二轮：影子账本 pending 文件独立（BookSpec 后缀）
+        pending_file = self._pending_file
         executed_stops: list[dict] = []   # 今日开盘执行的止损
         remaining: list[dict] = []        # P0-3：未成交保留（失败/无开盘价）
 
@@ -1058,7 +1137,7 @@ class DailyScanner:
         trailing_profit_pullback(默认3%) 判定（高水位×0.97，与
         risk/stop_loss.py 第七轮修正后口径一致）。
         """
-        pending_file = _ROOT / "data" / "pending_stops.json"
+        pending_file = self._pending_file   # 第十二轮：影子账本独立 pending 文件
         buys_today = set()
         for t in getattr(self.broker, "trades", []) or []:
             if t.get("side") == "buy" and str(t.get("date", ""))[:10] == str(latest)[:10]:
@@ -1180,16 +1259,42 @@ def setup_scheduler(
     sched = BlockingScheduler(timezone=settings.scheduler.timezone)
     scanner = DailyScanner(settings, mode=mode)
 
+    # ---- 影子账本（第十二轮）：顺序执行，主先影子后 ----
+    # 影子命中主账本当日取数缓存（同 client 缓存目录），每日新增 API 趋近零。
+    # 统计纪律：评审进度以主账本为准，影子仅跨池稳健性对照。
+    # 注意：shadow_books 增删在进程重启后生效（scan 内配置热载不重建影子
+    # scanner 列表，防止巡检中途换账本集合）。
+    shadow_scanners: list[DailyScanner] = []
+    for _sb in getattr(settings, "shadow_books", []) or []:
+        try:
+            _s2 = settings.model_copy(deep=True)   # pydantic v2 深拷贝嵌套 model
+            _s2.universe.pool_seed = _sb.seed
+            shadow_scanners.append(DailyScanner(
+                _s2, mode=mode,
+                book=BookSpec(name=_sb.name, pool_seed=_sb.seed, silent=True),
+            ))
+        except Exception as e:
+            logger.warning(f"[影子{_sb.name}] 构建失败（跳过）: {e}")
+
+    def _run_all_scans():
+        """三账本顺序巡检：主先（异常上抛口径不变），影子后（异常隔离）。"""
+        for sc in [scanner, *shadow_scanners]:
+            try:
+                summary = sc.scan(n=n)
+                logger.info(f"[定时任务] [{sc.book.name}] 巡检完成: "
+                            f"{summary['signals']}信号/"
+                            f"{len(summary['executed'])}执行/{len(summary['rejected'])}拦截，"
+                            f"报告 {summary['report']}")
+            except Exception as e:
+                logger.error(f"[定时任务] [{sc.book.name}] 巡检异常: {e}")
+                if sc.book.is_main:
+                    raise   # 主账本异常照旧上抛（心跳 fail / ERROR 邮件语义不变）
+                # 影子异常只记日志，不影响主账本与其他影子
+
     def daily_scan_job():
         logger.info("=" * 50)
-        logger.info("[定时任务] 每日巡检启动")
-        try:
-            summary = scanner.scan(n=n)
-            logger.info(f"[定时任务] 巡检完成: {summary['signals']}信号/"
-                        f"{len(summary['executed'])}执行/{len(summary['rejected'])}拦截，"
-                        f"报告 {summary['report']}")
-        except Exception as e:
-            logger.exception(f"[定时任务] 巡检异常: {e}")
+        logger.info("[定时任务] 每日巡检启动（含影子账本 ×%d）" % len(shadow_scanners))
+        _run_all_scans()
 
     def monthly_review_job():
         """修复H.2：月末生成月度复盘报告（填 docs/月度复盘模板.md 字段）。"""

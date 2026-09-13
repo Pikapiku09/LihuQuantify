@@ -120,3 +120,12 @@ ai_summary:
   model: "mimo-v2.5-pro"                 # 官方 /v1/models 实测 id（小写）；备选 deepseek-chat / qwen-turbo / glm-4-flash
   timeout: 20                            # 秒；超时静默降级（报告无 AI 段，巡检不受影响）
   max_chars: 300                         # 总结长度上限
+
+# 影子账本（第十二轮：多池并行积累参考样本）
+# 统计纪律：评审进度/胜率以主账本（paper_state.json）为准；影子仅跨池稳健性对照，
+# 同期账本间有市场相关性，不得当独立样本合并。
+shadow_books:
+  - name: "s43"
+    seed: 43
+  - name: "s44"
+    seed: 44

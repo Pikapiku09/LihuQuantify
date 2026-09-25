@@ -4,4 +4,6 @@ from .base import StrategyBase
 from .cherry_claw import CherryClaw
 from .deep_diagnose import DeepDiagnose, DeepReport
 
-__all__ = ["StrategyBase", "CherryClaw", "DeepDiagnose", "DeepReport"]
+__all__ = ["StrategyBase", "CherryClaw", "DeepDiagnose", "DeepReport", "IntradayReversal"]
+
+from .intraday_reversal import IntradayReversal

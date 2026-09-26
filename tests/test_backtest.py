@@ -25,15 +25,15 @@ def test_broker_market_buy():
     next_bar = pd.Series({"open": 100, "high": 105, "low": 99, "close": 103, "trade_date": date(2026, 8, 19)})
     fill = broker.fill(order, next_bar)
     assert fill is not None
-    # 市价买：open - slippage = 100 - 0.1 = 99.9
-    assert fill.price == pytest.approx(99.9, abs=0.01)
+    # 市价买：open + slippage = 100 + 0.1 = 100.1（2026-09-26 滑点方向修正）
+    assert fill.price == pytest.approx(100.1, abs=0.01)
     assert fill.side == "buy"
-    # 佣金 = max(99.9*100*0.00025, 5) = max(2.5, 5) = 5
+    # 佣金 = max(100.1*100*0.00025, 5) = max(2.5, 5) = 5
     assert fill.commission == 5.0
     # 印花税 = 0（买入）
     assert fill.stamp_tax == 0.0
-    # cash_flow = -(99.9*100 + 5) = -9995
-    assert fill.cash_flow == pytest.approx(-9995.0, abs=1)
+    # cash_flow = -(100.1*100 + 5) = -10015
+    assert fill.cash_flow == pytest.approx(-10015.0, abs=1)
 
 
 def test_broker_market_sell_stamp_tax():
@@ -42,12 +42,12 @@ def test_broker_market_sell_stamp_tax():
     next_bar = pd.Series({"open": 100, "high": 105, "low": 99, "close": 103, "trade_date": date(2026, 8, 19)})
     fill = broker.fill(order, next_bar)
     assert fill is not None
-    # 卖出：open + slippage = 100.1
-    assert fill.price == pytest.approx(100.1, abs=0.01)
-    # 印花税 = 100.1*200*0.0005 = 10.01
-    assert fill.stamp_tax == pytest.approx(10.01, abs=0.1)
-    # 佣金 = max(100.1*200*0.00025, 5) = max(5.005, 5) = 5.005
-    assert fill.commission == pytest.approx(5.005, abs=0.1)
+    # 卖出：open - slippage = 99.9（2026-09-26 滑点方向修正）
+    assert fill.price == pytest.approx(99.9, abs=0.01)
+    # 印花税 = 99.9*200*0.0005 = 9.99
+    assert fill.stamp_tax == pytest.approx(9.99, abs=0.1)
+    # 佣金 = max(99.9*200*0.00025, 5) = max(4.995, 5) = 5
+    assert fill.commission == pytest.approx(5.0, abs=0.1)
 
 
 def test_broker_limit_buy_not_triggered():

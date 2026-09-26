@@ -144,7 +144,7 @@ def test_p12_normal_bar_fills_without_preclose_vol():
     bar = pd.Series({"open": 100, "high": 105, "low": 99, "close": 103})
     fill = broker.fill(order, bar)
     assert fill is not None
-    assert fill.price == pytest.approx(100 * (1 - broker.slippage), rel=1e-6)
+    assert fill.price == pytest.approx(100 * (1 + broker.slippage), rel=1e-6)  # 2026-09-26 滑点方向修正
 
 
 def test_p12_limit_up_no_reject_when_not_one_word():

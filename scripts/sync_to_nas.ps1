@@ -13,5 +13,11 @@ foreach ($f in @("run_scheduler.py","run_backtest.py","run_full_backtest.py","ru
     $from = Join-Path $src $f; $to = Join-Path $NasRoot $f
     if (Test-Path $from) { New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null; Copy-Item $from $to -Force }
 }
+# 修正 NAS 侧 token_file 为容器路径（本地为 Windows 路径，直接覆盖会导致容器内 token 读不到）
+$nasYaml = Join-Path $NasRoot "config\settings.yaml"
+if (Test-Path $nasYaml) {
+    (Get-Content $nasYaml -Raw) -replace 'token_file: .*', 'token_file: /app/tushareMcp.json' | Set-Content $nasYaml -NoNewline -Encoding UTF8
+    Write-Host "已修正 NAS token_file → /app/tushareMcp.json"
+}
 Write-Host "同步完成——注意：src 构建进镜像，需在 NAS 执行 docker compose up -d --build（或 DSM Container Manager 点构建）才生效；仅改 settings.yaml 时重启容器即可"
 Write-Host "注意：config/settings.yaml 已推送（含 vol_target/ir20 影子账本），NAS 侧 .env（邮件授权码等）不受影响"

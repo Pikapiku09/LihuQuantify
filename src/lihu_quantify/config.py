@@ -205,6 +205,8 @@ class Settings(BaseSettings):
     qmt: QMTConfig = Field(default_factory=QMTConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    # 主账本策略（2026-09-26 复盘决策 A）：cherry_claw（原）| intraday_reversal（P1 通关因子）
+    main_strategy: str = "cherry_claw"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

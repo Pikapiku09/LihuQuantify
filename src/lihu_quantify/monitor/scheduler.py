@@ -27,6 +27,7 @@ from ..indicators.standard import add_all_standard
 from ..market import classify_market_state  # P2-9-4：包内引入，消除 sys.path hack
 from ..strategy.cherry_claw import CherryClaw
 from ..strategy.intraday_reversal import IntradayReversal
+from ..risk.vol_target import VolTargetSizer
 from ..risk.checklist import ChecklistGate, CheckContext
 from ..execution.paper_trade import PaperBroker
 from ..execution.oms import OrderManagementSystem
@@ -652,14 +653,19 @@ class DailyScanner:
             )
         else:
             strategy = CherryClaw(
-            ma_periods=tuple(s.ma_periods),
-            golden_cross_max_freshness=s.golden_cross_max_freshness_days,
-            volume_ratio_threshold=s.volume_ratio_threshold,
-            entity_ratio_threshold=s.entity_ratio_threshold,
-            close_to_ma5_max_dev=s.close_to_ma5_max_dev,
-            max_position_pct=r.max_single_position,
-            stop_loss_force_pct=r.stop_loss_force,
-        )
+                ma_periods=tuple(s.ma_periods),
+                golden_cross_max_freshness=s.golden_cross_max_freshness_days,
+                volume_ratio_threshold=s.volume_ratio_threshold,
+                entity_ratio_threshold=s.entity_ratio_threshold,
+                close_to_ma5_max_dev=s.close_to_ma5_max_dev,
+                max_position_pct=r.max_single_position,
+                stop_loss_force_pct=r.stop_loss_force,
+            )
+            # P4（2026-09-26）：主账本趋势策略套波动率目标（反转账本上面分支已跳过）
+            _vt = getattr(r, "vol_target", None)
+            if _vt is not None and getattr(_vt, "enabled", False):
+                from ..strategy.vol_wrap import wrap_vol_target
+                strategy = wrap_vol_target(strategy, _vt)
         codes, sector_map, name_map = self._universe(n)
         start = latest - timedelta(days=days)
         signals: list[tuple] = []   # (signal, last_bar)

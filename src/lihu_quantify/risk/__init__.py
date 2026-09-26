@@ -5,4 +5,6 @@ from .stop_loss import StopLossManager
 from .position_limit import PositionLimiter
 from .frequency import FrequencyGuard
 
-__all__ = ["ChecklistGate", "StopLossManager", "PositionLimiter", "FrequencyGuard"]
+from .vol_target import VolTargetSizer
+
+__all__ = ["VolTargetSizer","ChecklistGate", "StopLossManager", "PositionLimiter", "FrequencyGuard"]

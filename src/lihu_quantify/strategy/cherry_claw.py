@@ -207,8 +207,3 @@ class CherryClaw(StrategyBase):
                 trade_date=row.get("trade_date"),
             ))
         return signals
-
-    def latest_signal(self, df: pd.DataFrame) -> Signal | None:
-        """取最新一根 bar 的信号（今日选股用）。"""
-        signals = self.scan(df)
-        return signals[-1] if signals else None

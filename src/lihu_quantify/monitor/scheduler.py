@@ -26,6 +26,7 @@ from ..data.duckdb_store import DuckDBStore
 from ..indicators.standard import add_all_standard
 from ..market import classify_market_state  # P2-9-4：包内引入，消除 sys.path hack
 from ..strategy.cherry_claw import CherryClaw
+from ..strategy.intraday_reversal import IntradayReversal
 from ..risk.checklist import ChecklistGate, CheckContext
 from ..execution.paper_trade import PaperBroker
 from ..execution.oms import OrderManagementSystem
@@ -290,6 +291,7 @@ class BookSpec:
     name: str = "main"
     pool_seed: int = 42
     silent: bool = False          # 影子=True：无邮件/AI 摘要/心跳/last_scan 写入
+    strategy: str = "cherry_claw" # ir20 账本用 "intraday_reversal"（P1 对照腿）
 
     @property
     def is_main(self) -> bool:
@@ -581,7 +583,11 @@ class DailyScanner:
             stop_loss_force_pct=r.stop_loss_force,
         )
         codes, _, _ = self._universe(n)
-        start = latest - timedelta(days=days)
+
+        # ir20 账本：因子需 250 日滚动分位预热，窗口放大到 500 自然日
+
+        _days = 500 if getattr(self.book, "strategy", "") == "intraday_reversal" else days
+        start = latest - timedelta(days=_days)
         signals: list[tuple] = []
         for code in codes:
             try:
@@ -639,7 +645,13 @@ class DailyScanner:
             oms.rebuild_stops_from_positions()
 
         # 扫描信号（修复C：同时取板块映射）
-        strategy = CherryClaw(
+        if getattr(self.book, "strategy", "cherry_claw") == "intraday_reversal":
+            strategy = IntradayReversal(
+                max_position_pct=min(r.max_single_position, 0.15),
+                stop_loss_force_pct=r.stop_loss_force,
+            )
+        else:
+            strategy = CherryClaw(
             ma_periods=tuple(s.ma_periods),
             golden_cross_max_freshness=s.golden_cross_max_freshness_days,
             volume_ratio_threshold=s.volume_ratio_threshold,
@@ -1271,7 +1283,8 @@ def setup_scheduler(
             _s2.universe.pool_seed = _sb.seed
             shadow_scanners.append(DailyScanner(
                 _s2, mode=mode,
-                book=BookSpec(name=_sb.name, pool_seed=_sb.seed, silent=True),
+                book=BookSpec(name=_sb.name, pool_seed=_sb.seed, silent=True,
+                              strategy=getattr(_sb, "strategy", "cherry_claw")),
             ))
         except Exception as e:
             logger.warning(f"[影子{_sb.name}] 构建失败（跳过）: {e}")

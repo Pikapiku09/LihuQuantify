@@ -4,7 +4,7 @@
 # 用法：pwsh -File scripts\sync_to_nas.ps1
 param([string]$NasRoot = "\\192.168.123.204\Lihu_Quantify")
 if (-not (Test-Path $NasRoot)) { Write-Host "NAS 目录不可达: $NasRoot —— 请先开机/映射共享文件夹"; exit 1 }
-$src = $PSScriptRoot\..
+$src = Split-Path $PSScriptRoot -Parent
 foreach ($dir in @("src", "config", "scripts", "web")) {
     robocopy (Join-Path $src $dir) (Join-Path $NasRoot $dir) /MIR /XD __pycache__ .pytest_cache node_modules /XF *.pyc | Out-Null
     Write-Host "已同步: $dir"

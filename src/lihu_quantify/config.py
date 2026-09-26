@@ -83,7 +83,7 @@ class StrategyConfig(BaseModel):
 
 class VolTargetConfig(BaseModel):
     """P4 个股级波动率目标（仅趋势类策略；反转策略语义冲突自动跳过）。"""
-    enabled: bool = True
+    enabled: bool = False   # 模型默认关（防改变既有测试口径）；settings.yaml 显式开启
     target_vol: float = 0.35
     window: int = 20
     min_scale: float = 0.3

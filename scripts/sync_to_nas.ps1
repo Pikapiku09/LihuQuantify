@@ -1,0 +1,17 @@
+# LihuQuantify → NAS 同步（2026-09-26 建）
+# 前提：NAS 在线且共享文件夹已映射为 Z:（或修改下方 $NasRoot 为 UNC 路径）
+# 铁律：绝不推送 data/（NAS 侧 paper_state/duckdb 是生产状态）与 outputs/（NAS 自产报告）
+# 用法：pwsh -File scripts\sync_to_nas.ps1
+param([string]$NasRoot = "Z:\lihuquantify")
+if (-not (Test-Path $NasRoot)) { Write-Host "NAS 目录不可达: $NasRoot —— 请先开机/映射共享文件夹"; exit 1 }
+$src = $PSScriptRoot\..
+foreach ($dir in @("src", "config", "scripts", "web")) {
+    robocopy (Join-Path $src $dir) (Join-Path $NasRoot $dir) /MIR /XD __pycache__ .pytest_cache node_modules /XF *.pyc | Out-Null
+    Write-Host "已同步: $dir"
+}
+foreach ($f in @("run_scheduler.py","run_backtest.py","run_full_backtest.py","run_live.py","pyproject.toml","README.md","Dockerfile","docker-compose.yml",".dockerignore","docs\决策日志.md")) {
+    $from = Join-Path $src $f; $to = Join-Path $NasRoot $f
+    if (Test-Path $from) { New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null; Copy-Item $from $to -Force }
+}
+Write-Host "同步完成——在 NAS Container Manager 重建/重启 lihu-scheduler 与 lihu-web 容器生效"
+Write-Host "注意：config/settings.yaml 已推送（含 vol_target/ir20 影子账本），NAS 侧 .env（邮件授权码等）不受影响"

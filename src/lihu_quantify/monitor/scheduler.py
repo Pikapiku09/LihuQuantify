@@ -1275,7 +1275,13 @@ def setup_scheduler(
     from apscheduler.triggers.cron import CronTrigger
 
     sched = BlockingScheduler(timezone=settings.scheduler.timezone)
-    scanner = DailyScanner(settings, mode=mode)
+    # 主账本策略可配置（2026-09-26 复盘决策 A：切 IR20，CherryClaw 停用）
+    scanner = DailyScanner(
+        settings, mode=mode,
+        book=BookSpec(name="main", pool_seed=settings.universe.pool_seed,
+                      silent=False,
+                      strategy=getattr(settings, "main_strategy", "cherry_claw")),
+    )
 
     # ---- 影子账本（第十二轮）：顺序执行，主先影子后 ----
     # 影子命中主账本当日取数缓存（同 client 缓存目录），每日新增 API 趋近零。

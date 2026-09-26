@@ -46,6 +46,11 @@ class StrategyBase(ABC):
     def _evaluate(self, df: pd.DataFrame, indicators: dict) -> list[Signal]:
         """核心策略逻辑：在带指标的 DataFrame 上评估，返回信号列表。"""
 
+    def latest_signal(self, df: pd.DataFrame) -> Signal | None:
+        """取最新一根 bar 的信号（每日扫描用；2026-09-26 从 CherryClaw 上移为通用接口）。"""
+        signals = self.scan(df)
+        return signals[-1] if signals else None
+
     def scan(self, df: pd.DataFrame) -> list[Signal]:
         """批量扫描模式：输入完整日线 DataFrame，返回信号列表。"""
         if df is None or df.empty:

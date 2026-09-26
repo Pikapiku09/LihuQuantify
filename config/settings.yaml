@@ -129,3 +129,6 @@ shadow_books:
     seed: 43
   - name: "s44"
     seed: 44
+  - name: "ir20"                        # P1 通关因子对照腿（2026-09-26）：IntradayReversal 15% 仓位，100 笔后评审
+    seed: 42
+    strategy: "intraday_reversal"

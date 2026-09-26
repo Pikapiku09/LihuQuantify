@@ -81,8 +81,17 @@ class StrategyConfig(BaseModel):
         return get_settings().risk.chasing_high_threshold
 
 
+class VolTargetConfig(BaseModel):
+    """P4 个股级波动率目标（仅趋势类策略；反转策略语义冲突自动跳过）。"""
+    enabled: bool = True
+    target_vol: float = 0.35
+    window: int = 20
+    min_scale: float = 0.3
+
+
 class RiskConfig(BaseModel):
     max_single_position: float = 0.25
+    vol_target: VolTargetConfig = VolTargetConfig()   # P4（2026-09-26）主账本默认启用
     max_sector_position: float = 0.40
     stop_loss_warn: float = -0.03
     stop_loss_exec: float = -0.05

@@ -53,6 +53,12 @@ strategy:
 
 # 风控参数（铁律，不可放松）
 risk:
+  # P4 个股级波动率目标（2026-09-26）：趋势策略减高波动仓位；反转账本(ir20)自动跳过
+  vol_target:
+    enabled: true
+    target_vol: 0.35
+    window: 20
+    min_scale: 0.3
   max_single_position: 0.25
   max_sector_position: 0.40
   stop_loss_warn: -0.03

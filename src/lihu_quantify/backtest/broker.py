@@ -125,11 +125,10 @@ class SimulatedBroker:
                 price = max(order.limit_price, open_price)
         else:
             # 市价单：开盘价 ± 滑点
+            # 修复（2026-09-26 P5 滑点敏感性发现）：原实现买减卖加 = 倒收滑点，
+            # 导致回测低估成本且"滑点越高收益越高"。正确：买入更贵、卖出更便宜。
             slip = open_price * self.slippage
-            price = open_price - slip if order.side == "buy" else open_price + slip
-
-        if price <= 0:
-            return None
+            price = open_price + slip if order.side == "buy" else open_price - slip
 
         # 费用计算
         turnover = price * order.volume

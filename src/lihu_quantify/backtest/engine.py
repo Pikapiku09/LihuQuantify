@@ -252,15 +252,15 @@ class EventDrivenEngine:
                 if volume < 100:
                     continue
                 # P1-4（第十一轮）：买入现金充足性校验（防 T+1 跳空高开透支）。
-                # 以下一根 T+1 开盘价（买价 = open - 滑点）估算单股成本，现金不足原量
-                # → 按 cash // (估单手成本) 向下取整缩量；缩到不足 1 手 → 拒单。
+                # 以下一根 T+1 开盘价（买价 = open + 滑点，2026-09-26 修正方向）估算单股成本，
+                # 现金不足原量 → 按 cash // (估单手成本) 向下取整缩量；缩到不足 1 手 → 拒单。
                 est_price = price
                 ni = i + 1
                 if ni < len(df):
                     nb = df.iloc[ni]
                     nb_open = float(nb.get("open", 0))
                     if nb_open > 0 and not pd.isna(nb_open):
-                        est_price = nb_open * (1 - self.broker.slippage)
+                        est_price = nb_open * (1 + self.broker.slippage)
                 per_lot = est_price * 100 * (1 + self.broker.commission_rate)
                 max_lots = int(portfolio.cash // per_lot) if per_lot > 0 else 0
                 volume = min(volume, max_lots * 100)

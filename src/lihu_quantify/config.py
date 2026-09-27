@@ -81,6 +81,16 @@ class StrategyConfig(BaseModel):
         return get_settings().risk.chasing_high_threshold
 
 
+class SentimentFilterConfig(BaseModel):
+    """P6 情绪择时（炸板率门控，2026-09-27 验证：累计 +10.2%→+19.7%）。
+
+    巡检日拉 limit_list_d 算炸板率 = Z/(U+Z)，> fail_threshold 视为短线情绪退潮，
+    叠加在 block 之上禁开仓。默认关（ir20 过渡期后再评估开启）。
+    """
+    enabled: bool = False
+    fail_threshold: float = 0.30
+
+
 class VolTargetConfig(BaseModel):
     """P4 个股级波动率目标（仅趋势类策略；反转策略语义冲突自动跳过）。"""
     enabled: bool = False   # 模型默认关（防改变既有测试口径）；settings.yaml 显式开启
@@ -92,6 +102,7 @@ class VolTargetConfig(BaseModel):
 class RiskConfig(BaseModel):
     max_single_position: float = 0.25
     vol_target: VolTargetConfig = VolTargetConfig()   # P4（2026-09-26）主账本默认启用
+    sentiment_filter: SentimentFilterConfig = SentimentFilterConfig()   # P6（2026-09-27）
     max_sector_position: float = 0.40
     stop_loss_warn: float = -0.03
     stop_loss_exec: float = -0.05

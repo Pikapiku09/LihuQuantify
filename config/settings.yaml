@@ -62,6 +62,10 @@ risk:
   # P4 个股级波动率目标（2026-09-26）：趋势策略减高波动仓位；反转账本(ir20)自动跳过
   vol_target:
     enabled: true
+  # P6 情绪择时（2026-09-27 验证通过但默认关：ir20 过渡期后再评估开启）
+  sentiment_filter:
+    enabled: false
+    fail_threshold: 0.30
     target_vol: 0.35
     window: 20
     min_scale: 0.3

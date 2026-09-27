@@ -43,6 +43,7 @@ class IntradayReversal(StrategyBase):
         hist_window: int = 250,           # 分位参考的历史窗口
         max_position_pct: float = 0.25,
         stop_loss_force_pct: float = -0.08,
+        trend_filter: bool = False,      # CC-Reversal v2（2026-09-27）：MA20 趋势过滤
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,6 +51,7 @@ class IntradayReversal(StrategyBase):
         self.entry_pct = entry_pct
         self.hist_window = hist_window
         self.max_position_pct = max_position_pct
+        self.trend_filter = trend_filter
         self.stop_loss_mgr = StopLossManager(force_pct=stop_loss_force_pct)
 
     def _prepare_indicators(self, df: pd.DataFrame) -> dict:
@@ -63,6 +65,11 @@ class IntradayReversal(StrategyBase):
         s = intraday.rolling(self.lookback, min_periods=self.lookback // 2).sum()
         d["ir20"] = -s
         d["ir20_pct"] = d["ir20"].rolling(self.hist_window, min_periods=120).rank(pct=True)
+        if self.trend_filter:
+            # 门禁2 证据（2026-09-27）：MA20 上方+斜率向上组的 IC 0.0687/多空+34.8%，
+            # MA20 下方组 IC 0.0044（t=0.9 无信号）——趋势过滤剔除接飞刀
+            d["ma20"] = d["close"].rolling(20, min_periods=20).mean()
+            d["ma20_slope"] = d["ma20"].diff(5) / 5
         return {"df": d}
 
     def pre_filter(self, df: pd.DataFrame) -> bool:
@@ -83,6 +90,8 @@ class IntradayReversal(StrategyBase):
         rolling_amount = d["amount"].rolling(20).mean() if "amount" in d.columns else None
         mask = d["ir20_pct"].notna() & (d["ir20_pct"] <= self.entry_pct)
         mask &= d["close"] > 0.5
+        if self.trend_filter and {"ma20", "ma20_slope"}.issubset(d.columns):
+            mask &= (d["close"] > d["ma20"]).fillna(False) & (d["ma20_slope"] > 0).fillna(False)
         if rolling_amount is not None:
             mask &= rolling_amount.notna() & (rolling_amount >= self.MIN_AVG_AMOUNT_20D / 1e3)
         # 上市天数精确判定（元数据注入时）

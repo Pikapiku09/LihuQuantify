@@ -645,6 +645,20 @@ class DailyScanner:
         if positions_before:
             oms.rebuild_stops_from_positions()
 
+        # P6 情绪择时（2026-09-27）：炸板率>阈值视为退潮，叠加禁开仓（默认关）
+        sentiment_ebb = False
+        sf = getattr(r, "sentiment_filter", None)
+        if sf is not None and getattr(sf, "enabled", False):
+            try:
+                lim = self.client.query("limit_list_d", {"trade_date": latest.strftime("%Y%m%d")})
+                if not lim.empty:
+                    u = int((lim["limit"] == "U").sum()); z = int((lim["limit"] == "Z").sum())
+                    if (u + z) > 0 and z / (u + z) > sf.fail_threshold:
+                        logger.info(f"[情绪] 炸板率 {z/(u+z):.0%} > {sf.fail_threshold:.0%}，退潮日禁开仓")
+                        sentiment_ebb = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[情绪] limit_list_d 拉取失败（忽略门控）: {e}")
+
         # 扫描信号（修复C：同时取板块映射）
         if getattr(self.book, "strategy", "cherry_claw") == "intraday_reversal":
             strategy = IntradayReversal(
@@ -729,6 +743,10 @@ class DailyScanner:
         block_mode = s.market_filter and market_state != "上涨" and s.market_filter_mode == "block"
         reduce_scale = 0.5 if (s.market_filter and market_state != "上涨"
                                and s.market_filter_mode == "reduce") else 1.0
+        # P6（2026-09-27）：情绪退潮日叠加禁开仓（等同 block，覆盖 reduce）
+        if sentiment_ebb:
+            block_mode = True
+            reduce_scale = 0.0
         held = {p.ts_code for p in self.broker.query_positions()}
         # 需求1（第八轮）：资金守卫与 top-N 筛选配置
         # isinstance 守卫：MagicMock settings（测试）/异常配置 → 不启用

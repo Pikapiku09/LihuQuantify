@@ -41,6 +41,8 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - LIHU_WEB_HOST=0.0.0.0         # 容器内必须 0.0.0.0 才能端口映射；宿主侧安全由 ports 控制
+      # 看板鉴权 token：留空=只读模式（写接口禁用）；建议设置，前端首次访问弹框输入
+      - LIHU_WEB_TOKEN=${WEB_TOKEN:-}
     ports:
       - "8000:8000"                    # 局域网访问 http://<NAS_IP>:8000；勿公网映射
     volumes:

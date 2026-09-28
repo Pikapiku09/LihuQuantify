@@ -134,8 +134,10 @@ class EventDrivenEngine:
         equity_dict: dict = {}
         signals_generated = 0
         orders_rejected = 0
+        pos_meta: dict[str, dict] = {}       # {code: {entry_idx, holding_days}} 持仓元数据
+        pending_meta: dict[str, dict] = {}   # 下单暂存元数据（撮合成交后转入 pos_meta）
 
-        for dt in all_dates:
+        for day_idx, dt in enumerate(all_dates):
             # 1. 撮合 T-1 的订单（以 T 的 open 成交）
             if pending_orders:
                 for order in pending_orders:
@@ -161,6 +163,12 @@ class EventDrivenEngine:
                                 if fill is None:
                                     continue
                         portfolio.apply_fill(fill)
+                        if fill.side == "buy":
+                            meta = pending_meta.pop(fill.ts_code, {})
+                            pos_meta[fill.ts_code] = {
+                                "entry_idx": day_idx,
+                                "holding_days": meta.get("holding_days", 0),
+                            }
                 pending_orders = []
 
             # 2. 更新价格为 T 的 close（O(1) 定位）
@@ -196,6 +204,23 @@ class EventDrivenEngine:
                             reason=action.reason,
                         ))
 
+            # 3.5 持有期到期平仓（Signal.holding_days > 0；按交易日计数）
+            for code in list(portfolio.positions.keys()):
+                meta = pos_meta.get(code)
+                if not meta or not meta.get("holding_days"):
+                    continue
+                if not portfolio.can_sell(code, dt):
+                    continue
+                if day_idx - meta["entry_idx"] >= meta["holding_days"]:
+                    vol = (portfolio.positions[code].volume // 100) * 100
+                    if vol > 0:
+                        pending_orders.append(Order(
+                            ts_code=code, side="sell", volume=vol,
+                            order_type="market", trade_date=dt,
+                            reason=f"持有期到期({meta['holding_days']}交易日)",
+                        ))
+                    pos_meta.pop(code, None)
+
             # 4. 策略信号 → 买入（无状态策略查预计算表；有状态策略逐 bar 推送）
             #    市场状态（修复A降级为降仓信号）：非上涨段 scale<1（减半/禁止）；
             #    持仓止损在步骤3照常执行
@@ -229,6 +254,17 @@ class EventDrivenEngine:
                         logger.warning(f"策略 on_bar 异常 {code} {dt}: {e}")
                         continue
 
+                if signal is not None and signal.kind == "sell":
+                    # 卖出信号：仅对已持仓且可卖（T+1）的股票生成卖出单
+                    if code in portfolio.positions and portfolio.can_sell(code, dt):
+                        vol = (portfolio.positions[code].volume // 100) * 100
+                        if vol > 0:
+                            pending_orders.append(Order(
+                                ts_code=code, side="sell", volume=vol,
+                                order_type="market", trade_date=dt,
+                                reason=signal.reason or "策略卖出信号",
+                            ))
+                    continue
                 if signal is None or signal.kind != "buy":
                     continue
                 signals_generated += 1
@@ -271,8 +307,13 @@ class EventDrivenEngine:
                     order_type="market", trade_date=dt,
                     reason=signal.reason,
                 ))
+                pending_meta[code] = {"holding_days": getattr(signal, "holding_days", 0)}
 
             # 5. 记录权益
+            # 5.5 清理已无持仓的元数据
+            for code in list(pos_meta.keys()):
+                if code not in portfolio.positions:
+                    pos_meta.pop(code, None)
             equity_dict[dt] = portfolio.total_asset
 
         equity = pd.Series(equity_dict, name="equity")

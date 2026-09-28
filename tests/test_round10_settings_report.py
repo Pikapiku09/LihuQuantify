@@ -43,13 +43,14 @@ def _setup_web(tmp_path, monkeypatch):
     (root / "data").mkdir(exist_ok=True)
     monkeypatch.setattr(ws, "ROOT", root)
     monkeypatch.setattr(ws, "DATA_DIR", root / "data")
+    monkeypatch.setenv("LIHU_WEB_TOKEN", "test-token")
     return ws, root
 
 
 def test_settings_get_metadata(tmp_path, monkeypatch):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     ws, _ = _setup_web(tmp_path, monkeypatch)
-    client = fastapi_testclient.TestClient(ws.app)
+    client = fastapi_testclient.TestClient(ws.app, headers={"Authorization": "Bearer test-token"})
 
     r = client.get("/api/settings")
     assert r.status_code == 200
@@ -70,7 +71,7 @@ def test_settings_get_metadata(tmp_path, monkeypatch):
 def test_settings_post_requires_confirm(tmp_path, monkeypatch):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     ws, _ = _setup_web(tmp_path, monkeypatch)
-    client = fastapi_testclient.TestClient(ws.app)
+    client = fastapi_testclient.TestClient(ws.app, headers={"Authorization": "Bearer test-token"})
 
     r = client.post("/api/settings", json={"changes": {"heatmap.enabled": False}})
     assert r.status_code == 400
@@ -84,7 +85,7 @@ def test_settings_post_locked_rejected(tmp_path, monkeypatch):
     """冻结期硬约束：strategy/risk/universe 一律 400。"""
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     ws, _ = _setup_web(tmp_path, monkeypatch)
-    client = fastapi_testclient.TestClient(ws.app)
+    client = fastapi_testclient.TestClient(ws.app, headers={"Authorization": "Bearer test-token"})
 
     r = client.post("/api/settings", json={
         "confirm": True, "changes": {"strategy.market_filter": False}})
@@ -98,7 +99,7 @@ def test_settings_post_locked_rejected(tmp_path, monkeypatch):
 def test_settings_post_atomic_write_and_audit(tmp_path, monkeypatch):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     ws, root = _setup_web(tmp_path, monkeypatch)
-    client = fastapi_testclient.TestClient(ws.app)
+    client = fastapi_testclient.TestClient(ws.app, headers={"Authorization": "Bearer test-token"})
 
     r = client.post("/api/settings", json={
         "confirm": True,
@@ -216,7 +217,7 @@ def test_dashboard_brief_fields(tmp_path, monkeypatch):
         "summary": {"trade_date": "2026-08-28", "ai_summary": None,
                     "brief": "今日巡检完成：3 信号，1 成交；总资产 100,000。"},
     }, ensure_ascii=False), encoding="utf-8")
-    client = fastapi_testclient.TestClient(ws.app)
+    client = fastapi_testclient.TestClient(ws.app, headers={"Authorization": "Bearer test-token"})
 
     d = client.get("/api/dashboard").json()
     assert d["brief"].startswith("今日巡检完成")

@@ -66,11 +66,17 @@ async def _bearer_auth(request, call_next):
     import os
 
     token = os.environ.get("LIHU_WEB_TOKEN", "")
-    if token and request.url.path.startswith("/api/"):
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {token}":
-            return JSONResponse({"detail": "未授权：缺少或错误的 Bearer Token"
-                                         "（LIHU_WEB_TOKEN）"}, status_code=401)
+    if request.url.path.startswith("/api/"):
+        if token:
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {token}":
+                return JSONResponse({"detail": "未授权：缺少或错误的 Bearer Token"
+                                     "（LIHU_WEB_TOKEN）"}, status_code=401)
+        elif request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            return JSONResponse(
+                {"detail": "未配置 LIHU_WEB_TOKEN，写接口已禁用（只读模式）"},
+                status_code=403,
+            )
     return await call_next(request)
 
 

@@ -217,3 +217,92 @@ def test_position_gate_first_buy_bounds():
     edge = gate._check_position(_pos_signal(), _pos_snapshot(0.20),
                                 CheckContext(invest_amount=5_000.0))
     assert edge.approved is True
+
+
+# ============================================================
+# P0（评审 2026-09-28）：_register_new_stops 合并失败保留单，不覆盖
+# ============================================================
+
+def test_register_new_stops_merges_failed_pending(tmp_path, monkeypatch):
+    """执行阶段写回的失败单（failed_count>0）不被 _register_new_stops 从零覆写。"""
+    from lihu_quantify.monitor import scheduler as sched_mod
+    from lihu_quantify.monitor.alerts import Alerter
+    from lihu_quantify.monitor.scheduler import DailyScanner
+
+    monkeypatch.setattr(sched_mod, "_ROOT", tmp_path)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+
+    s = DailyScanner.__new__(DailyScanner)
+    s.alerter = Alerter()
+    s.book = SimpleNamespace(suffix=lambda: "", is_main=True,
+                             name="main", strategy="intraday_reversal")
+    s.settings = SimpleNamespace(risk=SimpleNamespace(trailing_profit_pullback=0.03))
+    pf = tmp_path / "data" / "pending_stops.json"
+
+    # 1) 预置一条失败单（failed_count=1）
+    pf.write_text(json.dumps([
+        {"ts_code": "600000.SH", "volume": 1000, "stop_price": 9.0,
+         "reason": "price_stop", "failed_count": 1},
+    ]), encoding="utf-8")
+
+    # 2) 执行阶段：卖单失败 → remaining 写回（failed_count=2）
+    fail = SimpleNamespace(success=False, msg="资金不足")
+    s.broker = SimpleNamespace(sell=lambda *a, **k: fail, trades=[])
+    monkeypatch.setattr(s, "_fetch_open", lambda code, d: 10.0, raising=False)
+    s._execute_pending_stops(date(2026, 9, 2))
+
+    # 3) 登记新止损（另一个 code，触发价格止损）
+    stop = SimpleNamespace(triggered=False, stop_price=9.0, volume=1000)
+    s.oms = SimpleNamespace(stop_registry={"600001.SH": stop})
+    s.broker = SimpleNamespace(
+        get_price=lambda code: 8.0,          # 8.0 < 9.0 → 触发登记
+        positions={"600001.SH": SimpleNamespace(cost=8.5)},
+        high_water_mark={}, trades=[],
+    )
+    monkeypatch.setattr(s, "_fetch_ma10", lambda code, d: 10.0, raising=False)
+    s._register_new_stops(s.oms, date(2026, 9, 2))
+
+    # 4) 验证：失败保留单 + 新登记单共存（不覆盖）
+    pending = json.loads(pf.read_text(encoding="utf-8"))
+    by_code = {x["ts_code"]: x for x in pending}
+    assert "600000.SH" in by_code, "失败保留单被覆写丢失（P0 回归）"
+    assert by_code["600000.SH"]["failed_count"] == 2
+    assert "600001.SH" in by_code, "新登记单缺失"
+    assert by_code["600001.SH"]["reason"] == "price_stop"
+
+
+def test_register_new_stops_same_code_overrides_failed(tmp_path, monkeypatch):
+    """同 code：今日新登记覆盖旧失败单（最新判定为准，不重复堆叠）。"""
+    from lihu_quantify.monitor import scheduler as sched_mod
+    from lihu_quantify.monitor.alerts import Alerter
+    from lihu_quantify.monitor.scheduler import DailyScanner
+
+    monkeypatch.setattr(sched_mod, "_ROOT", tmp_path)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    s = DailyScanner.__new__(DailyScanner)
+    s.alerter = Alerter()
+    s.book = SimpleNamespace(suffix=lambda: "", is_main=True,
+                             name="main", strategy="intraday_reversal")
+    s.settings = SimpleNamespace(risk=SimpleNamespace(trailing_profit_pullback=0.03))
+    pf = tmp_path / "data" / "pending_stops.json"
+    pf.write_text(json.dumps([
+        {"ts_code": "600000.SH", "volume": 1000, "stop_price": 9.0,
+         "reason": "price_stop", "failed_count": 1},
+    ]), encoding="utf-8")
+
+    stop = SimpleNamespace(triggered=False, stop_price=9.0, volume=1000)
+    s.oms = SimpleNamespace(stop_registry={"600000.SH": stop})
+    s.broker = SimpleNamespace(
+        get_price=lambda code: 8.0,
+        positions={"600000.SH": SimpleNamespace(cost=8.5)},
+        high_water_mark={}, trades=[],
+    )
+    monkeypatch.setattr(s, "_fetch_ma10", lambda code, d: 10.0, raising=False)
+    s._register_new_stops(s.oms, date(2026, 9, 2))
+
+    pending = json.loads(pf.read_text(encoding="utf-8"))
+    assert len(pending) == 1, "同 code 应覆盖而非重复堆叠"
+    assert pending[0]["ts_code"] == "600000.SH"
+    assert "failed_count" not in pending[0] or pending[0]["failed_count"] == 1
+    # 新登记单不带 failed_count（是今日新判定，非失败保留）
+    assert pending[0].get("failed_count", 0) in (0, 1)

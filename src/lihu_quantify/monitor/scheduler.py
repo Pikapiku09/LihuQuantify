@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 import json
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -1191,6 +1192,17 @@ class DailyScanner:
             pullback = 0.03
 
         broker_positions = getattr(self.broker, "positions", None)
+        # P0 修复（2026-09-28 评审）：合并执行阶段写回的"失败保留单"，防覆写丢失
+        # （_check_stops_with_alert 先 _execute_pending_stops 写回 remaining，
+        #   再调本方法；原 new_pending=[] 从零构建会把 failed 单覆盖 → 持仓失去止损保护）
+        remaining_kept: list[dict] = []
+        if pending_file.exists():
+            try:
+                _prev = json.loads(pending_file.read_text(encoding="utf-8"))
+                if isinstance(_prev, list):
+                    remaining_kept = [x for x in _prev if x.get("failed_count", 0) > 0]
+            except (json.JSONDecodeError, OSError):
+                remaining_kept = []
         new_pending = []
         for code, stop in oms.stop_registry.items():
             if stop.triggered or code in buys_today:
@@ -1237,12 +1249,15 @@ class DailyScanner:
                         f"[移动止盈登记] {code} 高水位 {hwm:.2f} 回撤 {pullback:.0%} → "
                         f"收盘 {close:.2f} ≤ {trail_price:.2f}，待次日开盘执行"
                     )
+        # P0 修复：remaining 保留单 + 今日新登记合并（同 code 以今日新登记为准）
+        _new_codes = {x["ts_code"] for x in new_pending}
+        new_pending = [x for x in remaining_kept if x["ts_code"] not in _new_codes] + new_pending
         if new_pending:
             try:
                 pending_file.parent.mkdir(parents=True, exist_ok=True)
-                pending_file.write_text(
-                    json.dumps(new_pending, ensure_ascii=False), encoding="utf-8"
-                )
+                _tmp = pending_file.with_suffix(".tmp")
+                _tmp.write_text(json.dumps(new_pending, ensure_ascii=False), encoding="utf-8")
+                os.replace(_tmp, pending_file)   # 原子替换（P0 修复）
             except OSError as e:
                 logger.warning(f"待执行止损写入失败: {e}")
         # P2-9-8：高水位统一落盘（循环内已 save=False）

@@ -47,6 +47,7 @@ class WeeklyBandReversal(StrategyBase):
         rebalance_weekday: int = 0,               # 0=周一
         use_cross_section: bool = True,           # v2：截面口径（对齐门禁2），需预注入 cs_pct 列
         cs_entry_pct: float = 0.10,               # 截面最超卖 10%
+        stop_mode: str = "trend",                 # v3：trend(破MA10+-10%) | wide(仅-15%) | time(纯时间止损)
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -57,6 +58,7 @@ class WeeklyBandReversal(StrategyBase):
         self.rebalance_weekday = rebalance_weekday
         self.use_cross_section = use_cross_section
         self.cs_entry_pct = cs_entry_pct
+        self.stop_mode = stop_mode
         self.stop_loss_mgr = StopLossManager(force_pct=stop_loss_force_pct)
 
     def _prepare_indicators(self, df: pd.DataFrame) -> dict:
@@ -103,7 +105,13 @@ class WeeklyBandReversal(StrategyBase):
             row = d.loc[i]
             close = float(row["close"])
             ma10 = float(row.get("ma10", close))
-            stop_loss = self.stop_loss_mgr.calc_stop_price(close, ma10)
+            # v3 止损模式（P7 策略化教训：趋势型止损摧毁反转策略的等待逻辑）
+            if self.stop_mode == "time":
+                stop_loss = None                    # 纯时间止损：由引擎持有期到期平仓
+            elif self.stop_mode == "wide":
+                stop_loss = close * 0.85            # 宽止损 -15%（不用 MA10）
+            else:
+                stop_loss = self.stop_loss_mgr.calc_stop_price(close, ma10)
             targets = [close * 1.08, close * 1.16, close * 1.25, close * 1.35]   # 波段目标位放宽
             signals.append(Signal(
                 kind="buy", ts_code=ts_code, suggested_price=close,

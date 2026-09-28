@@ -31,7 +31,7 @@ H = 4   # 4 周持有
 
 
 def load() -> pd.DataFrame:
-    df = duckdb.query(f"SELECT * FROM '{ROOT / 'data' / 'weekly_panel.parquet'}'").fetchdf()
+    df = duckdb.query(f"SELECT * FROM '{ROOT / 'data' / 'weekly_panel_full.parquet'}'").fetchdf()
     df = df[(df["close"] > 0.5) & (df["amount"] > 0)]
     df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     # 指数周频（regime 用）——走 Tushare client 缓存，避开 DuckDB 写锁（扩池任务占用中）

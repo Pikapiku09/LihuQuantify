@@ -145,6 +145,9 @@ shadow_books:
     seed: 43
   - name: "s44"
     seed: 44
+  - name: "wbr25"                       # WBR 周频 ms25 影子（2026-09-29 双轨研究）：2.5%×40只/截面超卖30%/持有20交易日到期
+    seed: 45
+    strategy: "weekly_band"
   - name: "ir20"                        # P1 通关因子对照腿（2026-09-26）：IntradayReversal 15% 仓位，100 笔后评审
     seed: 42
     strategy: "intraday_reversal"

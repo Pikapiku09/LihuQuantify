@@ -120,7 +120,8 @@ class WeeklyBandReversal(StrategyBase):
                 stop_loss=stop_loss, take_profit=targets,
                 suggested_position_pct=self.max_position_pct,
                 holding_days=self.holding_days,   # 引擎持有期到期平仓（评审修复②）
-                priority=float(row["wbr_cs_pct"]),  # 截面强度（引擎按此排序买入）
+                priority=(float(row["wbr_cs_pct"]) if "wbr_cs_pct" in d.columns
+                          else float(row.get("wbr_pct", 1.0))),  # 分位（小=超卖）
                 strategy_name=self.name,
                 reason=f"周频波段超卖(wbr分位={float(row['wbr_pct']):.2f})",
                 trade_date=row["trade_date"],

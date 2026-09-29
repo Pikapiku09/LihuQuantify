@@ -51,9 +51,12 @@ def split_walkforward(
     for k in range(n_folds):
         test_start = (k + 1) * test_len
         test_end = test_start + test_len if k < n_folds - 1 else n
-        train_end = test_start - purge
+        # embargo 修复（评审 P2，2026-09-29）：原减在 train_start（左界）——左界隔离对
+        # expanding window 无意义，测试前无任何隔离 = embargo 失效。移到右界：
+        # 训练右界 = 测试起点 - purge - embargo，测试段前留 purge+embargo 双重间隔。
+        train_end = test_start - purge - embargo
         # 训练段从 0 滚动到 train_end（expanding window；如需 sliding 可改）
-        train_start = 0 if k == 0 else max(0, k * test_len - embargo)
+        train_start = 0
         if train_start >= train_end:
             continue
         folds.append(Fold(train=(train_start, train_end), test=(test_start, test_end)))

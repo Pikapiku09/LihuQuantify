@@ -41,12 +41,14 @@ class StopLossManager:
         force_pct: float = -0.08,
         trailing_pullback: float = 0.03,
         trailing_break_ma: int = 10,
+        enabled: bool = True,      # P7（2026-09-29）：False=全部跳过（纯持有期离场策略）
     ):
         self.warn_pct = warn_pct
         self.exec_pct = exec_pct
         self.force_pct = force_pct
         self.trailing_pullback = trailing_pullback     # 盈利回撤 3% 离场
         self.trailing_break_ma = trailing_break_ma     # 或破 10 日线离场
+        self.enabled = enabled
 
     def evaluate(
         self,
@@ -70,6 +72,8 @@ class StopLossManager:
             4. warn -3%：close 触及
             5. trailing_stop：浮盈后从高水位回撤 3%（修复1：移动止盈接入）
         """
+        if not self.enabled:
+            return StopAction(kind="hold")   # P7：禁用全部止损/止盈（持有期到期接管）
         if position.volume <= 0 or position.cost <= 0:
             return StopAction(kind="hold")
 

@@ -45,6 +45,7 @@ class WeeklyBandReversal(StrategyBase):
         max_position_pct: float = 0.20,
         stop_loss_force_pct: float = -0.10,       # 波段容忍度略高于日频（-8%→-10%）
         rebalance_weekday: int = 0,               # 0=周一
+        holding_days: int = 20,                   # 4周兑现周期 → 引擎自动到期平仓
         use_cross_section: bool = True,           # v2：截面口径（对齐门禁2），需预注入 cs_pct 列
         cs_entry_pct: float = 0.10,               # 截面最超卖 10%
         stop_mode: str = "trend",                 # v3：trend(破MA10+-10%) | wide(仅-15%) | time(纯时间止损)
@@ -56,6 +57,7 @@ class WeeklyBandReversal(StrategyBase):
         self.hist_window = hist_window
         self.max_position_pct = max_position_pct
         self.rebalance_weekday = rebalance_weekday
+        self.holding_days = holding_days
         self.use_cross_section = use_cross_section
         self.cs_entry_pct = cs_entry_pct
         self.stop_mode = stop_mode
@@ -117,6 +119,8 @@ class WeeklyBandReversal(StrategyBase):
                 kind="buy", ts_code=ts_code, suggested_price=close,
                 stop_loss=stop_loss, take_profit=targets,
                 suggested_position_pct=self.max_position_pct,
+                holding_days=self.holding_days,   # 引擎持有期到期平仓（评审修复②）
+                priority=float(row["wbr_cs_pct"]),  # 截面强度（引擎按此排序买入）
                 strategy_name=self.name,
                 reason=f"周频波段超卖(wbr分位={float(row['wbr_pct']):.2f})",
                 trade_date=row["trade_date"],

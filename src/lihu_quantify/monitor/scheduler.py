@@ -1213,6 +1213,16 @@ class DailyScanner:
                 continue
             # 价格止损：收盘价 ≤ 止损线
             close = self.broker.get_price(code)
+            # 复权口径（评审 P0，2026-09-29）：stop/cost 为买入日口径 → 折算到今日
+            _ratio = 1.0
+            _adj_t = self._fetch_adj(code, latest)
+            _adj_fn = getattr(self.broker, "adj_ratio", None)
+            if _adj_fn is not None and _adj_t > 0:
+                try:
+                    _ratio = _adj_fn(code, _adj_t)
+                except Exception:  # noqa: BLE001
+                    _ratio = 1.0
+            stop_eff = stop.stop_price * _ratio
             # MA10 破位（修复D）：取最新 MA10
             ma10 = self._fetch_ma10(code, latest)
             # 修复4(第六轮)：更新高水位（移动止盈基准；当日新仓买入价已起算）
@@ -1220,7 +1230,7 @@ class DailyScanner:
             # 循环结束后统一落盘一次。
             if hasattr(self.broker, "update_high_water") and close > 0:
                 self.broker.update_high_water(code, close, save=False)
-            if close > 0 and close <= stop.stop_price:
+            if close > 0 and close <= stop_eff:
                 new_pending.append({
                     "ts_code": code, "volume": stop.volume,
                     "stop_price": stop.stop_price, "reason": "price_stop",
@@ -1236,9 +1246,9 @@ class DailyScanner:
                                f"待次日开盘执行")
             elif hasattr(self.broker, "high_water_mark"):
                 # 修复4(第六轮)：移动止盈——浮盈后从高水位回撤 pullback 离场
-                hwm = self.broker.high_water_mark.get(code, 0.0)
+                hwm = self.broker.high_water_mark.get(code, 0.0)   # 注：hwm 未换算（需逐次记录更新日因子）；除权后移动止盈判定或偏差，已登记残余限制
                 pos = broker_positions.get(code) if isinstance(broker_positions, dict) else None
-                cost = pos.cost if pos is not None else 0.0
+                cost = (pos.cost * _ratio) if pos is not None else 0.0   # 复权口径折算
                 trail_price = hwm * (1 - pullback)
                 if hwm > cost > 0 and close > 0 and close <= trail_price:
                     new_pending.append({
@@ -1282,8 +1292,23 @@ class DailyScanner:
             logger.warning(f"取 {ts_code} 开盘价失败: {e}")
         return 0.0
 
+    def _fetch_adj(self, ts_code: str, trade_date: date) -> float:
+        """取指定日复权因子（复权口径修复，2026-09-29）。失败返回 0 → 换算降级 1.0。"""
+        try:
+            df = self.client.query("adj_factor", {
+                "ts_code": ts_code,
+                "start_date": trade_date.strftime("%Y%m%d"),
+                "end_date": trade_date.strftime("%Y%m%d"),
+            }, use_cache=True)
+            if df is not None and not df.empty:
+                return float(df["adj_factor"].iloc[0])
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"取 {ts_code} 复权因子失败: {e}")
+        return 0.0
+
+
     def _fetch_ma10(self, ts_code: str, trade_date: date) -> float:
-        """取指定日 MA10（用最近 10 根收盘均价，数据不足返回 0）。"""
+        """取指定日 MA10（前复权口径：历史价折算到当日，除权不再污染均线——评审 P0 2026-09-29）。"""
         try:
             start = trade_date - timedelta(days=30)
             df = self.client.query("daily", {
@@ -1292,7 +1317,22 @@ class DailyScanner:
                 "end_date": trade_date.strftime("%Y%m%d"),
             }, use_cache=True)
             if len(df) >= 10:
-                return float(df["close"].tail(10).mean())
+                adf = self.client.query("adj_factor", {
+                    "ts_code": ts_code,
+                    "start_date": start.strftime("%Y%m%d"),
+                    "end_date": trade_date.strftime("%Y%m%d"),
+                }, use_cache=True)
+                if adf is not None and not adf.empty:
+                    df = df.copy()
+                    df["trade_date"] = df["trade_date"].astype(str)
+                    adf = adf.copy()
+                    adf["trade_date"] = adf["trade_date"].astype(str)
+                    df = df.merge(adf[["trade_date", "adj_factor"]], on="trade_date", how="left")
+                    adj_today = float(df["adj_factor"].iloc[-1]) if pd.notna(df["adj_factor"].iloc[-1]) else 0.0
+                    if adj_today > 0:
+                        df["close_adj"] = df["close"] * df["adj_factor"].fillna(adj_today) / adj_today
+                        return float(df["close_adj"].tail(10).mean())
+                return float(df["close"].tail(10).mean())   # 无因子 → 旧行为
         except Exception as e:
             logger.warning(f"取 {ts_code} MA10 失败: {e}")
         return 0.0

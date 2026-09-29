@@ -113,6 +113,7 @@ class SimulatedBroker:
             if order.side == "sell" and high <= limit_down:
                 return None
 
+        slip_cost = 0.0   # 保真度补丁（评审⑰ 2026-09-29）：限价单名义滑点 0，市价单按实际价差记账
         if order.order_type == "limit":
             # 限价买：limit_price >= low 才能成交，成交价 = min(limit, open)（P1-3）
             if order.side == "buy":
@@ -129,6 +130,15 @@ class SimulatedBroker:
             # 导致回测低估成本且"滑点越高收益越高"。正确：买入更贵、卖出更便宜。
             slip = open_price * self.slippage
             price = open_price + slip if order.side == "buy" else open_price - slip
+            # 保真度补丁（评审⑰）：滑点后成交价不得越过停板价（真实市场该价位不可成交）
+            if pre_close is not None:
+                if order.side == "buy":
+                    price = min(price, limit_up)
+                else:
+                    price = max(price, limit_down)
+            # 实际不利价差 × 数量（clamp 后口径）
+            slip_cost = ((price - open_price) if order.side == "buy"
+                         else (open_price - price)) * order.volume
 
         # 费用计算
         turnover = price * order.volume
@@ -148,6 +158,7 @@ class SimulatedBroker:
             fill_date=fill_date,
             commission=commission,
             stamp_tax=stamp_tax,
+            slippage_cost=slip_cost,
             cash_flow=cash_flow,
             reason=order.reason,
         )

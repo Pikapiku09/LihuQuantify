@@ -28,6 +28,7 @@ from ..indicators.standard import add_all_standard
 from ..market import classify_market_state  # P2-9-4：包内引入，消除 sys.path hack
 from ..strategy.cherry_claw import CherryClaw
 from ..strategy.intraday_reversal import IntradayReversal
+from ..strategy.weekly_band import WeeklyBandReversal
 from ..risk.vol_target import VolTargetSizer
 from ..risk.checklist import ChecklistGate, CheckContext
 from ..execution.paper_trade import PaperBroker
@@ -588,7 +589,7 @@ class DailyScanner:
 
         # ir20 账本：因子需 250 日滚动分位预热，窗口放大到 500 自然日
 
-        _days = 500 if getattr(self.book, "strategy", "") == "intraday_reversal" else days
+        _days = 500 if getattr(self.book, "strategy", "") in ("intraday_reversal", "weekly_band") else days
         start = latest - timedelta(days=_days)
         signals: list[tuple] = []
         for code in codes:
@@ -661,10 +662,17 @@ class DailyScanner:
                 logger.warning(f"[情绪] limit_list_d 拉取失败（忽略门控）: {e}")
 
         # 扫描信号（修复C：同时取板块映射）
-        if getattr(self.book, "strategy", "cherry_claw") == "intraday_reversal":
+        _strat_name = getattr(self.book, "strategy", "cherry_claw")
+        if _strat_name == "intraday_reversal":
             strategy = IntradayReversal(
                 max_position_pct=min(r.max_single_position, 0.15),
                 stop_loss_force_pct=r.stop_loss_force,
+            )
+        elif _strat_name == "weekly_band":
+            # WBR ms25 影子（2026-09-29 双轨研究）：对齐回测口径——2.5%单票、
+            # 截面最超卖 30%、持有 20 交易日到期（纯持有期离场，止损由账本跳过）
+            strategy = WeeklyBandReversal(
+                max_position_pct=0.025, cs_entry_pct=0.30, holding_days=20,
             )
         else:
             strategy = CherryClaw(
@@ -682,6 +690,9 @@ class DailyScanner:
                 from ..strategy.vol_wrap import wrap_vol_target
                 strategy = wrap_vol_target(strategy, _vt)
         codes, sector_map, name_map = self._universe(n)
+        # 分位预热窗口（ir20/wbr 需 250 日滚动分位 → 500 自然日，修复 _scan_impl 缺口）
+        if _strat_name in ("intraday_reversal", "weekly_band"):
+            days = max(days, 500)
         start = latest - timedelta(days=days)
         signals: list[tuple] = []   # (signal, last_bar)
         hm_quotes: list[dict] = []   # 问题3（第九轮）：最新 bar → 热力图快照
@@ -718,6 +729,15 @@ class DailyScanner:
                 # 需求1（第八轮）：信号评分（资金紧张时 top-N 排序用）
                 signals.append((sig, last_ind, _signal_score(last_ind)))
         logger.info(f"[巡检] [{self._state_label}] 扫描信号 {len(signals)} 个")
+        # WBR 池内截面过滤（2026-09-29 双轨影子）：单股扫描无全市场截面分位，
+        # 用信号 priority（自身历史分位，小=超卖）池内排序取相对最超卖前 30%——
+        # 对齐回测截面口径的池内近似（口径差异登记：池≈198 只 vs 回测全市场 2810 只）
+        if _strat_name == "weekly_band" and signals:
+            _prios = pd.Series([sig.priority for sig, _, _ in signals])
+            _ranks = _prios.rank(pct=True, ascending=True)
+            _kept = [(sg, bi, sc) for (sg, bi, sc), q in zip(signals, _ranks) if q <= 0.30]
+            logger.info(f"[巡检] WBR 池内截面过滤：{len(signals)} → {len(_kept)}（top30%）")
+            signals = _kept
 
         # 问题3（第九轮）：热力图快照落盘（web 唯一数据源，切断 DuckDB 依赖）
         # 第十二轮：影子不写（共享文件，避免影子池覆盖主快照）
@@ -737,6 +757,7 @@ class DailyScanner:
         # 回测引擎日循环 = 撮合 T-1 卖单（T 开盘）→ T 收盘买入；
         # 纸面原顺序"买入→卖出"导致止损回笼资金闲置一天，先执行待执行止损。
         executed_stops = self._execute_pending_stops(latest)
+        self._check_holding_expiry(latest)   # WBR 到期平仓（在买入执行前回款）
         asset = self.broker.query_asset()
         total_asset = asset.get("total_asset", 0)
         cash = asset.get("cash", 0)
@@ -1159,6 +1180,58 @@ class DailyScanner:
                 pass
         return executed_stops
 
+    def _check_holding_expiry(self, latest: date) -> list[dict]:
+        """WBR 周频账本：持有期到期平仓（回测口径 20 交易日 ≈ 28 自然日）。
+
+        2026-09-29 双轨研究：纸面原无持有期到期机制（引擎第一梯队②修复后回测有、
+        纸面无）——本方法补齐，对齐 WeeklyBandReversal(holding_days=20) 回测口径。
+        T+1：可用股数为 0（当日买入）→ 跳过次日再判。"""
+        if getattr(self.book, "strategy", "") != "weekly_band":
+            return []
+        positions = getattr(self.broker, "positions", None)
+        if not isinstance(positions, dict) or not positions:
+            return []
+        # 最近买入日期（trades 反查；兼容 str/date）
+        last_buy: dict = {}
+        for t in getattr(self.broker, "trades", []) or []:
+            if t.get("side") == "buy":
+                try:
+                    d = t.get("date")
+                    last_buy[t["ts_code"]] = (d if hasattr(d, "year")
+                                              else pd.Timestamp(str(d)[:10]).date())
+                except Exception:  # noqa: BLE001
+                    pass
+        executed: list = []
+        hold_days_calendar = 28   # 20 交易日 x 7/5
+        for code in list(positions.keys()):
+            bd = last_buy.get(code)
+            if bd is None or not hasattr(bd, "year"):
+                continue
+            age = (latest - bd).days
+            if age < hold_days_calendar:
+                continue
+            pos = positions[code]
+            vol = (getattr(pos, "available", 0) // 100) * 100
+            if vol <= 0:
+                vol = (getattr(pos, "volume", 0) // 100) * 100
+            if vol <= 0:
+                continue
+            price = self.broker.get_price(code)
+            if not price or price <= 0:
+                continue
+            try:
+                res = self.broker.sell(code, price, vol,
+                                       reason=f"持有期到期({age}自然日≈20交易日)")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[WBR到期平仓] {code} 卖出异常: {e}")
+                continue
+            if getattr(res, "success", False):
+                executed.append({"ts_code": code, "volume": vol, "price": price})
+                logger.info(f"[WBR到期平仓] {code} 持有 {age} 自然日 → 卖出 {vol} 股 @ {price}")
+        return executed
+
+
+
     def _register_new_stops(
         self, oms: OrderManagementSystem, latest: date
     ) -> list[dict]:
@@ -1174,6 +1247,10 @@ class DailyScanner:
         trailing_profit_pullback(默认3%) 判定（高水位×0.97，与
         risk/stop_loss.py 第七轮修正后口径一致）。
         """
+        # WBR 周频账本（2026-09-29）：纯持有期离场——不登记价格/MA/移动止盈止损
+        # （回测口径 StopLossManager(enabled=False)；到期平仓由 _check_holding_expiry 接管）
+        if getattr(self.book, "strategy", "") == "weekly_band":
+            return []
         pending_file = self._pending_file   # 第十二轮：影子账本独立 pending 文件
         buys_today = set()
         for t in getattr(self.broker, "trades", []) or []:

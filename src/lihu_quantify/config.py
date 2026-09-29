@@ -198,7 +198,7 @@ class ShadowBookConfig(BaseModel):
     """影子账本：同策略不同 seed 池的并行纸面副本（评审参考样本）。"""
     name: str = ""            # 账本名（如 s43），用于状态文件后缀与日志前缀
     seed: int = 42            # 分层池抽样种子（与主账本 42 不同）
-    strategy: str = "cherry_claw"   # "cherry_claw" | "intraday_reversal"
+    strategy: str = "cherry_claw"   # "cherry_claw" | "intraday_reversal" | "weekly_band"
 
 
 class Settings(BaseSettings):

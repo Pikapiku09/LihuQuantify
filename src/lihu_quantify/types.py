@@ -25,6 +25,7 @@ class Signal:
     stop_loss: Optional[float] = None       # 买入信号必须给出
     take_profit: list[float] = field(default_factory=list)  # L1-L4 目标价
     holding_days: int = 0                    # 持有期上限（交易日；0=不限制，到期自动平仓）
+    priority: float = 0.0                    # 截面选股优先级（越小越先买；如当日分位）
     suggested_position_pct: float = 0.0     # 建议仓位（≤25%）
     strategy_name: str = ""                  # 信号来源策略
     reason: str = ""

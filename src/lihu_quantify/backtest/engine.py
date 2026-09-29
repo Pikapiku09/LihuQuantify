@@ -53,6 +53,8 @@ class EventDrivenEngine:
         market_states: Optional[dict] = None,
         market_filter_on: bool = True,
         market_filter_mode: str = "reduce",   # "block"=禁止开仓 | "reduce"=仓位减半
+        priority_sort: bool = False,   # 截面按 priority 排序买入（默认关=遍历序；
+                                      # 实测 20-40 只集中时极端化选股劣化，见 P7 引擎复现报告）
     ):
         self.strategy = strategy
         self.broker = broker or SimulatedBroker()
@@ -67,6 +69,7 @@ class EventDrivenEngine:
         self.market_states = market_states
         self.market_filter_on = market_filter_on
         self.market_filter_mode = market_filter_mode
+        self.priority_sort = priority_sort
 
     def _entry_position_scale(self, dt) -> float:
         """市场状态 → 新开仓仓位缩放系数。"""
@@ -134,6 +137,8 @@ class EventDrivenEngine:
         equity_dict: dict = {}
         signals_generated = 0
         orders_rejected = 0
+        _diag = {"match_no_bar": 0, "match_cash_reject": 0, "match_ok": 0,
+                 "pre_cash_reject": 0, "pending_buy": 0, "pending_sell": 0}
         pos_meta: dict[str, dict] = {}       # {code: {entry_idx, holding_days}} 持仓元数据
         pending_meta: dict[str, dict] = {}   # 下单暂存元数据（撮合成交后转入 pos_meta）
 
@@ -144,6 +149,7 @@ class EventDrivenEngine:
                     pos_map = date_pos.get(order.ts_code, {})
                     i = pos_map.get(dt)
                     if i is None:
+                        _diag["match_no_bar"] += 1
                         continue
                     next_bar = prepared[order.ts_code].iloc[i]
                     fill = self.broker.fill(order, next_bar)
@@ -156,6 +162,7 @@ class EventDrivenEngine:
                             max_lots = int(portfolio.cash // per_lot) if per_lot > 0 else 0
                             vol2 = min(order.volume, max_lots * 100)
                             if vol2 < 100:
+                                _diag["match_cash_reject"] += 1
                                 continue
                             if vol2 != order.volume:
                                 order = replace(order, volume=vol2)
@@ -163,12 +170,17 @@ class EventDrivenEngine:
                                 if fill is None:
                                     continue
                         portfolio.apply_fill(fill)
+                        _diag["match_ok"] += 1
                         if fill.side == "buy":
                             meta = pending_meta.pop(fill.ts_code, {})
                             pos_meta[fill.ts_code] = {
                                 "entry_idx": day_idx,
                                 "holding_days": meta.get("holding_days", 0),
                             }
+                        elif fill.side == "sell":
+                            # 卖出成交 → 清除持仓元数据（到期/止损统一；
+                            # 撮合失败保留 pos_meta → 次日到期检查重试，持仓不再滞留）
+                            pos_meta.pop(fill.ts_code, None)
                 pending_orders = []
 
             # 2. 更新价格为 T 的 close（O(1) 定位）
@@ -219,12 +231,20 @@ class EventDrivenEngine:
                             order_type="market", trade_date=dt,
                             reason=f"持有期到期({meta['holding_days']}交易日)",
                         ))
-                    pos_meta.pop(code, None)
 
             # 4. 策略信号 → 买入（无状态策略查预计算表；有状态策略逐 bar 推送）
             #    市场状态（修复A降级为降仓信号）：非上涨段 scale<1（减半/禁止）；
             #    持仓止损在步骤3照常执行
             entry_scale = self._entry_position_scale(dt)
+            candidates: list = []   # 当日买入候选（按 priority 截面排序后处理）
+            # 现金可用额度（下单期逐单扣减——修复20单共享同一笔回款的超发问题）
+            cash_avail = portfolio.cash
+            for po in pending_orders:
+                if po.side == "sell":
+                    _pb = bars_today.get(po.ts_code)
+                    _px = float(_pb["close"]) if _pb is not None else 0.0
+                    if _px > 0:
+                        cash_avail += _px * po.volume
             for code, df in prepared.items():
                 if len(df) < 30:
                     continue
@@ -267,6 +287,15 @@ class EventDrivenEngine:
                     continue
                 if signal is None or signal.kind != "buy":
                     continue
+                candidates.append((float(getattr(signal, "priority", 0.0)), code, i, signal))
+
+            # 截面排序（2026-09-29）：按 priority（当日分位）升序买入——修复按字典序
+            # 选股的偏差（组合模拟按因子强度取 top，引擎原按代码序取前排）。
+            if self.priority_sort:
+                candidates.sort(key=lambda x: x[0])   # 按 priority（分位）升序
+            for _prio, code, i, signal in candidates:
+                df = prepared[code]
+                last_bar = df.iloc[i]
                 signals_generated += 1
                 # Checklist 闸门
                 account = portfolio.to_snapshot(sector_by_code)
@@ -298,7 +327,8 @@ class EventDrivenEngine:
                     if nb_open > 0 and not pd.isna(nb_open):
                         est_price = nb_open * (1 + self.broker.slippage)
                 per_lot = est_price * 100 * (1 + self.broker.commission_rate)
-                max_lots = int(portfolio.cash // per_lot) if per_lot > 0 else 0
+                # 逐单扣减可用现金（修复：多单共享同一笔回款超发 → 撮合期44%现金拒）
+                max_lots = int(cash_avail // per_lot) if per_lot > 0 else 0
                 volume = min(volume, max_lots * 100)
                 if volume < 100:
                     continue
@@ -307,7 +337,9 @@ class EventDrivenEngine:
                     order_type="market", trade_date=dt,
                     reason=signal.reason,
                 ))
+                _diag["pending_buy"] += 1
                 pending_meta[code] = {"holding_days": getattr(signal, "holding_days", 0)}
+                cash_avail -= per_lot * (volume // 100)   # 逐单扣减（每手成本×手数，含佣金）
 
             # 5. 记录权益
             # 5.5 清理已无持仓的元数据
@@ -318,6 +350,7 @@ class EventDrivenEngine:
 
         equity = pd.Series(equity_dict, name="equity")
         equity.index.name = "trade_date"
+        logger.info(f"[引擎诊断] 撮合成功={_diag['match_ok']} 现金拒={_diag['match_cash_reject']} 无bar={_diag['match_no_bar']} 下单buy={_diag['pending_buy']} 原始={signals_generated} 闸门拒={orders_rejected}")
         metrics = compute_metrics(equity, portfolio.trades)
         return BacktestResult(
             equity=equity,

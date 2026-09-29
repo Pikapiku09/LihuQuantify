@@ -4,7 +4,11 @@
     - data/paper_state.json：cash/positions/trades/trade_day/halted_until
     - 每次 buy/sell/on_new_day 后原子写入（临时文件+替换）
     - 进程重启加载恢复，模拟盘连续验证语义保持
-"""
+
+
+口径声明（评审⑰，2026-09-29）：纸面成交按真实开盘价，**不加滑点**——纸面记录的是
+可观察的准实盘口径；回测引擎另有 0.1% 滑点（方向已修正）。二者差异已在评审登记，
+不视为缺陷。"""
 
 from __future__ import annotations
 

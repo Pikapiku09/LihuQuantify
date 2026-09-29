@@ -126,3 +126,30 @@ def test_regime_classify():
     assert set(reg.unique()) <= {"bull", "bear", "range"}
     assert (reg.iloc[60:100] == "bull").mean() > 0.8  # 预热期后前段上涨以 bull 为主
     assert (reg.iloc[-100:] == "bear").mean() > 0.8  # 后段深跌以 bear 为主
+
+
+def test_ic_alignment_unsorted():
+    """IC 对齐回归（评审 P2）：df 打乱顺序后 IC 应与排序后一致（原 .values 位置贴会错位）。"""
+    import numpy as np
+    import pandas as pd
+    from lihu_quantify.research.ic import calc_ic
+
+    rng = np.random.default_rng(7)
+    n = 450
+    n_days = 30
+    df = pd.DataFrame({
+        "ts_code": [f"60{i // n_days:04d}.SH" for i in range(n)],
+        "trade_date": list(pd.date_range("2024-01-01", periods=n_days, freq="B")) * (n // n_days),
+        "close": 10.0 + rng.normal(0, 1, n).cumsum() * 0.1,
+    })
+    df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    factor = pd.Series(rng.normal(0, 1, n), index=df.index)
+    ic_sorted = calc_ic(df, factor, horizon=3)
+
+    # 打乱行序（同因子语义：因子跟着行走）
+    shuffled_idx = df.sample(frac=1.0, random_state=1).index
+    df_shuf = df.loc[shuffled_idx].reset_index(drop=True)
+    factor_shuf = factor.loc[shuffled_idx].reset_index(drop=True)
+    ic_shuf = calc_ic(df_shuf, factor_shuf, horizon=3)
+
+    pd.testing.assert_frame_equal(ic_sorted.sort_index(), ic_shuf.sort_index())

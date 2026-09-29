@@ -25,8 +25,14 @@ def calc_ic(df: pd.DataFrame, factor: pd.Series, horizon: int = 5) -> pd.DataFra
         n       —— 当日截面样本数
     """
     d = df.copy()
-    d["_factor"] = factor.values
-    d["_fwd"] = forward_return(d, horizon).values
+    # 对齐修复（评审 P2，2026-09-29）：原 .values 按位置贴——df 未预排序时
+    # forward_return 内部 sort 后的位置与 d 错位 → IC 整列错配。改为按 index 对齐
+    # （df 已排序时行为与旧口径完全一致，历史门禁数字不受影响）。
+    if isinstance(factor, pd.Series):
+        d["_factor"] = factor
+    else:
+        d["_factor"] = pd.Series(factor, index=d.index)
+    d["_fwd"] = forward_return(d, horizon)
     d = d.dropna(subset=["_factor", "_fwd"])
 
     def _day(g: pd.DataFrame):

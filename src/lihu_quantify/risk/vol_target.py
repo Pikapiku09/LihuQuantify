@@ -55,13 +55,38 @@ class VolTargetSizer:
             return 1.0
         return float(np.clip(self.target_vol / rv, self.min_scale, self.cap))
 
+    def _scale_by_date(self, df: pd.DataFrame) -> dict:
+        """预计算每交易日的 scale（窗口截至当日收盘，无前视）。
+
+        前视修复（评审 P1，2026-09-29）：原实现用整段 df 的末窗波动
+        缩放全部历史信号（= 用 2026-08 的波动决定 2022 年仓位）。
+        """
+        closes = df["close"].astype(float)
+        rets = closes.pct_change()
+        rv = rets.rolling(self.window, min_periods=max(10, self.window // 2)).std() * np.sqrt(self.trading_days)
+        scale = pd.Series(self.min_scale, index=df.index)
+        valid = rv.notna() & (rv > 0)
+        scale[valid] = np.clip(self.target_vol / rv[valid], self.min_scale, self.cap)
+        scale[~valid] = 1.0
+        dates = df["trade_date"].tolist()
+        return dict(zip(dates, scale.tolist()))
+
     def apply(self, signals: list[Signal], df: pd.DataFrame) -> list[Signal]:
-        """对信号列表就地缩放仓位（df 需含 close 列、与信号同股票升序）。"""
+        """对信号列表就地缩放仓位（df 含 close + trade_date 列、升序）。
+
+        每个信号用【其信号日及之前】的窗口波动——逐信号无前视。
+        """
         if not signals:
             return signals
-        s = self.scale(df["close"])
+        scale_map = self._scale_by_date(df)
+        # 未命中（trade_date=None 或不在 df）→ 回退 df 最后一根 bar 的 scale
+        # （语义：信号生成于最新 bar；兼容旧调用方不带 trade_date）
+        fallback = scale_map[next(reversed(scale_map))] if scale_map else 1.0
         for sig in signals:
-            if sig.kind == "buy":
+            if sig.kind != "buy":
+                continue
+            s = scale_map.get(sig.trade_date, fallback) if scale_map else 1.0
+            if s != 1.0:
                 sig.suggested_position_pct = round(
                     sig.suggested_position_pct * s, 4)
                 sig.reason = (sig.reason or "") + f" | vol_target×{s:.2f}"

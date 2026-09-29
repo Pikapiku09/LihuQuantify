@@ -88,6 +88,8 @@ class PaperBroker(BrokerBase):
         self._halt_map: dict[str, _date] = {}        # 修复F：按票停手 {ts_code: until}
         # 修复4(第六轮)：持仓期最高价（移动止盈基准，与回测 portfolio.high_water_mark 同语义）
         self.high_water_mark: dict[str, float] = {}
+        # 复权口径（评审 P0，2026-09-29）：买入日复权因子，除权时把 cost/stop 折算到当日口径
+        self.buy_adj: dict[str, float] = {}
         # 行情源（Tushare；None 时用手动 set_price 注入，便于测试）
         self._tushare = tushare_client
         self._store = duckdb_store
@@ -127,6 +129,7 @@ class PaperBroker(BrokerBase):
             "halted_until": str(self.halted_until) if self.halted_until else None,
             "halt_map": {k: str(v) for k, v in self._halt_map.items()},
             "high_water_mark": dict(self.high_water_mark),   # 修复4(第六轮)
+            "buy_adj": dict(self.buy_adj),   # 复权口径（买入日因子）
             "positions": {
                 code: {
                     "volume": p.volume, "available": p.available,
@@ -168,6 +171,7 @@ class PaperBroker(BrokerBase):
             }
             # 修复4(第六轮)：恢复高水位（旧状态文件无此字段 → 空 dict，重建即可）
             self.high_water_mark = dict(state.get("high_water_mark") or {})
+            self.buy_adj = dict(state.get("buy_adj") or {})
             self.positions = {
                 code: _PaperPosition(
                     volume=p.get("volume", 0),
@@ -245,6 +249,18 @@ class PaperBroker(BrokerBase):
         })
         # 修复4(第六轮)：新仓高水位以成交价起算（同回测 portfolio.apply_fill）
         self.update_high_water(ts_code, price, save=False)
+        # 复权口径：记录买入日 adj_factor（失败/无日期记 0 → 换算比率 1.0 降级旧行为）
+        self.buy_adj[ts_code] = 0.0
+        if self._tushare is not None and self.trade_day is not None:
+            try:
+                _td = str(self.trade_day).replace("-", "")[:8]
+                _adf = self._tushare.query("adj_factor", {
+                    "ts_code": ts_code, "start_date": _td, "end_date": _td,
+                }, use_cache=True)
+                if _adf is not None and not getattr(_adf, "empty", True):
+                    self.buy_adj[ts_code] = float(_adf["adj_factor"].iloc[-1])
+            except Exception:  # noqa: BLE001
+                pass
         logger.info(f"[模拟盘买入] {ts_code} {volume}股 @ {price:.2f}（佣金 {commission:.2f}）")
         self._save_state()   # 修复B：持久化
         return OrderResult(success=True, order_id=order_id, filled_volume=volume, filled_price=price)
@@ -265,6 +281,7 @@ class PaperBroker(BrokerBase):
         if pos.volume <= 0:
             self.positions.pop(ts_code, None)
             self.high_water_mark.pop(ts_code, None)   # 清仓清理高水位（同回测）
+        self.buy_adj.pop(ts_code, None)   # 清仓清理（复权口径）
         order_id = f"PB-S-{len(self.trades) + 1}"
         self.trades.append({
             "order_id": order_id, "ts_code": ts_code, "side": "sell",
@@ -278,6 +295,18 @@ class PaperBroker(BrokerBase):
         self._on_sell_halt_check(ts_code, price)   # 修复F：连亏停手检查
         self._save_state()   # 修复B：持久化
         return OrderResult(success=True, order_id=order_id, filled_volume=volume, filled_price=price)
+
+    def adj_ratio(self, ts_code: str, adj_today: float) -> float:
+        """买入日口径 → 今日口径 的换算比率 = adj_buy / adj_today（前复权到今日）。
+
+        复权口径（评审 P0，2026-09-29）：cost/stop_price 为买入日不复权口径，
+        除权后与今日 raw 不可直接比较 → 乘此比率折算到今日口径。
+        任一因子缺失 → 1.0（降级为旧行为，不更差）。"""
+        adj_buy = self.buy_adj.get(ts_code, 0.0)
+        if not adj_buy or not adj_today or adj_today <= 0:
+            return 1.0
+        return float(adj_buy) / float(adj_today)
+
 
     def update_high_water(self, ts_code: str, price: float, save: bool = True) -> None:
         """修复4(第六轮)：更新持仓期最高价（只升不降；变化时持久化）。"""

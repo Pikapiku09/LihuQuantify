@@ -1,8 +1,8 @@
 # LihuQuantify → NAS 同步（2026-09-26 建）
-# 前提：NAS 在线（192.168.123.204）且 Windows 已存凭据（2026-09-26 已配置 tld）
+# 前提：NAS 在线（192.168.123.203）且 Windows 已存凭据（2026-09-26 已配置 tld）
 # 铁律：绝不推送 data/（NAS 侧 paper_state/duckdb 是生产状态）与 outputs/（NAS 自产报告）
 # 用法：pwsh -File scripts\sync_to_nas.ps1
-param([string]$NasRoot = "\\192.168.123.204\Lihu_Quantify")
+param([string]$NasRoot = "\\192.168.123.203\Lihu_Quantify")
 if (-not (Test-Path $NasRoot)) { Write-Host "NAS 目录不可达: $NasRoot —— 请先开机/映射共享文件夹"; exit 1 }
 $src = Split-Path $PSScriptRoot -Parent
 foreach ($dir in @("src", "config", "scripts", "web")) {

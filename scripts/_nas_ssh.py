@@ -2,7 +2,7 @@
 import os, sys
 import paramiko
 
-host, user, pwd = "192.168.123.204", "931570981", os.environ["NAS_PWD"]
+host, user, pwd = "192.168.123.203", "931570981", os.environ["NAS_PWD"]
 cmd = sys.argv[1]
 use_sudo = os.environ.get("NAS_SUDO", "0") == "1"
 

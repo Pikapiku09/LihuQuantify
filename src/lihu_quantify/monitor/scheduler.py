@@ -1487,6 +1487,22 @@ def setup_scheduler(
         name="每日收盘巡检",
         misfire_grace_time=3600,
     )
+    # ---- 17:40 巡检兜底（2026-10-08；动机：9/28 16:30 未触发致用户未收邮件）----
+    # misfire_grace=3600 只覆盖 17:30 前的短暂错过；宿主休眠超窗后任务被永久跳过。
+    # 兜底无条件调 _run_all_scans——scan 自带幂等（当日已跑秒级跳过、主报告同名覆盖、
+    # 影子命中缓存），仅在 16:30 真没跑时实际补跑。非交易日同样被 scan 幂等吸收。
+    def daily_scan_fallback():
+        logger.info("[兜底] 17:40 幂等检查点（当日已跑 → scan 自动跳过）")
+        _run_all_scans()
+
+    sched.add_job(
+        daily_scan_fallback,
+        CronTrigger(hour=17, minute=40),
+        id="daily_scan_fallback",
+        name="巡检兜底补跑",
+        misfire_grace_time=7200,
+        coalesce=True,
+    )
     # 月末复盘（修复H.2；APScheduler 不支持 cron "L"，用 28-31 日 + 月内末次触发近似）
     sched.add_job(
         monthly_review_job,

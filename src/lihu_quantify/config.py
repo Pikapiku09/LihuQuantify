@@ -211,6 +211,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,
+                                  dotenv_settings, file_secret_settings):
+        # 优先级：init > env（.env/环境变量）> dotenv > YAML > 默认值
+        return (init_settings, env_settings, dotenv_settings,
+                _yaml_settings_source, file_secret_settings)
+
     tushare: TushareConfig = Field(default_factory=TushareConfig)
     duckdb: DuckDBConfig = Field(default_factory=DuckDBConfig)
     qmt: QMTConfig = Field(default_factory=QMTConfig)
@@ -311,10 +318,29 @@ def load_yaml_config(yaml_path: Path | str = "config/settings.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 
+# 模块级 YAML 注入源（2026-10-11 优先级修复：env 必须能覆盖 yaml）
+_yaml_override: dict = {}
+
+
+def _yaml_settings_source() -> dict:
+    """把 YAML 配置作为 pydantic source（优先级：init > env > dotenv > yaml > 默认）。
+
+    修复背景：原实现 Settings(**yaml_data) 把 yaml 作为 init 传入——pydantic 中
+    init 优先级最高，导致 .env 环境变量（如邮件 AUTH_CODE/USERNAME）永远被 yaml
+    空值压制（2026-10-11 邮件修复发现）。"""
+    return dict(_yaml_override)
+
+
 @lru_cache(maxsize=1)
 def get_settings(yaml_path: str = "config/settings.yaml") -> Settings:
     """获取全局 Settings 单例。YAML 为底，环境变量覆盖。"""
     yaml_data = load_yaml_config(yaml_path)
     # 环境变量由 pydantic-settings 自动读取；YAML 作为默认值注入
-    settings = Settings(**yaml_data)
+    _yaml_override.clear()
+    _yaml_override.update(yaml_data)
+    try:
+        settings = Settings()   # yaml 走自定义 source（env 可覆盖 yaml）
+    finally:
+        # 构造完成后清空，防模块级缓存污染其他 Settings() 直构造（测试隔离）
+        _yaml_override.clear()
     return settings

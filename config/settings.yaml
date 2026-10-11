@@ -101,12 +101,12 @@ heartbeat:
 alert:
   serverchan_key: ""
   email:
-    enabled: false                        # 总开关（授权码未填时保持 false）
+    enabled: true                         # 总开关（2026-10-11 邮件恢复；auth_code 由 .env 注入）
     smtp_host: "smtp.qq.com"              # 或 smtp.163.com
     smtp_port: 465
-    username: ""                          # 发件邮箱
+    username: "931570981@qq.com"          # 发件邮箱
     auth_code: ""                         # 授权码（非登录密码）；建议放 .env: LIHU_ALERT__EMAIL__AUTH_CODE
-    to: []                                # 收件人列表
+    to: ["931570981@qq.com"]              # 收件人列表
     send_daily_digest: true               # 每日综合日报邮件（HTML：持仓/操作/盈亏/风险提示，每日一封）
 
 # 指标自研参数

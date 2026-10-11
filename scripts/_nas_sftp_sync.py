@@ -92,8 +92,11 @@ def main() -> None:
         sys.exit(1)
 
     # 3) token_file 容器路径修正
-    st, out, _ = run(f"sed -i 's|token_file: .*|token_file: /app/tushareMcp.json|' {REMOTE}/config/settings.yaml && grep -m1 token_file {REMOTE}/config/settings.yaml")
+    st, out, _ = run(f"sed -i 's|token_file: .*|token_file: /app/tushareMcp.json|' {REMOTE}/config/settings.yaml && grep -E 'token_file: /app/' {REMOTE}/config/settings.yaml")
     print("token_file:", out.strip())
+    if "token_file: /app/" not in out:
+        print("!! token_file 校验失败——容器将因 token 为空崩溃", file=sys.stderr)
+        raise SystemExit(2)
 
     # 4) 校验关键内容到位
     for probe, desc in [

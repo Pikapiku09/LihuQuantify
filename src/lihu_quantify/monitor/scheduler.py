@@ -1511,6 +1511,26 @@ def setup_scheduler(
         name="月度复盘",
         misfire_grace_time=7200,
     )
+    # ---- 波段池周报（2026-10-16；每周五 21:00，读 data/swing_pool/ 推送件）----
+    # dsh-invest 波段池（中长周期）周检提醒；池子由 DSH 侧维护并经
+    # scripts/_nas_swing_push.py 推送，邮件复用 EmailAlerter（授权码在容器环境）。
+    def swing_weekly_job():
+        from .alerts import build_email_alerter
+        from .swing_pool import send_swing_weekly
+        logger.info("[定时任务] 波段池周报发送")
+        try:
+            send_swing_weekly(build_email_alerter(getattr(getattr(settings, "alert", None), "email", None)))
+        except Exception as e:
+            logger.exception(f"[定时任务] 波段池周报异常: {e}")
+
+    sched.add_job(
+        swing_weekly_job,
+        CronTrigger(day_of_week="fri", hour=21, minute=0),
+        id="swing_weekly",
+        name="波段池周报",
+        misfire_grace_time=7200,
+        coalesce=True,
+    )
     return sched
 
 

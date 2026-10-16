@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--run-now", action="store_true", help="启动时立即执行一次巡检")
     parser.add_argument("--force", action="store_true",
                         help="跳过幂等保护强制重跑当日巡检（人工补跑用；仅对 --run-now 生效）")
+    parser.add_argument("--swing-now", action="store_true",
+                        help="立即发送一次波段池周报后退出（测试/人工补发）")
     args = parser.parse_args()
 
     # 第四轮清单7：文件日志（30 天滚动）；cron 触发的巡检同样落盘
@@ -47,6 +49,13 @@ def main():
     if args.mode == "live" and not settings.qmt.enabled:
         logger.error("实盘模式需要 settings.yaml qmt.enabled=true")
         sys.exit(1)
+
+    if args.swing_now:
+        from lihu_quantify.monitor.alerts import build_email_alerter
+        from lihu_quantify.monitor.swing_pool import send_swing_weekly
+        ok = send_swing_weekly(build_email_alerter(getattr(getattr(settings, "alert", None), "email", None)))
+        print("波段池周报: 已发送" if ok else "波段池周报: 未发送（邮件未配置或发送失败）")
+        sys.exit(0 if ok else 1)
 
     if args.run_now:
         logger.info(f"[--run-now] 立即执行一次巡检（force={args.force}，含影子账本）")

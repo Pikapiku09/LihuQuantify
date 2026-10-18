@@ -434,6 +434,24 @@ async def state():
     return _read_paper_state()
 
 
+@app.get("/api/swing_backtest")
+async def swing_backtest():
+    """波段池策略三年回测结果（outputs/swing_backtest.json，run_swing_backtest.py 生成）。"""
+    d = _read_json(ROOT / "outputs" / "swing_backtest.json")
+    if not d:
+        raise HTTPException(status_code=404, detail="no swing backtest result; run run_swing_backtest.py first")
+    return d
+
+
+@app.get("/api/swing_pool")
+async def swing_pool():
+    """波段池当前持仓（data/swing_pool/波段池_持仓.md，DSH 侧维护经推送同步）。"""
+    p = ROOT / "data" / "swing_pool" / "波段池_持仓.md"
+    if not p.exists():
+        return {"exists": False, "content": "", "updated_at": None}
+    return {"exists": True, "content": p.read_text(encoding="utf-8"), "updated_at": p.stat().st_mtime}
+
+
 @app.get("/api/grid")
 async def grid():
     """网格搜索结果摘要（修复H.2：读 grid_v2_*_summary.json 结构化数据）。

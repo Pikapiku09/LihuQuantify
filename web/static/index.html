@@ -465,6 +465,10 @@
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
                     <span>回测分析</span>
                 </div>
+                <div role="button" tabindex="0" class="nav-item" onclick="showPage('swing', this)">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>
+                    <span>波段池</span>
+                </div>
                 <div role="button" tabindex="0" class="nav-item" onclick="showPage('grid', this)">
                     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
                     <span>网格搜索</span>
@@ -542,6 +546,17 @@
                         <div class="card-title"><span class="dot" style="background:var(--cyan)"></span>绩效指标详情</div>
                     </div>
                     <div id="backtestDetail"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+
+            <!-- ============ 波段池页（dsh-invest 波段池：三年回测 + 当前池子） ============ -->
+            <div class="page" id="page-swing">
+                <div class="metric-grid" id="swingMetrics"></div>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="dot" style="background:var(--green)"></span>波段池策略三年回测（2023-10 ~ 2026-10）</div>
+                    </div>
+                    <div id="swingDetail"><div class="loading">加载中</div></div>
                 </div>
             </div>
 
@@ -654,6 +669,7 @@
             if (name === 'dashboard') loadDashboard();
             if (name === 'reports') loadReports();
             if (name === 'backtest') loadBacktest();
+            if (name === 'swing') loadSwing();
             if (name === 'grid') loadGrid();
             if (name === 'heatmap') { if (hmChart) hmChart.resize(); loadHeatmap(); }
             if (name === 'settings') loadSettings();
@@ -871,6 +887,90 @@
                 catch (e) { /* 落入兜底 */ }
             }
             return '<pre style="white-space:pre-wrap;font-family:inherit;">' + safe + '</pre>';
+        }
+
+        // ============ 波段池页（dsh-invest 波段池：三年回测 + 当前池子） ============
+        let _swingChart = null;
+
+        async function loadSwing() {
+            const cards = document.getElementById('swingMetrics');
+            const detail = document.getElementById('swingDetail');
+            cards.innerHTML = '';
+            detail.innerHTML = '<div class="loading">加载中</div>';
+            try {
+                const [btRes, poolRes] = await Promise.all([fetch('/api/swing_backtest'), fetch('/api/swing_pool')]);
+                const bt = btRes.ok ? await btRes.json() : null;
+                const pool = poolRes.ok ? await poolRes.json() : null;
+                renderSwing(bt, pool);
+            } catch (e) {
+                detail.innerHTML = '<div class="empty-state">后端未启动</div>';
+            }
+        }
+
+        function renderSwing(bt, pool) {
+            const cards = document.getElementById('swingMetrics');
+            const detail = document.getElementById('swingDetail');
+            const m = (bt && bt.metrics) || {};
+            if (bt) {
+                const grid = [
+                    { label: '三年总收益', value: fmt.sign(m.total_return), cls: fmt.color(m.total_return) },
+                    { label: '沪深300', value: fmt.sign(m.bench_return), cls: fmt.color(m.bench_return) },
+                    { label: '超额收益', value: fmt.sign(m.excess_return), cls: fmt.color(m.excess_return) },
+                    { label: '年化', value: fmt.pct(m.cagr), cls: fmt.color(m.cagr) },
+                    { label: '最大回撤', value: fmt.pct(m.max_drawdown), cls: 'negative' },
+                    { label: '夏普', value: m.sharpe ?? '-' },
+                    { label: '交易笔数', value: m.n_trades ?? '-' },
+                    { label: '胜率 / 盈亏比', value: (m.win_rate != null ? (m.win_rate * 100).toFixed(0) + '%' : '-') + ' / ' + (m.profit_factor ?? '-') },
+                ];
+                cards.innerHTML = grid.map(c => `
+                    <div class="metric-card">
+                        <div class="metric-label">${c.label}</div>
+                        <div class="metric-value ${c.cls || 'neutral'}">${c.value}</div>
+                    </div>`).join('');
+            }
+            const yearlyRows = bt ? Object.entries(bt.yearly || {}).map(([y, e]) => `
+                <tr><td>${y}</td><td class="${fmt.color(e.ret)}">${fmt.sign(e.ret)}</td>
+                <td>${e.trades}</td><td>${e.win_rate != null ? (e.win_rate * 100).toFixed(0) + '%' : '-'}</td></tr>`).join('') : '';
+            const params = (bt && bt.params) || {};
+            detail.innerHTML = `
+                <blockquote style="border-left:3px solid var(--amber);padding-left:12px;color:var(--amber);font-size:12px;margin:0 0 12px">
+                    ⚠️ ${bt ? (bt.disclaimers || []).join('；') : '暂无回测结果——先运行 python scripts/run_swing_backtest.py'}
+                </blockquote>
+                <div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);margin-bottom:10px">
+                    <span>窗口：${esc((params.window || []).join(' ~ '))}</span>
+                    <span>信号：${esc(params.signal || '-')}</span>
+                    <span>止损 -15% / 峰值回撤 8% / 63 日 / ${params.slots ?? 5} 槽位 / 双边成本 ${((params.cost_round_trip || 0) * 100).toFixed(1)}%</span>
+                    <span>生成：${esc(bt ? bt.generated_at : '-')}</span>
+                </div>
+                <div id="swingChart" style="width:100%;height:340px"></div>
+                <div class="table-wrap" style="margin:12px 0">
+                    <table><thead><tr><th>年份</th><th>策略收益</th><th>交易</th><th>胜率</th></tr></thead>
+                    <tbody>${yearlyRows || '<tr><td colspan="4">无数据</td></tr>'}</tbody></table>
+                </div>
+                <div style="margin:14px 0 4px;font-weight:600;border-bottom:1px solid var(--border);padding-bottom:6px">
+                    当前波段池（DSH 侧维护，${pool && pool.updated_at ? esc(new Date(pool.updated_at * 1000).toLocaleString('zh-CN')) : '未同步'}）
+                </div>
+                <div>${pool && pool.exists ? mdToHtml(pool.content) : '<div class="empty-state">池子文件未同步（scripts/_nas_swing_push.py）</div>'}</div>
+            `;
+            if (bt && bt.equity_curve && typeof echarts !== 'undefined') {
+                const chartDom = document.getElementById('swingChart');
+                if (!chartDom) return;
+                if (_swingChart) _swingChart.dispose();
+                _swingChart = echarts.init(chartDom);
+                const curve = bt.equity_curve;
+                _swingChart.setOption({
+                    backgroundColor: 'transparent',
+                    tooltip: { trigger: 'axis', backgroundColor: '#111827', borderColor: '#374151', textStyle: { color: '#e5e7eb', fontSize: 12 } },
+                    legend: { data: ['波段池策略', '沪深300'], textStyle: { color: '#9ca3af' } },
+                    grid: { left: 56, right: 20, top: 34, bottom: 30 },
+                    xAxis: { type: 'category', data: curve.map(p => p.date), axisLabel: { color: '#9ca3af' }, axisLine: { lineStyle: { color: '#4b5563' } } },
+                    yAxis: { type: 'value', scale: true, axisLabel: { color: '#9ca3af' }, splitLine: { lineStyle: { color: '#374151' } } },
+                    series: [
+                        { name: '波段池策略', type: 'line', showSymbol: false, data: curve.map(p => p.equity), lineStyle: { width: 2, color: '#ef4444' } },
+                        { name: '沪深300', type: 'line', showSymbol: false, data: curve.map(p => p.bench), lineStyle: { width: 1.5, color: '#60a5fa', type: 'dashed' } },
+                    ],
+                });
+            }
         }
 
         // ============ 回测页（修复C：权益曲线 ECharts + 当前配置口径） ============

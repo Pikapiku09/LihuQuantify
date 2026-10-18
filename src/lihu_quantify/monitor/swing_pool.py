@@ -68,9 +68,9 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
         '<html><body style="font-family:Microsoft YaHei,sans-serif">'
         f"<h2>波段池周报 {today}</h2>"
         "<p>本周例行：复核池内标的三重共振（行业景气/估值分位/周线趋势）。"
-        "纪律：持仓&lt;5 只（含观察）、每月最多 1 次调仓、止损=跌破 30 周线或 -12%~-15% "
-        "或买入逻辑破（严禁套用短线 -8%/10 日线）、任一批触发止损全部离场严禁补仓、"
-        "非必要可以空仓。</p>"
+        "纪律 v2（2026-10-18 修订）：持仓&lt;5 只（含观察）、每月最多 1 次调仓、"
+        "出场四条件任一触发即卖（-15% 硬止损 / 周收盘破 30 周线 / 自峰值回撤 20% / 126 交易日收割）、"
+        "严禁固定百分比移动止盈、任一批触发止损全部离场严禁补仓、非必要可以空仓。</p>"
         + table
         + '<h3>完整池子文件</h3><pre style="background:#f6f6f6;padding:12px;'
         'white-space:pre-wrap">'

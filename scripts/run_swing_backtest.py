@@ -43,8 +43,8 @@ MA_W = 30
 SLOPE_MIN = -0.002          # 走平或向上（4 周斜率）
 SLOPE_MIN_STRICT = 0.0
 STOP_LOSS = 0.85            # -15%
-TRAIL = 0.92                # 峰值回撤 8%
-MAX_HOLD = 63               # 交易日 ≈ 3 个月
+TRAIL = 0.80                # 峰值回撤 20% 灾难线（v2：删除 8% 噪声区止盈，2026-10-18 修订）
+MAX_HOLD = 126              # 交易日 ≈ 6 个月收获期（v2：原 63 日砍右尾，盈亏比 5→10）
 SLOTS = 5
 COST_SIDE = 0.001           # 单边 0.1%
 
@@ -121,7 +121,8 @@ def build_weeks(rows: list) -> list:
     return out
 
 
-def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, ma20_exit: bool = False) -> dict:
+def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, ma20_exit: bool = False,
+             time_stop: int = MAX_HOLD, be_trigger: float | None = None) -> dict:
     # 主日历（所有代码并集）
     master = sorted({r["d"] for s in series.values() for r in s["rows"] if r.get("close") is not None})
     master = [d for d in master if WIN_START.isoformat().replace("-", "") <= d <= WIN_END.isoformat().replace("-", "")]
@@ -195,8 +196,10 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
                 p["peak"] = max(p["peak"], w["adj_close"])
             if adj_t / p["entry_adj"] <= STOP_LOSS:
                 pending.append((code, "exit", "硬止损-15%"))
-            elif p["days"] >= MAX_HOLD:
-                pending.append((code, "exit", "时间止损63日"))
+            elif be_trigger and adj_t / p["entry_adj"] >= be_trigger and adj_t / p["entry_adj"] <= 1.0:
+                pending.append((code, "exit", "保本止损"))
+            elif p["days"] >= time_stop:
+                pending.append((code, "exit", f"时间止损{time_stop}日"))
             elif w:
                 if w["adj_close"] < w["ma30"]:
                     pending.append((code, "exit", "破30周线"))
@@ -263,6 +266,9 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
     wins = [t0["ret"] for t0 in trades if t0["ret"] > 0]
     losses = [t0["ret"] for t0 in trades if t0["ret"] <= 0]
     pf = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else None
+    avg_win = sum(wins) / len(wins) if wins else None
+    avg_loss = sum(losses) / len(losses) if losses else None
+    win_loss_ratio = (avg_win / abs(avg_loss)) if (avg_win and avg_loss) else None
     yearly = {}
     for t0 in trades:
         y = t0["exit_date"][:4]
@@ -292,6 +298,9 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
             "total_return": round(total, 4), "cagr": round(cagr, 4), "max_drawdown": round(max_dd, 4),
             "sharpe": round(sharpe, 2), "win_rate": round(len(wins) / len(trades), 4) if trades else None,
             "profit_factor": round(pf, 2) if pf else None, "n_trades": len(trades),
+            "avg_win": round(avg_win, 4) if avg_win else None,
+            "avg_loss": round(avg_loss, 4) if avg_loss else None,
+            "win_loss_ratio": round(win_loss_ratio, 2) if win_loss_ratio else None,
             "avg_hold_days": round(sum(t0["hold_days"] for t0 in trades) / len(trades), 1) if trades else None,
             "avg_trade_ret": round(sum(t0["ret"] for t0 in trades) / len(trades), 4) if trades else None,
         },
@@ -310,8 +319,10 @@ def main() -> None:
     res_strict = simulate(gold, series, SLOPE_MIN_STRICT)
     res_trail12 = simulate(gold, series, SLOPE_MIN, trail=0.88)
     res_notrail = simulate(gold, series, SLOPE_MIN, trail=0.0)
-    # 完全忠实纪律原文：移动止盈（回撤8% 或 跌破20周线）
-    res_live = simulate(gold, series, SLOPE_MIN, trail=0.92, ma20_exit=True)
+    # v1 规则（修订前纪律原文）：移动止盈=回撤8% 或 破20周线 + 63 日时间帽
+    res_live = simulate(gold, series, SLOPE_MIN, trail=0.92, ma20_exit=True, time_stop=63)
+    # 时间帽 189 日反例（证明收获期必要）
+    res_t189 = simulate(gold, series, SLOPE_MIN, trail=0.80, time_stop=189)
 
     # 基准：沪深300
     cfg = get_settings()
@@ -353,9 +364,13 @@ def main() -> None:
                 "label": "取消移动止盈（仅止损+时间出场）",
                 "metrics": res_notrail["metrics"], "funnel": res_notrail["funnel"], "yearly": res_notrail["yearly"],
             },
-            "live_fidelity": {
-                "label": "纪律原文口径（移动止盈=回撤8% 或 跌破20周线）",
+            "v1_rules": {
+                "label": "v1 修订前（回撤8%或破20周线 + 63日时间帽）",
                 "metrics": res_live["metrics"], "funnel": res_live["funnel"], "yearly": res_live["yearly"],
+            },
+            "time_189": {
+                "label": "时间帽放宽到 189 日（反例：收获期不可过长）",
+                "metrics": res_t189["metrics"], "funnel": res_t189["funnel"], "yearly": res_t189["yearly"],
             },
         },
         "disclaimers": [
@@ -371,7 +386,8 @@ def main() -> None:
 
     m = out["metrics"]
     lines = [f"# 波段池策略三年回测报告（{WIN_START} ~ {WIN_END}）", "",
-             f"> 生成：{out['generated_at']} ｜ 机械口径：当月金股 + 估值分位≤30% + 周线趋势 ｜ 参数：止损-15%/破30周线/峰值回撤8%/63日/5槽位/双边成本0.2%", "",
+             f"> 生成：{out['generated_at']} ｜ 机械口径：当月金股 + 估值分位≤30% + 周线趋势 ｜ **v2 出场（2026-10-18 修订）**：-15% 硬止损 / 破 30 周线 / 峰值 20% 灾难线 / 126 交易日收获期 ｜ 5 槽位 / 双边成本 0.2%", "",
+             "> ⚠️ 参数敏感性提示：时间帽在 90-140 日带内收益量级摆动 +21%~+785%（路径运气主导），**绝对收益数字不可外推**；可外推的结论是期望方向（v1 负→v2 正）、PF≈2-5 区间与 2026 年不崩。2027 年样本外验证中。", "",
              "## 核心指标", "",
              "| 指标 | 策略 | 沪深300 |", "|---|---|---|",
              f"| 总收益 | {m['total_return']*100:.1f}% | {(m.get('bench_return') or 0)*100:.1f}% |",
@@ -391,7 +407,7 @@ def main() -> None:
         lines.append(f"- {k}：{v} 笔")
     lines += ["", "## 敏感性（诊断用，不构成参数优选）", "",
               "| 变体 | 总收益 | 年化 | 最大回撤 | 交易 | 胜率 | PF |", "|---|---|---|---|---|---|---|"]
-    for key in ("live_fidelity", "strict_trend", "trail_12pct", "no_trail"):
+    for key in ("v1_rules", "strict_trend", "trail_12pct", "no_trail", "time_189"):
         ms = out["sensitivity"][key]["metrics"]
         lines.append(f"| {out['sensitivity'][key]['label']} | {ms['total_return']*100:.1f}% | {ms['cagr']*100:.1f}% | "
                      f"{ms['max_drawdown']*100:.1f}% | {ms['n_trades']} | {(ms.get('win_rate') or 0)*100:.1f}% | {ms.get('profit_factor')} |")

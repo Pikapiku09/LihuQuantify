@@ -35,8 +35,10 @@ def items():
     reports = sorted(
         (WORKSPACE / "invest-outputs").glob("*波段池*/报告.md"),
         key=lambda p: p.parent.name, reverse=True)
-    if reports:
-        out.append((reports[0], REMOTE_DIR, "波段池_最近报告.md"))
+    # 优先推策略报告/建池报告（审计报告仅作历史记录，不覆盖"最近报告"）
+    preferred = [r for r in reports if "审计" not in r.parent.name] or reports
+    if preferred:
+        out.append((preferred[0], REMOTE_DIR, "波段池_最近报告.md"))
     # 回测结果 → 看板数据源（outputs/ 卷）
     bt = LIHU / "outputs" / "swing_backtest.json"
     if bt.exists():

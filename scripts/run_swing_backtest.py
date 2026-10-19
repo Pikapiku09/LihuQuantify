@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -36,6 +37,8 @@ from lihu_quantify.data.tushare_client import TushareClient
 BT = ROOT / "data" / "swing_bt"
 OUT_JSON = ROOT / "outputs" / "swing_backtest.json"
 OUT_MD = ROOT / "outputs" / "reports"
+BENCH_CACHE = BT / "bench_000300.json"
+SIMS_CACHE = ROOT / "outputs" / "_swing_sims_cache.pkl"
 
 WIN_START, WIN_END = date(2023, 10, 2), date(2026, 10, 16)
 VAL_PCT_MAX = 0.30
@@ -158,13 +161,15 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
 
     for t in master:
         # 1) 执行次日指令
+        carry = []   # 审计修复(2026-10-19)：停牌无法成交的指令顺延到下一交易日，原实现静默丢弃
         for code, kind, reason in pending:
             adj_t = fadj(code, t)
             if adj_t is None:
+                carry.append((code, kind, reason))
                 continue
             if kind == "exit" and code in pos:
                 p = pos[code]
-                v = p["value"] * (adj_t / p["entry_adj"])
+                v = p["value_costed"] * (adj_t / p["entry_adj"])   # 审计修复：单次盯市（原实现重复乘比例→收益被平方）
                 proceeds = v * (1 - COST_SIDE)
                 cash += proceeds
                 ret = proceeds / (p["value_costed"]) - 1
@@ -182,7 +187,7 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
                     pos[code] = {"value": used, "value_costed": used, "entry_adj": adj_t,
                                  "entry_close": per[code]["byd"][t]["close"], "entry_date": t,
                                  "peak": adj_t, "days": 0}
-        pending = []
+        pending = carry
         # 2) 日内持仓推进与出场判断
         for code in list(pos):
             p = pos[code]
@@ -237,14 +242,17 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
         eq = cash + sum(p["value"] for p in pos.values())
         equity_daily.append((t, eq))
 
-    # 清仓收尾（按最后价格）
+    # 清仓收尾（按最后价格；停牌则用最后一个可用收盘价）
     for code, p in list(pos.items()):
         adj_t = fadj(code, master[-1]) or p["entry_adj"]
-        v = p["value"] * (adj_t / p["entry_adj"])
+        v = p["value_costed"] * (adj_t / p["entry_adj"])   # 审计修复：单次盯市
         cash += v * (1 - COST_SIDE)
+        last_close = next((per[code]["byd"][d]["close"] for d in sorted(per[code]["byd"], reverse=True)
+                           if d <= master[-1]), None)
         trades.append({"code": code, "name": per[code]["name"], "entry_date": p["entry_date"],
                        "exit_date": master[-1], "entry_close": round(p["entry_close"], 2),
-                       "exit_close": 0, "ret": round(v * (1 - COST_SIDE) / p["value_costed"] - 1, 4),
+                       "exit_close": round(last_close, 2) if last_close else 0,
+                       "ret": round(v * (1 - COST_SIDE) / p["value_costed"] - 1, 4),
                        "hold_days": p["days"], "reason": "期末清仓"})
         del pos[code]
     equity_daily.append((master[-1], cash))
@@ -290,10 +298,32 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
     reasons = {}
     for t0 in trades:
         reasons[t0["reason"]] = reasons.get(t0["reason"], 0) + 1
-    logger.info(f"漏斗: {funnel} 出场分布: {reasons}")
+    # 集中度审计（2026-10-19 审计新增）：剔除 TOPn 盈利单后的近似累计收益
+    ts_sorted = sorted(trades, key=lambda x: x["ret"], reverse=True)
+
+    def _eq_without(k: int):
+        if len(ts_sorted) <= k:
+            return None
+        drop = {id(x) for x in ts_sorted[:k]}
+        eq2 = 1.0
+        for t0 in trades:
+            if id(t0) in drop:
+                continue
+            eq2 *= (1 + 0.2 * t0["ret"])
+        return round(eq2 - 1, 4)
+
+    concentration = {
+        "note": "按单槽 20% 权重对交易序列复利近似（与组合路径有小误差）",
+        "ex_top1": _eq_without(1), "ex_top3": _eq_without(3), "ex_top5": _eq_without(5),
+        "top1": ({"code": ts_sorted[0]["code"], "name": ts_sorted[0]["name"], "ret": ts_sorted[0]["ret"]}
+                 if ts_sorted else None),
+        "top3": [{"code": t0["code"], "name": t0["name"], "ret": t0["ret"]} for t0 in ts_sorted[:3]],
+    }
+    logger.info(f"漏斗: {funnel} 出场分布: {reasons} 集中度: ex_top1={concentration['ex_top1']}")
     return {
         "funnel": funnel,
         "exit_reasons": reasons,
+        "concentration": concentration,
         "metrics": {
             "total_return": round(total, 4), "cagr": round(cagr, 4), "max_drawdown": round(max_dd, 4),
             "sharpe": round(sharpe, 2), "win_rate": round(len(wins) / len(trades), 4) if trades else None,
@@ -310,29 +340,91 @@ def simulate(gold: dict, series: dict, slope_min: float, trail: float = TRAIL, m
     }
 
 
+def _load_sims_cache():
+    """sim 结果缓存（引擎文件更新后自动失效，避免重复 12 分钟计算）。"""
+    import pickle
+    try:
+        if SIMS_CACHE.exists() and SIMS_CACHE.stat().st_mtime > Path(__file__).stat().st_mtime:
+            with SIMS_CACHE.open("rb") as f:
+                return pickle.load(f)
+    except Exception as e:
+        logger.warning(f"sim 缓存读取失败（忽略）: {e}")
+    return None
+
+
+def _save_sims_cache(payload) -> None:
+    import pickle
+    try:
+        SIMS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with SIMS_CACHE.open("wb") as f:
+            pickle.dump(payload, f)
+        logger.info(f"sim 结果缓存已写入: {SIMS_CACHE}")
+    except Exception as e:
+        logger.warning(f"sim 缓存写入失败（忽略）: {e}")
+
+
+def _fetch_benchmark() -> dict:
+    """沪深300 基准（文件缓存 + 重试 + 失败降级，绝不因网络问题丢弃回测结果）。"""
+    if BENCH_CACHE.exists():
+        try:
+            d = json.loads(BENCH_CACHE.read_text(encoding="utf-8"))
+            if d.get("data"):
+                logger.info(f"基准读缓存：{BENCH_CACHE.name}（{d.get('fetched_at')}）")
+                return d["data"]
+        except Exception:
+            pass
+    try:
+        cfg = get_settings()
+        raw = Path(cfg.tushare.token_file).read_text(encoding="utf-8").strip()
+        import re
+        token = cfg.tushare.token or (re.search(r"token=([A-Za-z0-9]+)", raw).group(1) if raw.startswith("{") else raw)
+        c = TushareClient(token=token, cache_dir=ROOT / "data" / "cache", cache_mtime_ttl=0)
+        idx = None
+        for attempt in range(3):
+            try:
+                idx = c.query("index_daily", {"ts_code": "000300.SH", "start_date": "20230901", "end_date": "20261016"})
+                break
+            except Exception as e:
+                logger.warning(f"基准取数失败（第 {attempt + 1} 次）: {e}")
+                idx = None
+                time.sleep(2 * (attempt + 1))
+        bench = {}
+        if idx is not None and not idx.empty:
+            for _, r in idx.iterrows():
+                bench[str(r["trade_date"])] = float(r["close"])
+            BENCH_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            BENCH_CACHE.write_text(json.dumps({"fetched_at": date.today().isoformat(), "data": bench},
+                                              ensure_ascii=False), encoding="utf-8")
+            logger.info(f"基准已缓存：{len(bench)} 个交易日 → {BENCH_CACHE.name}")
+        return bench
+    except Exception as e:
+        logger.warning(f"基准不可得，跳过基准对比（不影响策略指标）: {e}")
+        return {}
+
+
 def main() -> None:
     strict = "--strict-slope" in sys.argv
-    gold, series = load_code_series()
-    logger.info(f"候选数据 {len(series)} 只，金股月份数 {len(gold)}")
-    res = simulate(gold, series, SLOPE_MIN)
-    # 敏感性：严格趋势口径 + 出场参数变体（诊断用，不构成参数优选）
-    res_strict = simulate(gold, series, SLOPE_MIN_STRICT)
-    res_trail12 = simulate(gold, series, SLOPE_MIN, trail=0.88)
-    res_notrail = simulate(gold, series, SLOPE_MIN, trail=0.0)
-    # v1 规则（修订前纪律原文）：移动止盈=回撤8% 或 破20周线 + 63 日时间帽
-    res_live = simulate(gold, series, SLOPE_MIN, trail=0.92, ma20_exit=True, time_stop=63)
-    # 时间帽 189 日反例（证明收获期必要）
-    res_t189 = simulate(gold, series, SLOPE_MIN, trail=0.80, time_stop=189)
+    cached = _load_sims_cache()
+    if cached is not None:
+        universe, res, res_strict, res_trail12, res_notrail, res_live, res_t189 = cached
+        logger.info(f"复用 sim 结果缓存：{universe}")
+    else:
+        gold, series = load_code_series()
+        universe = {"n_codes": len(series), "n_gold_months": len(gold)}
+        logger.info(f"候选数据 {len(series)} 只，金股月份数 {len(gold)}")
+        res = simulate(gold, series, SLOPE_MIN)
+        # 敏感性：严格趋势口径 + 出场参数变体（诊断用，不构成参数优选）
+        res_strict = simulate(gold, series, SLOPE_MIN_STRICT)
+        res_trail12 = simulate(gold, series, SLOPE_MIN, trail=0.88)
+        res_notrail = simulate(gold, series, SLOPE_MIN, trail=0.0)
+        # v1 规则（修订前纪律原文）：移动止盈=回撤8% 或 破20周线 + 63 日时间帽
+        res_live = simulate(gold, series, SLOPE_MIN, trail=0.92, ma20_exit=True, time_stop=63)
+        # 时间帽 189 日反例（证明收获期必要）
+        res_t189 = simulate(gold, series, SLOPE_MIN, trail=0.80, time_stop=189)
+        _save_sims_cache((universe, res, res_strict, res_trail12, res_notrail, res_live, res_t189))
 
-    # 基准：沪深300
-    cfg = get_settings()
-    token = cfg.tushare.token or (lambda p: (lambda raw: (lambda m: m.group(1) if m else (_ for _ in ()).throw(ValueError("token")))(__import__("re").search(r"token=([A-Za-z0-9]+)", raw)) if raw.startswith("{") else raw)(Path(p).read_text(encoding="utf-8").strip()))(cfg.tushare.token_file)
-    c = TushareClient(token=token, cache_dir=ROOT / "data" / "cache", cache_mtime_ttl=0)
-    idx = c.query("index_daily", {"ts_code": "000300.SH", "start_date": "20230901", "end_date": "20261016"})
-    bench = {}
-    if idx is not None and not idx.empty:
-        for _, r in idx.iterrows():
-            bench[str(r["trade_date"])] = float(r["close"])
+    # 基准：沪深300（可降级）
+    bench = _fetch_benchmark()
     b0 = next((bench[d] for d in sorted(bench) if d >= "20231002"), None)
     for pt in res["equity_curve"]:
         bd = next((bench[d] for d in sorted(bench) if d <= pt["date"]), None)
@@ -349,7 +441,7 @@ def main() -> None:
             "max_hold_days": MAX_HOLD, "slots": SLOTS, "cost_round_trip": COST_SIDE * 2,
             "signal": "①当月金股 ②估值分位≤30% ③收盘>30周线且20周线斜率≥阈值（周五收盘确认，次日收盘买入）",
         },
-        "universe": {"n_codes": len(series), "n_gold_months": len(gold)},
+        "universe": universe,
         **res,
         "sensitivity": {
             "strict_trend": {
@@ -386,11 +478,12 @@ def main() -> None:
 
     m = out["metrics"]
     lines = [f"# 波段池策略三年回测报告（{WIN_START} ~ {WIN_END}）", "",
-             f"> 生成：{out['generated_at']} ｜ 机械口径：当月金股 + 估值分位≤30% + 周线趋势 ｜ **v2 出场（2026-10-18 修订）**：-15% 硬止损 / 破 30 周线 / 峰值 20% 灾难线 / 126 交易日收获期 ｜ 5 槽位 / 双边成本 0.2%", "",
-             "> ⚠️ 参数敏感性提示：时间帽在 90-140 日带内收益量级摆动 +21%~+785%（路径运气主导），**绝对收益数字不可外推**；可外推的结论是期望方向（v1 负→v2 正）、PF≈2-5 区间与 2026 年不崩。2027 年样本外验证中。", "",
+             f"> 生成：{out['generated_at']} ｜ 机械口径：当月金股 + 估值分位≤30% + 周线趋势 ｜ **v2 出场（2026-10-18 修订）**：-15% 硬止损 / 破 30 周线 / 峰值 20% 灾难线 / 126 交易日收获期 ｜ 5 槽位 / 双边成本 0.2%",
+             "> 引擎版本：2026-10-19 审计修复（此前出场执行重复乘复权比例导致单笔收益被平方，历史数字作废）", "",
+             "> ⚠️ 参数敏感性提示：时间帽与回撤线在邻域内收益量级摆动明显（路径运气主导），**绝对收益数字不可外推**；可外推的只有期望方向、PF 区间、2026 年表现与集中度（见下节）。2027 年样本外验证中。", "",
              "## 核心指标", "",
              "| 指标 | 策略 | 沪深300 |", "|---|---|---|",
-             f"| 总收益 | {m['total_return']*100:.1f}% | {(m.get('bench_return') or 0)*100:.1f}% |",
+             f"| 总收益 | {m['total_return']*100:.1f}% | " + (f"{m['bench_return']*100:.1f}%" if m.get('bench_return') is not None else "—（基准不可得）") + " |",
              f"| 年化 | {m['cagr']*100:.1f}% | — |",
              f"| 最大回撤 | {m['max_drawdown']*100:.1f}% | — |",
              f"| 夏普 | {m['sharpe']} | — |",
@@ -398,10 +491,17 @@ def main() -> None:
              f"| 胜率 | {(m.get('win_rate') or 0)*100:.1f}% | — |",
              f"| 盈亏比(PF) | {m.get('profit_factor')} | — |",
              f"| 平均持有 | {m.get('avg_hold_days')} 日 | — |",
-             f"| 超额 | {(m.get('excess_return') or 0)*100:.1f}% | — |", "",
+             "| 超额 | " + (f"{m['excess_return']*100:.1f}%" if m.get('excess_return') is not None else "—") + " | — |", "",
              "## 分年", "", "| 年份 | 收益 | 交易 | 胜率 |", "|---|---|---|---|"]
     for y, e0 in out["yearly"].items():
         lines.append(f"| {y} | {e0['ret']*100:.1f}% | {e0['trades']} | {(e0.get('win_rate') or 0)*100:.0f}% |")
+    c = out.get("concentration") or {}
+    lines += ["", "## 集中度审计（剔除最大盈利单后的收益）", "",
+              f"- 全样本总收益：{m['total_return']*100:.1f}% ｜ 剔除 TOP1：{(c.get('ex_top1') or 0)*100:.1f}% ｜ "
+              f"剔除 TOP3：{(c.get('ex_top3') or 0)*100:.1f}% ｜ 剔除 TOP5：{(c.get('ex_top5') or 0)*100:.1f}%",
+              f"- TOP1 交易：{(c.get('top1') or {}).get('name', '-')}（{(c.get('top1') or {}).get('code', '-')}）"
+              f"收益 {(c.get('top1') or {}).get('ret', 0)*100:.1f}%",
+              "- **判读**：若剔除 TOP1 后为负，则该策略的正收益依赖单笔极端盈利，不能视为稳定 edge。", ""]
     lines += ["", "## 出场原因分布（主口径）", ""]
     for k, v in (out.get("exit_reasons") or {}).items():
         lines.append(f"- {k}：{v} 笔")

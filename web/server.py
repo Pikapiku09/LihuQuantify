@@ -436,10 +436,28 @@ async def state():
 
 @app.get("/api/swing_backtest")
 async def swing_backtest():
-    """波段池策略三年回测结果（outputs/swing_backtest.json，run_swing_backtest.py 生成）。"""
+    """波段池策略回测结果（outputs/swing_backtest.json）+ 同窗口随机对照摘要（swing_montecarlo*.json）。"""
     d = _read_json(ROOT / "outputs" / "swing_backtest.json")
     if not d:
         raise HTTPException(status_code=404, detail="no swing backtest result; run run_swing_backtest.py first")
+    win = list((d.get("params") or {}).get("window") or [])
+    for name in ("swing_montecarlo_2021.json", "swing_montecarlo.json"):
+        mc = _read_json(ROOT / "outputs" / name)
+        if not mc or not mc.get("controls"):
+            continue
+        if list(mc.get("window") or []) == win:
+            d["robustness"] = {
+                "window": mc.get("window"),
+                "val_window_days": mc.get("val_window_days"),
+                "baseline": (mc.get("baseline") or {}).get("metrics", {}).get("total_return"),
+                "controls": {k: {"mean": v.get("mean"), "baseline_percentile": v.get("baseline_percentile"),
+                                 "q5": (v.get("q") or {}).get("p5"), "q95": (v.get("q") or {}).get("p95")}
+                             for k, v in mc["controls"].items()},
+                "gold_beta": (mc.get("gold_universe_beta") or {}).get("total_return"),
+                "month_cap": {k: (v.get("metrics") or {}).get("total_return")
+                              for k, v in (mc.get("month_cap") or {}).items()},
+            }
+            break
     return d
 
 

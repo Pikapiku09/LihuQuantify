@@ -554,7 +554,7 @@
                 <div class="metric-grid" id="swingMetrics"></div>
                 <div class="card">
                     <div class="card-header">
-                        <div class="card-title"><span class="dot" style="background:var(--green)"></span>波段池策略三年回测（2023-10 ~ 2026-10）</div>
+                        <div class="card-title"><span class="dot" style="background:var(--green)"></span>波段池策略回测（2021-01 ~ 2026-10，含随机对照）</div>
                     </div>
                     <div id="swingDetail"><div class="loading">加载中</div></div>
                 </div>
@@ -913,7 +913,7 @@
             const m = (bt && bt.metrics) || {};
             if (bt) {
                 const grid = [
-                    { label: '三年总收益', value: fmt.sign(m.total_return), cls: fmt.color(m.total_return) },
+                    { label: '总收益', value: fmt.sign(m.total_return), cls: fmt.color(m.total_return) },
                     { label: '沪深300', value: fmt.sign(m.bench_return), cls: fmt.color(m.bench_return) },
                     { label: '超额收益', value: fmt.sign(m.excess_return), cls: fmt.color(m.excess_return) },
                     { label: '年化', value: fmt.pct(m.cagr), cls: fmt.color(m.cagr) },
@@ -939,7 +939,7 @@
                 <div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);margin-bottom:10px">
                     <span>窗口：${esc((params.window || []).join(' ~ '))}</span>
                     <span>信号：${esc(params.signal || '-')}</span>
-                    <span>止损 -15% / 峰值回撤 8% / 63 日 / ${params.slots ?? 5} 槽位 / 双边成本 ${((params.cost_round_trip || 0) * 100).toFixed(1)}%</span>
+                    <span>出场 v2：-15% 止损 / 破 30 周线 / 峰值回撤 20% / 126 日 ｜ ${params.slots ?? 5} 槽位 / 双边成本 ${((params.cost_round_trip || 0) * 100).toFixed(1)}%</span>
                     <span>生成：${esc(bt ? bt.generated_at : '-')}</span>
                 </div>
                 <div id="swingChart" style="width:100%;height:340px"></div>

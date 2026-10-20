@@ -39,12 +39,25 @@ def items():
     preferred = [r for r in reports if "审计" not in r.parent.name] or reports
     if preferred:
         out.append((preferred[0], REMOTE_DIR, "波段池_最近报告.md"))
+    # 固定推送策略报告（含 §10-11 回测结论），不随"最近报告"变化
+    strategy = WORKSPACE / "invest-outputs" / "20261017_波段池策略报告" / "报告.md"
+    if strategy.exists():
+        out.append((strategy, REMOTE_DIR, "波段池_策略报告.md"))
+    # 归因/稳健性报告（2026-10-20）→ 固定名，供人工查阅
+    attr = WORKSPACE / "invest-outputs" / "20261020_波段池收益归因与样本外检验" / "报告.md"
+    if attr.exists():
+        out.append((attr, REMOTE_DIR, "波段池_归因与样本外检验.md"))
     # 回测结果 → 看板数据源（outputs/ 卷）
     bt = LIHU / "outputs" / "swing_backtest.json"
     if bt.exists():
         out.append((bt, REMOTE_OUT, "swing_backtest.json"))
+    # 3 年对照 + 随机对照结果（供看板/研究侧引用）
+    for name in ("swing_backtest_3y.json", "swing_montecarlo.json", "swing_montecarlo_2021.json"):
+        f = LIHU / "outputs" / name
+        if f.exists():
+            out.append((f, REMOTE_OUT, name))
     rp = LIHU / "outputs" / "reports"
-    bt_reports = sorted(rp.glob("*波段池回测报告.md")) if rp.exists() else []
+    bt_reports = sorted(rp.glob("*波段池回测报告*.md"), key=lambda p: p.stat().st_mtime) if rp.exists() else []
     if bt_reports:
         out.append((bt_reports[-1], REMOTE_OUT + "/reports", bt_reports[-1].name))
     return out

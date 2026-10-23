@@ -309,6 +309,31 @@ def _render_risk(d: dict) -> str:
         f"（{filter_note}；扫描信号 {d.get('signals', 0)} 个）</p>"
     )
 
+    # 市场闸门条件统计（2026-10-23 前向验证：闸门开/关分组的条件期望）
+    gate = d.get("market_gate") or {}
+    if gate:
+        gate_txt = "开（上涨段，允许开仓）" if gate.get("gate_open") else "关（非上涨段，停止开新仓）"
+        parts.append(
+            f"<p style='margin:10px 0 4px;font-weight:600;font-size:13px;'>"
+            f"🚧 市场闸门：<b>{gate_txt}</b>"
+            f"<span style='color:#6b7280;font-weight:400;'>（模式 {gate.get('mode', '-')}，"
+            "满 20 笔或 1 个月复盘：两组条件期望无差异则回退）</span></p>"
+        )
+        rows = []
+        for k, label in (("on", "上涨段（闸门开）"), ("off", "非上涨段（闸门关）")):
+            g = gate.get(k)
+            if not g:
+                rows.append([_td(label), _td("0", num=True), _td("-"), _td("-"), _td("-")])
+                continue
+            rows.append([
+                _td(label),
+                _td(f"{g.get('n', 0)}", num=True),
+                _td(f"{(g.get('win_rate') or 0) * 100:.0f}%", num=True),
+                _td(f"{g.get('avg_pnl', 0):+.2f}", num=True),
+                _td(f"{g.get('total_pnl', 0):+.2f}", num=True),
+            ])
+        parts.append(_table(["分组（按入场日）", "笔数", "胜率", "单笔均值", "合计盈亏"], rows))
+
     # 待执行止损（收盘登记、次日开盘执行）
     pending = d.get("pending_stops") or []
     if pending:

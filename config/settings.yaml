@@ -51,10 +51,11 @@ strategy:
   close_to_ma5_max_dev: 0.05
   chasing_high_threshold: 0.08
   market_filter: true                    # 市场状态参考信号（000001.SH 20日涨幅）
-  market_filter_mode: "reduce"            # reduce=非上涨段仓位减半（默认，修复G保守化）
-                                         # 证据等级：中等偏弱——holdout ON-3%-20d 仅 16 笔样本（+7.2% vs OFF -7.5%），
-                                         # 变体脆弱（2%阈值≈无效 +0.5%、60日窗为负 -8.1%）
-                                         # 积累 ≥100 笔纸面交易后再评估是否升级 block（见 docs/决策日志.md）
+  market_filter_mode: "block"             # block=非上涨段停止开新仓（2026-10-23 用户决定：动量趋势只在上涨段出手）
+                                         # 原 reduce（仓位减半）保留为回退档；历史证据：holdout ON-3%-20d +7.2% vs OFF -7.5%，
+                                         # 但样本小/变体脆弱（2%阈值≈无效、60日窗为负 -8.1%）→ 不调参、不加条件
+                                         # 前向验证门槛（预注册）：满 ≥20 笔或 1 个月复盘日报「市场闸门」两组条件期望，
+                                         # 无差异则回退 reduce（见 docs/决策日志.md 2026-10-23）
                                          # block=非上涨段禁止开仓（旧模式，已判脆弱弃用）
 
 # 风控参数（铁律，不可放松）

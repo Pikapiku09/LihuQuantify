@@ -506,7 +506,55 @@ class DailyScanner:
         idx_df["trade_date"] = pd.to_datetime(idx_df["trade_date"], format="%Y%m%d").dt.date
         idx_df = idx_df.sort_values("trade_date").reset_index(drop=True)
         states = classify_market_state(idx_df)
+        self._market_states_map = states   # 供市场闸门条件统计复用（2026-10-23 前向验证）
         return latest, states.get(latest, "未知")
+
+    def _market_gate_stats(self, today_state: str, s) -> dict:
+        """市场闸门条件统计（2026-10-23，前向验证）：历史成交流水按**入场日**市场状态分组。
+
+        动量趋势策略只在上涨段出手（market_filter_mode=block）；此统计回答
+        "闸门开/关两组的条件期望是否有差异"——满 ≥20 笔或 1 个月后复盘，
+        无差异则回退闸门。只读展示，不影响任何信号/成交。
+        """
+        out = {
+            "state": today_state,
+            "mode": s.market_filter_mode if getattr(s, "market_filter", False) else "off",
+            "gate_open": (today_state == "上涨") or not getattr(s, "market_filter", False),
+            "on": None, "off": None,
+        }
+        try:
+            from .daily_report import realized_pnl_for_sell
+            states = getattr(self, "_market_states_map", {}) or {}
+            trades = getattr(self.broker, "trades", []) or []
+            groups: dict = {"on": [], "off": []}
+            for t in trades:
+                if t.get("side") != "sell":
+                    continue
+                sell_day = str(t.get("date", ""))[:10]
+                code = t.get("ts_code")
+                prior = [b for b in trades
+                         if b.get("ts_code") == code and b.get("side") == "buy"
+                         and str(b.get("date", ""))[:10] <= sell_day]
+                entry_day = str(prior[-1].get("date", ""))[:10] if prior else sell_day
+                try:
+                    key = date.fromisoformat(entry_day)
+                except ValueError:
+                    key = entry_day
+                st = states.get(key, "未知")
+                groups["on" if st == "上涨" else "off"].append(
+                    realized_pnl_for_sell(trades, t))
+            for k, vals in groups.items():
+                if vals:
+                    wins = sum(1 for v in vals if v > 0)
+                    out[k] = {
+                        "n": len(vals),
+                        "win_rate": round(wins / len(vals), 3),
+                        "avg_pnl": round(sum(vals) / len(vals), 2),
+                        "total_pnl": round(sum(vals), 2),
+                    }
+        except Exception as e:   # 统计失败绝不影响巡检
+            logger.warning(f"[市场闸门] 条件统计失败（忽略，不影响巡检）：{e}")
+        return out
 
     # ===== 巡检主流程 =====
 
@@ -887,6 +935,8 @@ class DailyScanner:
             mode=self.mode,
             alerts=self.alerter.history[hist_start:],
         )
+        # ---- 市场闸门条件统计（2026-10-23 前向验证，纯展示） ----
+        summary["market_gate"] = self._market_gate_stats(market_state, s)
         # ---- 需求3（第八轮）：资金利用效率数据（.md 报告与邮件日报共用） ----
         summary["capital"] = {
             # 今日止损执行回笼金额（毛额，今日开盘价 × 股数）

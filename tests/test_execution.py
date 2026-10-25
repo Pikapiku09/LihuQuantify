@@ -320,10 +320,13 @@ def test_paper_halt_persisted(tmp_path):
         pb1.on_new_day(date(2026, 8, 10 + i * 7))
         pb1.set_price(code, 95.0)
         pb1.sell(code, 95.0, 100)
-    assert pb1.is_halted(code)
+    # 修复时间炸弹（2026-10-25）：is_halted 不传 today 会用真实系统日期，
+    # 停手窗口（2026-08-24 + 30 天）过后必假失败——与邻近用例一致显式固定 today
+    assert pb1.is_halted(code, today=date(2026, 9, 1))
     # 重启
     pb2 = PaperBroker(state_file=str(state_file))
-    assert pb2.is_halted(code), "停手状态应跨重启保留"
+    assert pb2.is_halted(code, today=date(2026, 9, 1)), "停手状态应跨重启保留"
+    assert not pb2.is_halted(code, today=date(2026, 10, 1)), "停手期满应解除（持久化的是截止日，不是永久标记）"
 
 
 def test_paper_fee_adjusted_loss_counts():

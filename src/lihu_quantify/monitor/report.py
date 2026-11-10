@@ -248,7 +248,11 @@ class ReportGenerator:
             filter_note = "上涨段，允许正常开仓"
         lines.append("## 五、市场与风险提示")
         lines.append("")
-        lines.append(f"- 市场状态：**{market_state}**（{filter_note}；扫描信号 {rich.get('signals', 0)} 个）")
+        # P0-A（2026-11-10）：如实标注被丢弃的历史信号，避免「199 个信号却不买入」的误解
+        _stale = rich.get("stale_dropped") or 0
+        _stale_note = f"；另有 {_stale} 只历史信号因非当日已丢弃" if _stale else ""
+        lines.append(f"- 市场状态：**{market_state}**（{filter_note}；"
+                     f"当日有效信号 {rich.get('signals', 0)} 个{_stale_note}）")
         pending = rich.get("pending_stops") or []
         if pending:
             lines.append("")

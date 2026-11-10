@@ -224,9 +224,12 @@ def verify(ssh) -> bool:
         ("依赖可 import（duckdb 等原生库）",
          "import duckdb,numpy,pandas,scipy;print('OK')"),
         ("latest_signal 只认当日",
+         # 注意：不可用「源码不含 signals[-1]」做判据——新实现的 docstring 会描述旧行为，
+         # 照样含该字符串，会假阴性（2026-11-10 第二次部署即因此误回滚）。
+         # 改判唯一属于新实现的那行调用。
          "import inspect,lihu_quantify.strategy.base as b;"
          "s=inspect.getsource(b.StrategyBase.latest_signal);"
-         "print('OK' if 'last_date' in s and 'signals[-1]' not in s else 'OLD')"),
+         "print('OK' if '_same_date(s.trade_date, last_date)' in s else 'OLD')"),
         ("因子方向已翻正",
          "import inspect,lihu_quantify.strategy.intraday_reversal as m;"
          "s=inspect.getsource(m.IntradayReversal._evaluate);"

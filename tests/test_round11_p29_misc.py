@@ -77,6 +77,51 @@ def test_p29_market_classify_basic():
     assert states[date(2026, 8, 24)] == "上涨"
 
 
+def test_p29_market_reversal_in_range():
+    """2026-11-06 修复：震荡区(20日涨幅在-3%~+3%)出现短期动量反转时也判'上涨'。
+
+    旧逻辑仅看20日累计涨幅，趋势反转初期持续判'震荡'→block模式关门错过行情。
+    新逻辑：MA5>MA20且上行，或近5日涨幅≥2%，则震荡区翻多为'上涨'。
+    """
+    # 前5天96 → 中间15天90 → 末5天92~96（V型反弹，20日累计=0%落震荡区）
+    df = pd.DataFrame({
+        "trade_date": [date(2026, 8, i) for i in range(1, 26)],
+        "close": [96] * 5 + [90] * 15 + [92, 93, 94, 95, 96],
+    })
+    states = classify_market_state(df, window=20)
+    # 末5天 MA5(94) > MA20(91) 且 MA5 上行 → 判上涨（旧逻辑会判震荡）
+    assert states[date(2026, 8, 25)] == "上涨"
+
+
+def test_p29_market_deep_down_protection():
+    """深度下跌段(20日≤-3%)的短期反弹分级处理：弱反弹保下跌，强反弹翻多。"""
+    # 弱反弹：20日-17%、近5日+3.75% → 保持下跌
+    df_weak = pd.DataFrame({
+        "trade_date": [date(2026, 8, i) for i in range(1, 26)],
+        "close": [100] * 5 + [80] * 15 + [80, 80, 81, 82, 83],
+    })
+    states_weak = classify_market_state(df_weak, window=20)
+    assert states_weak[date(2026, 8, 25)] == "下跌"
+
+    # 强反弹：20日-10%、近5日+12.5% → 翻多上涨
+    df_strong = pd.DataFrame({
+        "trade_date": [date(2026, 8, i) for i in range(1, 26)],
+        "close": [100] * 5 + [80] * 15 + [82, 84, 86, 88, 90],
+    })
+    states_strong = classify_market_state(df_strong, window=20)
+    assert states_strong[date(2026, 8, 25)] == "上涨"
+
+
+def test_p29_market_pure_range_unchanged():
+    """纯震荡无短期动量时仍判'震荡'，修复不引入误判。"""
+    df = pd.DataFrame({
+        "trade_date": [date(2026, 8, i) for i in range(1, 26)],
+        "close": [100] * 25,
+    })
+    states = classify_market_state(df, window=20)
+    assert states[date(2026, 8, 25)] == "震荡"
+
+
 # ============================================================
 # P2-9-6 run_live 复用 DailyScanner.collect_signals
 # ============================================================

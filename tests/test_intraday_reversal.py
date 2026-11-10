@@ -40,3 +40,26 @@ def test_signals_generated(df):
 def test_excludes_chinext(df):
     df2 = df.copy(); df2["ts_code"] = "300001.SZ"
     assert IntradayReversal().scan(df2) == []
+
+
+def test_entry_direction_uses_high_percentile(df):
+    """P0-B 回归：入场必须取因子【高分位】。
+
+    因子 ir20 = -Σ ln(close/open)，数值越大代表日内跌得越多、越超卖、越看多。
+    因此 mask 应为 `ir20_pct >= 1 - entry_pct`（默认 ≥0.80），而非 `<= entry_pct`。
+    历史 bug：误用低分位，回测 -25.18%（胜率 29.4%）vs 高分位 +13.39%（40.9%）。
+    """
+    strat = IntradayReversal()
+    sigs = strat.scan(df)
+    assert sigs, "fixture 应产生信号"
+
+    d = strat._prepare_indicators(df)["df"]
+    pct = dict(zip(d["trade_date"], d["ir20_pct"]))
+    threshold = 1.0 - strat.entry_pct
+    for s in sigs:
+        p = pct.get(s.trade_date)
+        assert p is not None and not pd.isna(p), f"{s.trade_date} 缺 ir20_pct"
+        assert p >= threshold - 1e-9, (
+            f"{s.trade_date} ir20_pct={p:.3f} 低于高分位阈值 {threshold:.2f}，方向疑似又反了"
+        )
+

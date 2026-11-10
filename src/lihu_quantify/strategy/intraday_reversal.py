@@ -7,8 +7,14 @@
     门禁2 RankIC=+0.0690 ICIR=0.47 t=17.6 icDSR=0.976 单调ρ=1.00（R4 PASS）
     门禁3 样本外(2025-2026.8) RankIC=+0.0804，5/5 稳健性 gate 全过
 
-单股时序实现说明：门禁2 为截面分位选股；单股事件驱动引擎中用
-「因子相对自身过去 250 日滚动分位 ≤20%」近似（每期截面低分位 ≈ 自身历史低分位）。
+单股时序实现说明：门禁2 为截面分位选股（因子值越大越超卖、越看多）；单股事件驱动
+引擎中用「因子相对自身过去 250 日滚动分位 ≥80%」近似（每期截面高分位 ≈ 自身历史高分位）。
+
+2026-11-10 修复（P0-B）：原实现误用「≤20% 低分位」，与因子定义方向相反。
+实测（148 只 / 2025-01~2026-11，含佣金+印花税+滑点）：
+    低分位（原）总收益 -25.18% 胜率 29.4% 夏普 -1.58
+    高分位（修复）+13.39% 胜率 40.9% 夏普 +0.41     改善 +38.57pp
+
 持有周期：与门禁一致按 20 日兑现（目标/止损/移动止盈由风控层执行）。
 
 铁律对齐：止损=成本-8% 或破10日线（先到先走）；单票仓位 ≤25%。
@@ -39,7 +45,7 @@ class IntradayReversal(StrategyBase):
     def __init__(
         self,
         lookback: int = 20,               # 日内收益累计窗口
-        entry_pct: float = 0.20,          # 自身历史分位入场阈值（≤20% = 超卖）
+        entry_pct: float = 0.20,          # 尾部比例：取因子最高的 20% 分位（≥0.80）入场
         hist_window: int = 250,           # 分位参考的历史窗口
         max_position_pct: float = 0.25,
         stop_loss_force_pct: float = -0.08,
@@ -88,7 +94,10 @@ class IntradayReversal(StrategyBase):
 
         # 基础过滤（逐 bar 滚动，无前视）
         rolling_amount = d["amount"].rolling(20).mean() if "amount" in d.columns else None
-        mask = d["ir20_pct"].notna() & (d["ir20_pct"] <= self.entry_pct)
+        # 2026-11-10 修复（P0-B）：ir20 = -Σ ln(close/open)，日内跌得越多 → ir20 越大
+        # → 越超卖 → 看多 ⇒ 应买【高分位】。原实现 `<= entry_pct`（低分位）方向反了。
+        # 回测对照见模块 docstring；门禁3 记录的 RankIC=+0.0804（正号）亦印证取高分位。
+        mask = d["ir20_pct"].notna() & (d["ir20_pct"] >= 1.0 - self.entry_pct)
         mask &= d["close"] > 0.5
         if self.trend_filter and {"ma20", "ma20_slope"}.issubset(d.columns):
             mask &= (d["close"] > d["ma20"]).fillna(False) & (d["ma20_slope"] > 0).fillna(False)
@@ -125,7 +134,7 @@ class IntradayReversal(StrategyBase):
                 stop_loss=stop_loss, take_profit=targets,
                 suggested_position_pct=self.max_position_pct,
                 strategy_name=self.name,
-                reason=f"日内反转超卖(ir20分位={float(row['ir20_pct']):.2f})",
+                reason=f"日内反转超卖(ir20分位={float(row['ir20_pct']):.2f} 高分位)",
                 trade_date=td,
             ))
         return signals

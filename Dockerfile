@@ -16,12 +16,14 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 依赖层（pyproject.toml 不变则命中构建缓存）。
+# 依赖层（pyproject.toml / constraints.txt 不变则命中构建缓存）。
 # 只装第三方依赖（tomllib 提取），不 pip install 项目本身——
 # 运行靠 PYTHONPATH=/app/src（入口脚本均有 sys.path 兜底）。
-COPY pyproject.toml README.md ./
+# constraints.txt 为 NAS 目标机的已知良好版本锁定：目标 CPU 为 Intel Celeron J1900
+# （仅 SSE4.2，无 AVX），duckdb 2.x 的二进制会 SIGILL 崩溃——2026-11-10 部署事故根因。
+COPY pyproject.toml README.md constraints.txt ./
 RUN python -c "import tomllib; deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; deps += ['fastapi>=0.110.0', 'uvicorn>=0.29.0']; print('\n'.join(deps))" > /tmp/req.txt \
-    && pip install --no-cache-dir -r /tmp/req.txt \
+    && pip install --no-cache-dir -c constraints.txt -r /tmp/req.txt \
     && rm /tmp/req.txt
 
 # 代码层（data/outputs 不进镜像——通过卷挂载持久化，见 docker-compose.yml）

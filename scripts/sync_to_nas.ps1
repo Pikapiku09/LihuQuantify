@@ -12,7 +12,7 @@ foreach ($dir in @("src", "config", "scripts", "web")) {
     robocopy (Join-Path $src $dir) (Join-Path $NasRoot $dir) /MIR /XD __pycache__ .pytest_cache node_modules /XF *.pyc | Out-Null
     Write-Host "已同步: $dir"
 }
-foreach ($f in @("run_scheduler.py","run_backtest.py","run_full_backtest.py","run_live.py","pyproject.toml","README.md","Dockerfile","docker-compose.yml",".dockerignore","docs\决策日志.md")) {
+foreach ($f in @("run_scheduler.py","run_backtest.py","run_full_backtest.py","run_live.py","pyproject.toml","constraints.txt","README.md","Dockerfile","docker-compose.yml",".dockerignore","docs\决策日志.md")) {
     $from = Join-Path $src $f; $to = Join-Path $NasRoot $f
     if (Test-Path $from) { New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null; Copy-Item $from $to -Force }
 }

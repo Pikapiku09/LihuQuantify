@@ -24,7 +24,7 @@ USER, PORT = "931570981", 22
 REMOTE = os.environ.get("NAS_REMOTE", "/volume2/Lihu_Quantify")
 DIRS = ["src", "config", "scripts", "web"]
 FILES = ["run_scheduler.py", "run_backtest.py", "run_full_backtest.py", "run_live.py",
-         "pyproject.toml", "README.md", "Dockerfile", "docker-compose.yml",
+         "pyproject.toml", "constraints.txt", "README.md", "Dockerfile", "docker-compose.yml",
          ".dockerignore", "docs/决策日志.md"]
 EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "node_modules"}
 EXCLUDE_EXT = {".pyc", ".log"}

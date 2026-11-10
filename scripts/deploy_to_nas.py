@@ -85,14 +85,16 @@ def precheck(ssh) -> bool:
     for line in out.strip().splitlines()[1:]:
         log(f"    {line}")
 
-    rc, out, _ = run(ssh, "docker version --format '{{.Server.Version}}' 2>&1 || "
-                          "sudo -n docker version --format '{{.Server.Version}}' 2>&1")
+    rc, out, _ = run(ssh, "docker version --format '{{.Server.Version}}'", sudo=True)
     log(f"  docker: {out.strip().splitlines()[0] if out.strip() else '未知'}")
 
-    rc, out, _ = run(ssh, f"docker ps --format '{{{{.Names}}}}\\t{{{{.Status}}}}' 2>&1 | head -10")
+    rc, out, _ = run(ssh, "docker ps --format '{{.Names}}|{{.Status}}' | head -10", sudo=True)
     log("  运行中容器:")
     for line in out.strip().splitlines() or ["(无)"]:
         log(f"    {line}")
+
+    rc, out, _ = run(ssh, "docker-compose version 2>&1 | head -1", sudo=True)
+    log(f"  compose: {out.strip().splitlines()[0] if out.strip() else '未知'}")
 
     # NAS 侧 settings 关键字段（防覆盖特有配置）
     rc, out, _ = run(ssh, f"grep -E '^(main_strategy|init_capital)|^  (market_filter|market_filter_mode|pool_mode|pool_size):' "
@@ -161,9 +163,14 @@ def push(ssh) -> bool:
 # ---------------------------------------------------------------- 重建
 def rebuild(ssh) -> bool:
     log("4/7 重建镜像（src 是 COPY 进镜像的，只重启无效）")
-    cmd = f"cd {REMOTE} && docker compose up -d --build 2>&1 | tail -40"
-    rc, out, err = run(ssh, cmd, sudo=True, timeout=1800)
-    tail = (out or err).strip().splitlines()[-6:]
+    # DSM 自带 docker-compose 1.28（无 `docker compose` 子命令），两者择可用者
+    rc, out, _ = run(ssh, "docker-compose version >/dev/null 2>&1 && echo OK_HYPHEN || echo NO_HYPHEN",
+                     sudo=True)
+    compose = "docker-compose" if "OK_HYPHEN" in out else "docker compose"
+    log(f"  compose 命令: {compose}")
+    cmd = f"cd {REMOTE} && {compose} up -d --build 2>&1 | tail -40"
+    rc, out, err = run(ssh, cmd, sudo=True, timeout=2400)
+    tail = (out or err).strip().splitlines()[-8:]
     for line in tail:
         log(f"    {line}")
     if rc != 0:
@@ -173,10 +180,49 @@ def rebuild(ssh) -> bool:
     return True
 
 
+def current_image_id(ssh) -> str:
+    """记录部署前 lihu-quantify:latest 的镜像 ID（重建后用于回滚 retag）。"""
+    rc, out, _ = run(ssh, "docker images lihu-quantify:latest --format '{{.ID}}'", sudo=True)
+    lines = [l.strip() for l in out.strip().splitlines() if l.strip() and "Password" not in l]
+    return lines[0] if lines else ""
+
+
+def wait_healthy(ssh, timeout: int = 180) -> bool:
+    """轮询容器健康状态。
+
+    2026-11-10 事故教训：重建后容器立即处于 restarting 时，直接跑 docker exec 探测
+    会得到空输出（误判为"验证失败"而非"容器崩了"）。改为先等健康，并把
+    Restarting 视为硬失败，交由调用方自动回滚。
+    """
+    log("  等待容器就绪（最多 %ds）…" % timeout)
+    deadline = time.time() + timeout
+    need = (CONTAINER_SCHEDULER, "lihu-web")
+    last = ""
+    while time.time() < deadline:
+        rc, out, _ = run(ssh, "docker ps --format '{{.Names}}|{{.Status}}'", sudo=True)
+        last = out.replace("Password: ", "").strip()
+        names = {}
+        for ln in last.splitlines():
+            if "|" in ln:
+                k, v = ln.split("|", 1)
+                names[k.strip()] = v.strip()
+        if any(n in names and "Restarting" in names[n] for n in need):
+            log(f"  ✗ 检测到重启循环: {last}")
+            return False
+        if all(n in names and "healthy" in names[n] for n in need):
+            log("  容器已健康")
+            return True
+        time.sleep(6)
+    log(f"  ✗ 健康等待超时: {last}")
+    return False
+
+
 # ---------------------------------------------------------------- 验证
 def verify(ssh) -> bool:
     log("5/7 验证新逻辑是否真的进了镜像")
     probes = [
+        ("依赖可 import（duckdb 等原生库）",
+         "import duckdb,numpy,pandas,scipy;print('OK')"),
         ("latest_signal 只认当日",
          "import inspect,lihu_quantify.strategy.base as b;"
          "s=inspect.getsource(b.StrategyBase.latest_signal);"
@@ -195,7 +241,7 @@ def verify(ssh) -> bool:
     ]
     ok = True
     for desc, code in probes:
-        rc, out, err = run(ssh, f"docker exec {CONTAINER_SCHEDULER} python -c {sh_quote(code)} 2>&1")
+        rc, out, err = run(ssh, f"docker exec {CONTAINER_SCHEDULER} python -c {sh_quote(code)} 2>&1", sudo=True)
         res = out.strip().splitlines()[-1] if out.strip() else "?"
         flag = "✓" if res == "OK" else "✗"
         if res != "OK":
@@ -208,7 +254,7 @@ def verify(ssh) -> bool:
 def force_scan(ssh) -> bool:
     log("6/7 补跑当日巡检（--run-now --force）")
     cmd = (f"docker exec {CONTAINER_SCHEDULER} python run_scheduler.py --run-now --force 2>&1 | tail -30")
-    rc, out, err = run(ssh, cmd, timeout=1800)
+    rc, out, err = run(ssh, cmd, timeout=2400, sudo=True)
     text = out or err
     for line in text.strip().splitlines()[-12:]:
         log(f"    {line}")
@@ -223,21 +269,33 @@ def show_logs(ssh) -> None:
     log("7/7 近期日志（关键词）")
     cmd = (f"docker logs --tail 300 {CONTAINER_SCHEDULER} 2>&1 | "
            f"grep -E '扫描信号|当日有效|丢弃|市场状态|异常' | tail -15")
-    rc, out, _ = run(ssh, cmd)
+    rc, out, _ = run(ssh, cmd, sudo=True)
     for line in out.strip().splitlines() or ["(无匹配)"]:
         log(f"    {line}")
 
 
 # ---------------------------------------------------------------- 回滚
-def rollback(ssh, tgz_path: str) -> bool:
-    log(f"回滚：用 {tgz_path} 恢复 src/ config/")
-    cmd = f"tar xzf {tgz_path} -C {REMOTE} && echo RESTORE_OK"
-    rc, out, err = run(ssh, cmd, sudo=True)
-    if "RESTORE_OK" not in out:
-        log(f"  ✗ 回滚失败: {(err or out).strip()[:300]}")
-        return False
-    log("  文件已恢复，需重建镜像：docker compose up -d --build")
-    return rebuild(ssh)
+def rollback(ssh, tgz_path: str | None = None, image_id: str | None = None) -> bool:
+    """回滚：可选恢复文件（tgz）+ 可选 retag 回旧镜像，然后重启并等健康。"""
+    log("回滚开始")
+    if tgz_path:
+        log(f"  恢复文件：{tgz_path}")
+        rc, out, err = run(ssh, f"tar xzf {tgz_path} -C {REMOTE} && echo RESTORE_OK", sudo=True)
+        if "RESTORE_OK" not in out:
+            log(f"  ✗ 文件恢复失败: {(err or out).strip()[:300]}")
+            return False
+        log("  文件已恢复")
+    if image_id:
+        log(f"  镜像 retag：{image_id} → lihu-quantify:latest")
+        rc, out, err = run(ssh, f"docker tag {image_id} lihu-quantify:latest && echo TAG_OK", sudo=True)
+        if "TAG_OK" not in out:
+            log(f"  ✗ retag 失败: {(err or out).strip()[:300]}")
+            return False
+    log("  重启容器（--no-build）")
+    rc, out, err = run(ssh, f"cd {REMOTE} && docker-compose up -d --no-build 2>&1 | tail -8",
+                       sudo=True, timeout=900)
+    log(f"    {(out or err).strip().splitlines()[-1] if (out or err).strip() else ''}")
+    return wait_healthy(ssh)
 
 
 def main() -> None:
@@ -246,14 +304,18 @@ def main() -> None:
     ap.add_argument("--yes", action="store_true", help="跳过确认")
     ap.add_argument("--skip-rebuild", action="store_true", help="不同步/不重建（仅预检）")
     ap.add_argument("--skip-scan", action="store_true", help="部署后不补跑巡检")
-    ap.add_argument("--rollback", metavar="TGZ", help="用指定备份包回滚")
+    ap.add_argument("--rollback", metavar="TGZ", help="用指定备份包回滚（文件 + 镜像）")
+    ap.add_argument("--rollback-image", metavar="ID", help="回滚时一并 retag 的旧镜像 ID")
+    ap.add_argument("--no-auto-rollback", action="store_true",
+                    help="失败时不自动回滚（默认自动回滚以尽快恢复服务）")
     args = ap.parse_args()
 
     ssh = connect()
     try:
-        if args.rollback:
-            rollback(ssh, args.rollback)
-            return
+        if args.rollback or args.rollback_image:
+            ok = rollback(ssh, args.rollback, args.rollback_image)
+            log("回滚完成" if ok else "✗ 回滚后容器仍未健康，请人工介入")
+            raise SystemExit(0 if ok else 9)
 
         if not precheck(ssh):
             raise SystemExit(1)
@@ -266,6 +328,9 @@ def main() -> None:
                 log("已取消")
                 return
 
+        prev_img = current_image_id(ssh)
+        log(f"  部署前镜像 ID: {prev_img or '(未知)'}")
+
         bak = backup(ssh)
         if not bak:
             log("✗ 备份失败，中止部署（不冒险覆盖生产代码）")
@@ -276,18 +341,35 @@ def main() -> None:
             return
 
         if not push(ssh):
-            log("✗ 同步失败，可回滚：python scripts/deploy_to_nas.py --yes --rollback " + bak)
+            log(f"✗ 同步失败，可回滚：--rollback {bak} --rollback-image {prev_img}")
             raise SystemExit(3)
+
         if not rebuild(ssh):
-            log("✗ 重建失败，可回滚：python scripts/deploy_to_nas.py --yes --rollback " + bak)
+            log("✗ 重建失败，自动回滚…")
+            if not args.no_auto_rollback:
+                rollback(ssh, bak, prev_img)
             raise SystemExit(4)
+
+        # 2026-11-10 事故教训：重建后必须先等容器健康，否则 docker exec 探测拿不到输出
+        if not wait_healthy(ssh):
+            log("✗ 容器未健康（疑似崩溃循环），自动回滚到部署前镜像…")
+            if not args.no_auto_rollback:
+                ok = rollback(ssh, bak, prev_img)
+                log("  自动回滚" + ("成功，服务已恢复" if ok else "失败，需人工介入"))
+            raise SystemExit(4)
+
         if not verify(ssh):
-            log("✗ 验证未通过，建议回滚：--rollback " + bak)
+            log("✗ 验证未通过")
+            if not args.no_auto_rollback:
+                log("  自动回滚…")
+                ok = rollback(ssh, bak, prev_img)
+                log("  自动回滚" + ("成功" if ok else "失败，需人工介入"))
             raise SystemExit(5)
+
         if not args.skip_scan:
             force_scan(ssh)
         show_logs(ssh)
-        log(f"部署完成。回滚备份：{bak}")
+        log(f"部署完成。回滚备份：{bak}｜回滚镜像：{prev_img}")
     finally:
         ssh.close()
 

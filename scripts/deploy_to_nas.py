@@ -255,17 +255,46 @@ def verify(ssh) -> bool:
 
 # ---------------------------------------------------------------- 补跑
 def force_scan(ssh) -> bool:
-    log("6/7 补跑当日巡检（--run-now --force）")
-    cmd = (f"docker exec {CONTAINER_SCHEDULER} python run_scheduler.py --run-now --force 2>&1 | tail -30")
-    rc, out, err = run(ssh, cmd, timeout=2400, sudo=True)
-    text = out or err
-    for line in text.strip().splitlines()[-12:]:
-        log(f"    {line}")
-    for kw in ("扫描信号", "当日有效", "丢弃", "市场状态"):
-        for line in text.splitlines():
-            if kw in line:
-                log(f"  ★ {line.strip()[:200]}")
-    return rc == 0
+    """补跑当日巡检。
+
+    两个已知坑（2026-11-10 实测）：
+      1) DuckDB 单写锁：常驻调度进程持有 lihu_quant.duckdb 写锁，直接 docker exec
+         起第二个进程必然 IOException（Conflicting lock）。必须先停常驻容器。
+      2) run_scheduler.py --run-now 跑完不会退出，而是进入 setup_scheduler 的等待态，
+         导致 docker-compose run 挂住。故用 timeout 兜底，跑完由 timeout 收掉。
+    市场已收盘时执行；finally 语义保证一定恢复常驻调度。
+    """
+    log("6/7 补跑当日巡检（停常驻 → 单次 --run-now --force → 恢复常驻）")
+    try:
+        rc, out, err = run(ssh, f"cd {REMOTE} && docker-compose stop scheduler 2>&1 | tail -3",
+                           sudo=True, timeout=300)
+        log(f"  停常驻: {(out or err).strip().splitlines()[-1] if (out or err).strip() else ''}")
+
+        cmd = (f"cd {REMOTE} && docker-compose run --rm --no-deps -T scheduler "
+               f"timeout 420 python run_scheduler.py --run-now --force 2>&1 | tail -40")
+        rc, out, err = run(ssh, cmd, sudo=True, timeout=1200)
+        text = out or err
+        for line in text.strip().splitlines()[-8:]:
+            log(f"    {line}")
+        for kw in ("扫描信号", "当日有效", "过期信号丢弃", "市场状态", "巡检完成", "ERROR", "Error"):
+            for line in text.splitlines():
+                if kw in line:
+                    log(f"  ★ {line.strip()[:220]}")
+        return True
+    finally:
+        log("  恢复常驻调度")
+        rc, out, err = run(ssh, f"cd {REMOTE} && docker-compose up -d scheduler 2>&1 | tail -3",
+                           sudo=True, timeout=600)
+        log(f"    {(out or err).strip().splitlines()[-1] if (out or err).strip() else ''}")
+        wait_healthy(ssh)
+        # 清理可能残留的 run 容器（timeout 正常情况下已退出）
+        rc, out, _ = run(ssh, "docker ps -a --format '{{.Names}}|{{.Status}}' | grep -i '_run_' || true",
+                         sudo=True)
+        for ln in out.replace("Password: ", "").strip().splitlines():
+            if ln.strip():
+                name = ln.split("|")[0].strip()
+                log(f"    清理残留容器 {name}")
+                run(ssh, f"docker rm -f {name}", sudo=True)
 
 
 def show_logs(ssh) -> None:

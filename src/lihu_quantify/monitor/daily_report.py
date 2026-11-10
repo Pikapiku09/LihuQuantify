@@ -304,9 +304,11 @@ def _render_risk(d: dict) -> str:
         filter_note = "非上涨段，市场过滤生效：今日新仓仓位减半"
     else:
         filter_note = "上涨段，允许正常开仓"
+    stale = d.get("stale_dropped") or 0
+    stale_note = (f"；另有 {stale} 只历史信号因非当日已丢弃" if stale else "")
     parts.append(
         f"<p style='margin:4px 0;font-size:13px;'>市场状态：<b>{market_state}</b>"
-        f"（{filter_note}；扫描信号 {d.get('signals', 0)} 个）</p>"
+        f"（{filter_note}；当日有效信号 {d.get('signals', 0)} 个{stale_note}）</p>"
     )
 
     # 市场闸门条件统计（2026-10-23 前向验证：闸门开/关分组的条件期望）

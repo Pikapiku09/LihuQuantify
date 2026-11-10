@@ -225,23 +225,35 @@ def _market_state() -> dict:
     try:
         import duckdb
 
+        from lihu_quantify.market import classify_market_state
+
         con = duckdb.connect(str(db), read_only=True)
         df = con.execute(
             "SELECT trade_date, close FROM index_daily WHERE ts_code='000001.SH' "
-            "ORDER BY trade_date DESC LIMIT 25"
+            "ORDER BY trade_date DESC LIMIT 60"
         ).df()
         con.close()
+        if df.empty:
+            return {"state": "未知", "latest": None, "ret20d": None}
+        # 统一 trade_date 为 date（DuckDB 可能返回 str / date / Timestamp）
+        td = df["trade_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        df["trade_date"] = pd.to_datetime(td, format="%Y%m%d", errors="coerce").dt.date
+        df = (df.dropna(subset=["trade_date"])
+                .sort_values("trade_date").reset_index(drop=True))
         if len(df) < 21:
             return {"state": "未知", "latest": None, "ret20d": None}
-        df = df.sort_values("trade_date").reset_index(drop=True)
         df["ret20"] = df["close"].pct_change(20) * 100
         last = df.iloc[-1]
         ret = last["ret20"]
-        state = "上涨" if ret >= 3 else ("下跌" if ret <= -3 else "震荡")
+        # 2026-11-10 修复（P2）：改为与调度器同一实现 classify_market_state。
+        # 原先内联 `ret>=3 上涨 / <=-3 下跌 / 其余 震荡` 是已被替换的旧三分段，
+        # 会导致同一交易日「看板」与「日报」给出不同市场状态。
+        states = classify_market_state(df)
+        state = states.get(last["trade_date"], "未知")
         return {
             "state": state,
             "latest": str(last["trade_date"])[:10],
-            "ret20d": round(float(ret), 2),
+            "ret20d": round(float(ret), 2) if pd.notna(ret) else None,
         }
     except Exception:
         return {"state": "未知", "latest": None, "ret20d": None}

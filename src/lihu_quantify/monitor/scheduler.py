@@ -139,6 +139,20 @@ def _signal_score(bar) -> float:
             + 0.3 * (1 - min(max(fresh, 0.0), 7.0) / 7.0))
 
 
+def _is_same_trade_date(a, b):
+    """宽松判断两个日期是否同一交易日。
+
+    P0-A 双保险用：返回 True / False，无法判定（None、Mock、异常）返回 None。
+    只有明确 False 才丢弃信号——避免把测试替身或未知类型误杀。
+    """
+    if a is None or b is None:
+        return None
+    try:
+        return bool(pd.Timestamp(a).normalize() == pd.Timestamp(b).normalize())
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def _build_daily_summary(
     broker,
     latest: date,
@@ -744,6 +758,10 @@ class DailyScanner:
         start = latest - timedelta(days=days)
         signals: list[tuple] = []   # (signal, last_bar)
         hm_quotes: list[dict] = []   # 问题3（第九轮）：最新 bar → 热力图快照
+        # P0-A（2026-11-10）：过期信号丢弃计数——可观测性，不静默吞掉。
+        # 修复前池内 200 只几乎「每天都有信号」（196-200 个），本质是僵尸信号堆积。
+        stale_dropped = 0
+        stale_sample: list[str] = []
         for code in codes:
             try:
                 df = self.client.query("daily", {
@@ -772,11 +790,23 @@ class DailyScanner:
                 continue
             sig = strategy.latest_signal(df)
             if sig is not None:
+                # P0-A 双保险（2026-11-10）：即便某策略类回退到 signals[-1]，
+                # 也绝不允许把历史信号当今日信号下单（信号价与执行价混用）。
+                # 只有明确判定为不同交易日才丢弃；None/Mock/未知类型放行（不误杀）。
+                fresh = _is_same_trade_date(
+                    getattr(sig, "trade_date", None), df.iloc[-1]["trade_date"])
+                if fresh is False:
+                    stale_dropped += 1
+                    if len(stale_sample) < 3:
+                        stale_sample.append(f"{code}@{sig.trade_date}")
+                    continue
                 df_ind = add_all_standard(df)
                 last_ind = df_ind.iloc[-1]
                 # 需求1（第八轮）：信号评分（资金紧张时 top-N 排序用）
                 signals.append((sig, last_ind, _signal_score(last_ind)))
-        logger.info(f"[巡检] [{self._state_label}] 扫描信号 {len(signals)} 个")
+        logger.info(f"[巡检] [{self._state_label}] 扫描信号 {len(signals)} 个（当日有效）"
+                    + (f"；过期信号丢弃 {stale_dropped} 只"
+                       f"（示例 {'、'.join(stale_sample)}）" if stale_dropped else ""))
         # WBR 池内截面过滤（2026-09-29 双轨影子）：单股扫描无全市场截面分位，
         # 用信号 priority（自身历史分位，小=超卖）池内排序取相对最超卖前 30%——
         # 对齐回测截面口径的池内近似（口径差异登记：池≈198 只 vs 回测全市场 2810 只）
@@ -937,6 +967,9 @@ class DailyScanner:
         )
         # ---- 市场闸门条件统计（2026-10-23 前向验证，纯展示） ----
         summary["market_gate"] = self._market_gate_stats(market_state, s)
+        # P0-A 可观测性：当日有效信号数 + 被丢弃的历史信号数（如实标注，不静默）
+        summary["stale_dropped"] = stale_dropped
+        summary["stale_sample"] = stale_sample
         # ---- 需求3（第八轮）：资金利用效率数据（.md 报告与邮件日报共用） ----
         summary["capital"] = {
             # 今日止损执行回笼金额（毛额，今日开盘价 × 股数）

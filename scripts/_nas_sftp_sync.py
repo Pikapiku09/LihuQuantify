@@ -17,8 +17,11 @@ from pathlib import Path
 import paramiko
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST, USER, PORT = "192.168.123.203", "931570981", 22
-REMOTE = "/volume2/Lihu_Quantify"
+# NAS_HOST 可覆盖：该 NAS 的 DHCP 地址已漂移两次（.204 → .203 → .204），
+# 硬编码在漂移后会静默失效。建议在 DSM 绑定固定 IP。
+HOST = os.environ.get("NAS_HOST", "192.168.123.204")
+USER, PORT = "931570981", 22
+REMOTE = os.environ.get("NAS_REMOTE", "/volume2/Lihu_Quantify")
 DIRS = ["src", "config", "scripts", "web"]
 FILES = ["run_scheduler.py", "run_backtest.py", "run_full_backtest.py", "run_live.py",
          "pyproject.toml", "README.md", "Dockerfile", "docker-compose.yml",

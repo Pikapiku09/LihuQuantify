@@ -1,8 +1,13 @@
-"""NAS SSH 一次性操作（密码经环境变量传入；NAS_SUDO=1 时走 sudo -S）。"""
+"""NAS SSH 一次性操作（密码经环境变量传入；NAS_SUDO=1 时走 sudo -S）。
+
+NAS_HOST 可用环境变量覆盖：该 NAS 的 DHCP 地址已漂移两次（.204 → .203 → .204），
+硬编码极易在漂移后静默失效。建议在 DSM 里为 NAS 绑定固定 IP。
+"""
 import os, sys
 import paramiko
 
-host, user, pwd = "192.168.123.203", "931570981", os.environ["NAS_PWD"]
+host = os.environ.get("NAS_HOST", "192.168.123.204")
+user, pwd = "931570981", os.environ["NAS_PWD"]
 cmd = sys.argv[1]
 use_sudo = os.environ.get("NAS_SUDO", "0") == "1"
 

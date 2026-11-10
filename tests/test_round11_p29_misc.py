@@ -175,16 +175,19 @@ def test_p29_alert_self_check_file_after_consec_fails(tmp_path, monkeypatch):
     assert data["consec_fail"] == 0
 
 
-def test_p29_alert_returns_real_channel_result(monkeypatch):
+def test_p29_alert_returns_real_channel_result(monkeypatch, tmp_path):
     from lihu_quantify.monitor.alerts import Alerter
 
+    # 2026-11-10：原用 Path("x") / "y" 相对路径，会在仓库根目录写盘造成 x/y 垃圾文件
+    status_path = tmp_path / "alert_status.json"
+
     al = Alerter(serverchan_key="fake", enabled=True)
-    al._alert_status_path_override = Path("x") / "y"
+    al._alert_status_path_override = status_path
     monkeypatch.setattr(al, "_push_serverchan", lambda t, d: True)
     assert al.send("ok", level="info") is True
 
     al2 = Alerter(serverchan_key="fake", enabled=True)
-    al2._alert_status_path_override = Path("x") / "y"
+    al2._alert_status_path_override = status_path
     monkeypatch.setattr(al2, "_push_serverchan", lambda t, d: False)
     assert al2.send("fail", level="info") is False, "实通道全失败应返回 False"
 

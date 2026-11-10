@@ -625,19 +625,26 @@ class DailyScanner:
         self.heartbeat.success()
         return summary
 
-    def collect_signals(self, n: int = 50, days: int = 120) -> dict:
-        """P2-9-6：抽取"股票池 + 信号扫描"供 run_live 复用（替代其重复 scan_universe）。
+    def _build_strategy(self, s, r):
+        """按账本策略名构造策略实例（单一实现，杜绝调用方各自分叉）。
 
-        DailyScanner 是股票池/参数/信号生成的单一实现；run_live 只在交互式
-        打印流程里需要信号与市场状态，无需执行巡检完整副作用（落盘/止损/cron），
-        故抽出本方法，统一 CherryClaw 参数构造（修掉 run_live 裸构造分叉）。
-
-        Returns:
-            {"latest": date, "market_state": str, "codes": [...],
-             "signals": [(sig, last_ind), ...]}   # last_ind 为含指标的末行
+        2026-11-10 修复（P3）：原先 collect_signals（run_live 路径）无条件构造
+        CherryClaw，无视 settings.main_strategy 已于 2026-09-26 切到
+        intraday_reversal —— 交互式打印的信号与巡检实际下单的信号来自不同策略，
+        诊断与实盘口径不一致。此处收敛为唯一构造点，_scan_impl 与 collect_signals 共用。
         """
-        latest, market_state = self._market_state()
-        s, r = self.settings.strategy, self.settings.risk
+        _strat_name = getattr(self.book, "strategy", "cherry_claw")
+        if _strat_name == "intraday_reversal":
+            return IntradayReversal(
+                max_position_pct=min(r.max_single_position, 0.15),
+                stop_loss_force_pct=r.stop_loss_force,
+            )
+        if _strat_name == "weekly_band":
+            # WBR ms25 影子（2026-09-29 双轨研究）：对齐回测口径——2.5%单票、
+            # 截面最超卖 30%、持有 20 交易日到期（纯持有期离场，止损由账本跳过）
+            return WeeklyBandReversal(
+                max_position_pct=0.025, cs_entry_pct=0.30, holding_days=20,
+            )
         strategy = CherryClaw(
             ma_periods=tuple(s.ma_periods),
             golden_cross_max_freshness=s.golden_cross_max_freshness_days,
@@ -647,6 +654,26 @@ class DailyScanner:
             max_position_pct=r.max_single_position,
             stop_loss_force_pct=r.stop_loss_force,
         )
+        # P4（2026-09-26）：主账本趋势策略套波动率目标（反转账本上面分支已跳过）
+        _vt = getattr(r, "vol_target", None)
+        if _vt is not None and getattr(_vt, "enabled", False):
+            from ..strategy.vol_wrap import wrap_vol_target
+            strategy = wrap_vol_target(strategy, _vt)
+        return strategy
+
+    def collect_signals(self, n: int = 50, days: int = 120) -> dict:
+        """P2-9-6：抽取"股票池 + 信号扫描"供 run_live 复用（替代其重复 scan_universe）。
+
+        DailyScanner 是股票池/参数/信号生成的单一实现；run_live 只在交互式
+        打印流程里需要信号与市场状态，无需执行巡检完整副作用（落盘/止损/cron）。
+
+        Returns:
+            {"latest": date, "market_state": str, "codes": [...],
+             "signals": [(sig, last_ind), ...]}   # last_ind 为含指标的末行
+        """
+        latest, market_state = self._market_state()
+        s, r = self.settings.strategy, self.settings.risk
+        strategy = self._build_strategy(s, r)
         codes, _, _ = self._universe(n)
 
         # ir20 账本：因子需 250 日滚动分位预热，窗口放大到 500 自然日
@@ -725,32 +752,7 @@ class DailyScanner:
 
         # 扫描信号（修复C：同时取板块映射）
         _strat_name = getattr(self.book, "strategy", "cherry_claw")
-        if _strat_name == "intraday_reversal":
-            strategy = IntradayReversal(
-                max_position_pct=min(r.max_single_position, 0.15),
-                stop_loss_force_pct=r.stop_loss_force,
-            )
-        elif _strat_name == "weekly_band":
-            # WBR ms25 影子（2026-09-29 双轨研究）：对齐回测口径——2.5%单票、
-            # 截面最超卖 30%、持有 20 交易日到期（纯持有期离场，止损由账本跳过）
-            strategy = WeeklyBandReversal(
-                max_position_pct=0.025, cs_entry_pct=0.30, holding_days=20,
-            )
-        else:
-            strategy = CherryClaw(
-                ma_periods=tuple(s.ma_periods),
-                golden_cross_max_freshness=s.golden_cross_max_freshness_days,
-                volume_ratio_threshold=s.volume_ratio_threshold,
-                entity_ratio_threshold=s.entity_ratio_threshold,
-                close_to_ma5_max_dev=s.close_to_ma5_max_dev,
-                max_position_pct=r.max_single_position,
-                stop_loss_force_pct=r.stop_loss_force,
-            )
-            # P4（2026-09-26）：主账本趋势策略套波动率目标（反转账本上面分支已跳过）
-            _vt = getattr(r, "vol_target", None)
-            if _vt is not None and getattr(_vt, "enabled", False):
-                from ..strategy.vol_wrap import wrap_vol_target
-                strategy = wrap_vol_target(strategy, _vt)
+        strategy = self._build_strategy(s, r)
         codes, sector_map, name_map = self._universe(n)
         # 分位预热窗口（ir20/wbr 需 250 日滚动分位 → 500 自然日，修复 _scan_impl 缺口）
         if _strat_name in ("intraday_reversal", "weekly_band"):

@@ -16,6 +16,9 @@ backups/
 # 测试状态隔离目录
 tests/.test_state/
 
+# 测试/脚本误用相对路径写盘产生的垃圾目录（2026-11-10 防回归，见 x/y 事件）
+x/
+
 # Python
 __pycache__/
 *.pyc

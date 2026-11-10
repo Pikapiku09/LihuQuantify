@@ -57,10 +57,25 @@ def build_tgz() -> bytes:
     return buf.getvalue()
 
 
-def main() -> None:
+def _nas_pwd() -> str:
+    """凭据优先级：环境变量 NAS_PWD → 项目根 .env 的 NAS_PWD=...（.env 不入 git）。"""
     pwd = os.environ.get("NAS_PWD")
+    if pwd:
+        return pwd
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("NAS_PWD=") and not s.startswith("#"):
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def main() -> None:
+    pwd = _nas_pwd()
     if not pwd:
-        print("NAS_PWD 必填", file=sys.stderr)
+        print("NAS_PWD 必填：请设置环境变量，或在项目根 .env 写 NAS_PWD=...(不入 git)",
+              file=sys.stderr)
         sys.exit(1)
     tgz = build_tgz()
     b64 = base64.b64encode(tgz).decode()

@@ -225,6 +225,7 @@ def _market_state() -> dict:
     try:
         import duckdb
 
+        from lihu_quantify.data.integrity import filter_non_trading_days
         from lihu_quantify.market import classify_market_state
 
         con = duckdb.connect(str(db), read_only=True)
@@ -232,6 +233,15 @@ def _market_state() -> dict:
             "SELECT trade_date, close FROM index_daily WHERE ts_code='000001.SH' "
             "ORDER BY trade_date DESC LIMIT 60"
         ).df()
+        # P0-0 数据完整性（2026-11-14）：同连接顺带取交易日历，剔除伪交易日。
+        # index_daily 曾混入 2026-09-12（周六）一条孤立 bar，而闸门用按行数滚动的
+        # pct_change(20)，会让看板与日报的市场状态不一致。trade_cal 缺失则跳过。
+        try:
+            _cal = con.execute("SELECT cal_date FROM trade_cal WHERE is_open = 1").df()
+            _tdays = ({pd.Timestamp(d).date() for d in _cal["cal_date"].tolist()}
+                      if not _cal.empty else set())
+        except Exception:
+            _tdays = set()
         con.close()
         if df.empty:
             return {"state": "未知", "latest": None, "ret20d": None}
@@ -240,6 +250,9 @@ def _market_state() -> dict:
         df["trade_date"] = pd.to_datetime(td, format="%Y%m%d", errors="coerce").dt.date
         df = (df.dropna(subset=["trade_date"])
                 .sort_values("trade_date").reset_index(drop=True))
+        if _tdays:
+            df, _dropped = filter_non_trading_days(df, _tdays)
+            df = df.reset_index(drop=True)
         if len(df) < 21:
             return {"state": "未知", "latest": None, "ret20d": None}
         df["ret20"] = df["close"].pct_change(20) * 100

@@ -9,9 +9,11 @@ tushareMcp.json
 Mimo.txt
 
 # ===== 运行时状态/数据（本地生成，体积大且含账户状态） =====
-data/
-outputs/
-backups/
+/data/
+/outputs/
+/backups/
+/src/outputs/
+/_nas_import_staging/
 
 # 测试状态隔离目录
 tests/.test_state/

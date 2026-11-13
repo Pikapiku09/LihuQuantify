@@ -129,6 +129,16 @@ def scan_history(secrets: dict[str, str]) -> list[str]:
     return problems
 
 
+# Windows 控制台默认 GBK：输出非 ASCII 会抛 UnicodeEncodeError，
+# 让安全扫描钩子以非零退出码「误报发现密钥」。此处强制 UTF-8 兜底。
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--staged", action="store_true", help="只扫暂存区（pre-commit）")
@@ -150,14 +160,14 @@ def main() -> None:
         problems += scan_history(secrets)
 
     if problems:
-        print("\n✗ 发现疑似密钥，已阻止：\n")
+        print("\n[X] 发现疑似密钥，已阻止：\n")
         for p in problems:
             print(f"  - {p}")
         print("\n处置建议：改用环境变量或 .env（勿入库），并把明文从历史中清除"
               "（git filter-repo --replace-text）。")
         sys.exit(2)
 
-    print("✓ 未发现密钥，可以提交/推送")
+    print("[OK] 未发现密钥，可以提交/推送")
     sys.exit(0)
 
 

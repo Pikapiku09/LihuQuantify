@@ -138,6 +138,13 @@ ai_summary:
   timeout: 20                            # 秒；超时静默降级（报告无 AI 段，巡检不受影响）
   max_chars: 300                         # 总结长度上限
 
+# 评审自动阻断（P0-3，2026-11-14）：把 USER_GUIDE §5.0「≥50 轮且胜率<45% → 停下检查」
+# 变成每次巡检末尾的代码检查（monitor/auto_block.py）。触发时只写
+# outputs/auto_block.json + 推一条告警 + 标记「建议冻结新开仓」，
+# 绝不自动平仓、绝不自动修改本文件——冻结与调参由人工决策。
+review_block_min_rounds: 50             # 预检轮次门槛（已平仓轮次，review_progress 口径）
+review_block_min_win_rate: 0.45         # 预检胜率线（低于此值触发阻断告警）
+
 # 影子账本（第十二轮：多池并行积累参考样本）
 # 统计纪律：评审进度/胜率以主账本（paper_state.json）为准；影子仅跨池稳健性对照，
 # 同期账本间有市场相关性，不得当独立样本合并。
@@ -152,3 +159,18 @@ shadow_books:
   - name: "ir20"                        # P1 通关因子对照腿（2026-09-26）：IntradayReversal 15% 仓位，100 笔后评审
     seed: 42
     strategy: "intraday_reversal"
+  - name: "nogate"                      # P1-4 无闸门影子（2026-11-14）：主账本同信号源，仅闸门恒 off
+    seed: 42
+    strategy: "intraday_reversal"
+
+# 影子账本行为配置（P1-4，2026-11-14）：pydantic Settings 未建模该块，
+# 由 monitor/scheduler._load_shadow_ledgers() 直读原始 YAML（生效前提：
+# shadow_books 里也启用了同名账本）。
+# 背景：market_filter_mode=block 期（2026-10-26~11-13，15 天）成交 0 笔，
+# "闸门是否误杀机会"永远没有样本 → 用一本闸门恒 off 的影子账本做反事实对照。
+# 隔离：独立 paper_state_nogate.json / 独立止损登记 / silent 不发日报，不影响主账本资金与持仓。
+shadow_ledgers:
+  - name: "nogate"
+    enabled: true
+    signal_source: "main"               # 与主账本共用同一信号源（同池 seed、同策略）
+    market_gate: "off"                  # 闸门恒 off → entry_scale 恒 1.0，不看 market_state

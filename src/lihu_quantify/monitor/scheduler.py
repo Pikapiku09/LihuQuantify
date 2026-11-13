@@ -19,11 +19,13 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import yaml
 from loguru import logger
 
 from ..config import CapitalGuardConfig, Settings
 from ..data.tushare_client import TushareClient
 from ..data.duckdb_store import DuckDBStore
+from ..data.integrity import filter_non_trading_days, load_trading_days
 from ..indicators.standard import add_all_standard
 from ..market import classify_market_state  # P2-9-4：包内引入，消除 sys.path hack
 from ..strategy.cherry_claw import CherryClaw
@@ -73,6 +75,66 @@ _STOP_REASON_LABEL = {
     "ma_break": "MA10 破位",
     "trailing_stop": "移动止盈",   # 修复4(第六轮)
 }
+
+
+def _gate_scale(
+    book,
+    strategy_cfg,
+    market_state: str,
+    sentiment_ebb: bool = False,
+) -> tuple[bool, float]:
+    """市场闸门 → (是否禁开新仓 block_mode, 有效仓位系数 entry_scale)。
+
+    口径与旧实现逐字等价：block → entry_scale=0.0；reduce → 0.5；否则 1.0。
+    P1-4（2026-11-14）：无闸门影子账本（BookSpec.gate=="off"）闸门恒 off——
+    entry_scale 恒 1.0、不看 market_state；**只改闸门行为**，策略/仓位上限/
+    风控铁律全部沿用原配置。其余账本（gate="follow"，默认）行为不变。
+    """
+    block_mode = bool(
+        getattr(strategy_cfg, "market_filter", False)
+        and market_state != "上涨"
+        and getattr(strategy_cfg, "market_filter_mode", "") == "block"
+    )
+    reduce_scale = 0.5 if (
+        getattr(strategy_cfg, "market_filter", False)
+        and market_state != "上涨"
+        and getattr(strategy_cfg, "market_filter_mode", "") == "reduce"
+    ) else 1.0
+    # P6 情绪退潮日叠加禁开仓（等同 block，覆盖 reduce）
+    if sentiment_ebb:
+        block_mode = True
+        reduce_scale = 0.0
+    if getattr(book, "gate", "follow") == "off":
+        return False, 1.0
+    return block_mode, (0.0 if block_mode else reduce_scale)
+
+
+def _load_shadow_ledgers() -> dict[str, dict]:
+    """读 config/settings.yaml 的 shadow_ledgers 块（P1-4 无闸门影子行为配置）。
+
+    该块（name/enabled/signal_source/market_gate）未进 pydantic Settings 模型
+    （config.py 不在 P0-3/P1-4 写作用域），故直接读原始 YAML；字段缺失/文件损坏
+    → {}（零生效，退回现行行为）。生效前提仍是 shadow_books 里启用了同名账本
+    ——shadow_books 依旧是"是否跑影子"的总开关，防止测试/旁路配置误增账本。
+    """
+    path = _ROOT / "config" / "settings.yaml"
+    try:
+        if not path.exists():
+            return {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.warning(f"[影子账本] shadow_ledgers 配置读取失败（忽略）: {e}")
+        return {}
+    out: dict[str, dict] = {}
+    items = data.get("shadow_ledgers") if isinstance(data, dict) else None
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or not item.get("enabled", True):
+            continue
+        out[name] = item
+    return out
 
 
 def build_account_snapshot(broker) -> AccountSnapshot:
@@ -309,6 +371,9 @@ class BookSpec:
     pool_seed: int = 42
     silent: bool = False          # 影子=True：无邮件/AI 摘要/心跳/last_scan 写入
     strategy: str = "cherry_claw" # ir20 账本用 "intraday_reversal"（P1 对照腿）
+    # P1-4（2026-11-14）：闸门行为。follow=按 settings（默认，现行行为）；
+    # off=闸门恒关（entry_scale=1.0），仅用于"无闸门影子"反事实对照账本。
+    gate: str = "follow"
 
     @property
     def is_main(self) -> bool:
@@ -519,6 +584,20 @@ class DailyScanner:
         idx_df = idx.copy()
         idx_df["trade_date"] = pd.to_datetime(idx_df["trade_date"], format="%Y%m%d").dt.date
         idx_df = idx_df.sort_values("trade_date").reset_index(drop=True)
+        # P0-0 数据完整性（2026-11-14）：剔除数据源混入的伪交易日（非开市日的孤立 bar）。
+        # 背景：index_daily 曾混入 2026-09-12（周六，pct_chg=+4.73%）一条孤立 bar，
+        # 而闸门用 pct_change(20)/rolling(20) 按**行数**滚动、不感知日历，该行会把
+        # 2026-10-19 的 ret_20d 由真实的 −4.04% 扭曲成 −8.38%（把"震荡"判成"下跌"）。
+        # trade_cal 不可用/覆盖不足时原样返回，绝不阻断巡检。
+        trading_days = load_trading_days(self.store)
+        if trading_days:
+            idx_df, dropped = filter_non_trading_days(idx_df, trading_days)
+            if dropped:
+                logger.warning(
+                    f"[巡检] 剔除伪交易日 {[str(d) for d in dropped]}，不参与闸门判定")
+            if not idx_df.empty:
+                # 锚定到过滤后的真实最新交易日，避免伪 bar 冒充"最新交易日"
+                latest = idx_df["trade_date"].max()
         states = classify_market_state(idx_df)
         self._market_states_map = states   # 供市场闸门条件统计复用（2026-10-23 前向验证）
         return latest, states.get(latest, "未知")
@@ -534,6 +613,8 @@ class DailyScanner:
             "state": today_state,
             "mode": s.market_filter_mode if getattr(s, "market_filter", False) else "off",
             "gate_open": (today_state == "上涨") or not getattr(s, "market_filter", False),
+            # P1-4：账本自身闸门档位（off=无闸门影子，gate_open 仅表示市场状态口径）
+            "ledger_gate": getattr(self.book, "gate", "follow"),
             "on": None, "off": None,
         }
         try:
@@ -825,7 +906,11 @@ class DailyScanner:
             self._write_heatmap_snapshot(hm_quotes, name_map, sector_map)
 
         # 市场参考信号（修复A：reduce=非上涨段仓位减半；block=禁止）
-        if market_state != "上涨" and s.market_filter:
+        # P1-4：无闸门影子账本单独记日志（闸门恒 off，不看市场状态）
+        if getattr(self.book, "gate", "follow") == "off":
+            logger.info(f"[巡检] [{self._state_label}] 闸门恒 off（无闸门对照），"
+                        f"当日市场状态 {market_state} 不参与开仓判定")
+        elif market_state != "上涨" and s.market_filter:
             if s.market_filter_mode == "block":
                 logger.info("[巡检] 市场过滤(block)：非上涨段，不开新仓")
             else:
@@ -842,19 +927,15 @@ class DailyScanner:
         total_asset = asset.get("total_asset", 0)
         cash = asset.get("cash", 0)
 
-        block_mode = s.market_filter and market_state != "上涨" and s.market_filter_mode == "block"
-        reduce_scale = 0.5 if (s.market_filter and market_state != "上涨"
-                               and s.market_filter_mode == "reduce") else 1.0
-        # P6（2026-09-27）：情绪退潮日叠加禁开仓（等同 block，覆盖 reduce）
-        if sentiment_ebb:
-            block_mode = True
-            reduce_scale = 0.0
+        # 市场闸门 + P6 情绪退潮叠加（P1-4：gate=off 的账本恒 entry_scale=1.0）
+        block_mode, entry_scale = _gate_scale(
+            self.book, s, market_state, sentiment_ebb)
         held = {p.ts_code for p in self.broker.query_positions()}
         # 需求1（第八轮）：资金守卫与 top-N 筛选配置
         # isinstance 守卫：MagicMock settings（测试）/异常配置 → 不启用
         cg = getattr(self.settings, "capital_guard", None)
         cg_enabled = isinstance(cg, CapitalGuardConfig) and cg.enabled
-        budget = r.max_single_position * total_asset * reduce_scale   # 常规单笔投入
+        budget = r.max_single_position * total_asset * entry_scale   # 常规单笔投入
         guard_skipped = False
         topn_used, topn_skipped = 0, 0
 
@@ -905,7 +986,7 @@ class DailyScanner:
                 for score, idx, sig, last_bar in candidates:
                     # 修复E：执行价一律用最新交易日收盘
                     price = float(last_bar["close"])
-                    invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * reduce_scale
+                    invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * entry_scale
                     volume = int(invest / price / 100) * 100
                     if volume < 100:
                         continue
@@ -954,7 +1035,7 @@ class DailyScanner:
             latest=latest,
             market_state=market_state,
             signals=len(signals),
-            entry_scale=0.0 if block_mode else reduce_scale,
+            entry_scale=entry_scale,
             executed=executed,
             rejected=rejected,
             executed_stops=executed_stops,
@@ -1008,6 +1089,17 @@ class DailyScanner:
         # 需求5（第十轮）：双层简报——AI 成功用 AI 版，失败/未配置自动回退规则版
         summary["brief"] = (summary.get("ai_summary")
                             or summary.pop("brief_rule", "") or "")
+        if self.book.is_main:
+            # ---- P0-3 评审自动阻断（2026-11-14）：只告警 + 标记建议冻结新开仓 ----
+            # 边界：auto_block 不接收 broker、不调买卖接口、不写配置，只落审计文件
+            # outputs/auto_block.json → 系统绝不自动平仓（冻结与否由人工决策）。
+            self._apply_review_block(summary)
+            # ---- P1-4 无闸门影子：日报一行（影子上游先跑，主账本日报引用当日命中数）----
+            _shadow_line = self._shadow_ledger_digest_line(latest)
+            if _shadow_line:
+                summary["shadow_nogate"] = _shadow_line
+                summary["brief"] = (f"{summary.get('brief', '')}\n"
+                                    f"{_shadow_line}").strip()
         stop_orders = [
             {"ts_code": st.ts_code, "stop_price": st.stop_price,
              "volume": st.volume, "triggered": st.triggered}
@@ -1043,9 +1135,12 @@ class DailyScanner:
                 "market_state": market_state,
                 "signals": len(signals),
                 "filter_mode": s.market_filter_mode if s.market_filter else "off",
-                "entry_scale": 0.0 if block_mode else reduce_scale,
+                "entry_scale": entry_scale,
                 "executed": len(executed),
             })
+        # P1-4：无闸门影子当日命中数落盘（供主账本日报引用；影子不写 last_scan）
+        if getattr(self.book, "gate", "follow") == "off":
+            self._write_shadow_ledger_stats(latest, summary)
         return summary
 
     # ===== 工具 =====
@@ -1172,6 +1267,104 @@ class DailyScanner:
         """P0-5（第十一轮）：委托 build_account_snapshot（补全 trades/
         halted_until/psychology_alert，恢复 checklist 8 项闸门）。"""
         return build_account_snapshot(self.broker)
+
+    # ===== P0-3 / P1-4（2026-11-14）：评审阻断 + 无闸门影子日报 =====
+
+    def _apply_review_block(self, summary: dict) -> None:
+        """P0-3：主账本越预检线 → 告警 + 标记"建议冻结新开仓"（绝不自动平仓）。
+
+        统计口径直接取 summary["review"]（review_progress 唯一入口，未到 50 轮
+        前不告警）；阈值读 config/settings.yaml。失败只记日志，绝不影响巡检。
+        """
+        review = summary.get("review") or {}
+        try:
+            from .auto_block import check_and_block
+
+            decision = check_and_block(
+                [{
+                    "name": "main",
+                    "closed_rounds": review.get("closed_rounds", 0),
+                    "win_rate": review.get("win_rate"),
+                }],
+                settings=self.settings,
+                output_path=_ROOT / "outputs" / "auto_block.json",
+                config_path=_ROOT / "config" / "settings.yaml",
+                alerter=getattr(self, "alerter", None),
+            )
+        except Exception as e:  # noqa: BLE001 - 防呆检查失败不得杀死巡检
+            logger.warning(f"[评审阻断] 检查失败（不影响巡检）: {e}")
+            return
+        summary["auto_block"] = decision.as_dict()
+        line = decision.brief_line()
+        if line:
+            summary["brief"] = f"{summary.get('brief', '')}\n{line}".strip()
+
+    def _write_shadow_ledger_stats(self, latest: date, summary: dict) -> None:
+        """P1-4：无闸门影子当日命中数落盘（data/shadow_ledger_stats.json）。
+
+        主账本日报需要一行"无闸门影子：今日命中 N 个信号"，而影子账本 silent
+        不写 last_scan——当日命中数经此独立文件传递（按交易日校验，隔日自动失效，
+        绝不跨日串数据）。写失败只告警。
+        """
+        path = _ROOT / "data" / "shadow_ledger_stats.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        if not isinstance(data, dict) or str(data.get("trade_date")) != str(latest):
+            data = {"trade_date": str(latest), "ledgers": {}}
+        ledgers = data.get("ledgers")
+        if not isinstance(ledgers, dict):
+            ledgers = {}
+        # 容错：summary["executed"] 正常为 list；异常类型（历史数据/测试替身）不炸
+        _exec = summary.get("executed")
+        if isinstance(_exec, (list, tuple, dict)):
+            _exec_n = len(_exec)
+        else:
+            try:
+                _exec_n = int(_exec or 0)
+            except (TypeError, ValueError):
+                _exec_n = 0
+        try:
+            _signals_n = int(summary.get("signals") or 0)
+        except (TypeError, ValueError):
+            _signals_n = 0
+        ledgers[self.book.name] = {
+            "signals": _signals_n,
+            "executed": _exec_n,
+            "entry_scale": summary.get("entry_scale"),
+            "gate": getattr(self.book, "gate", "follow"),
+        }
+        data["ledgers"] = ledgers
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+        except (OSError, TypeError) as e:
+            logger.warning(f"[无闸门影子] 命中数落盘失败: {e}")
+
+    def _shadow_ledger_digest_line(self, latest: date) -> str:
+        """P1-4：日报一行「无闸门影子：今日命中 N 个信号」。
+
+        仅当无闸门影子**当日**已产出统计（gate=off 账本、日期一致）才返回文本；
+        未配置/当日缺失/日期不符 → ""（日报不写假数据）。
+        """
+        path = _ROOT / "data" / "shadow_ledger_stats.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError):
+            return ""
+        if not isinstance(data, dict) or str(data.get("trade_date")) != str(latest):
+            return ""
+        ledgers = data.get("ledgers")
+        if not isinstance(ledgers, dict):
+            return ""
+        for stats in ledgers.values():
+            if isinstance(stats, dict) and stats.get("gate") == "off":
+                hits = int(stats.get("signals") or 0)
+                return (f"无闸门影子：今日命中 {hits} 个信号"
+                        f"（闸门 off，反事实对照）")
+        return ""
 
     def _check_stops_with_alert(
         self, oms: OrderManagementSystem, latest: date
@@ -1518,27 +1711,50 @@ def setup_scheduler(
                       strategy=getattr(settings, "main_strategy", "cherry_claw")),
     )
 
-    # ---- 影子账本（第十二轮）：顺序执行，主先影子后 ----
+    # ---- 影子账本（第十二轮）：顺序执行 ----
     # 影子命中主账本当日取数缓存（同 client 缓存目录），每日新增 API 趋近零。
     # 统计纪律：评审进度以主账本为准，影子仅跨池稳健性对照。
     # 注意：shadow_books 增删在进程重启后生效（scan 内配置热载不重建影子
     # scanner 列表，防止巡检中途换账本集合）。
+    # P1-4（2026-11-14）：shadow_ledgers 块补充"行为"配置（signal_source /
+    # market_gate）——同信号源=与主账本同池同策略；market_gate=off 即无闸门影子。
+    _ledger_cfg = _load_shadow_ledgers()
     shadow_scanners: list[DailyScanner] = []
     for _sb in getattr(settings, "shadow_books", []) or []:
         try:
+            _ov = _ledger_cfg.get(_sb.name) or {}
+            _from_main = str(_ov.get("signal_source", "")).strip().lower() == "main"
+            # 同信号源：池 seed 与策略都对齐主账本（唯一差异只剩闸门）
+            _seed = (getattr(settings.universe, "pool_seed", 42) if _from_main
+                     else _sb.seed)
+            _strategy = (getattr(settings, "main_strategy", "cherry_claw")
+                         if _from_main
+                         else getattr(_sb, "strategy", "cherry_claw"))
+            _gate = ("off" if str(_ov.get("market_gate", "follow")).strip().lower()
+                     == "off" else "follow")
             _s2 = settings.model_copy(deep=True)   # pydantic v2 深拷贝嵌套 model
-            _s2.universe.pool_seed = _sb.seed
+            _s2.universe.pool_seed = _seed
             shadow_scanners.append(DailyScanner(
                 _s2, mode=mode,
-                book=BookSpec(name=_sb.name, pool_seed=_sb.seed, silent=True,
-                              strategy=getattr(_sb, "strategy", "cherry_claw")),
+                book=BookSpec(name=_sb.name, pool_seed=_seed, silent=True,
+                              strategy=_strategy, gate=_gate),
             ))
+            if _gate == "off":
+                logger.info(f"[影子{_sb.name}] 无闸门对照账本：同主账本信号源，"
+                            f"entry_scale 恒 1.0（gate=off）")
         except Exception as e:
             logger.warning(f"[影子{_sb.name}] 构建失败（跳过）: {e}")
 
     def _run_all_scans():
-        """三账本顺序巡检：主先（异常上抛口径不变），影子后（异常隔离）。"""
-        for sc in [scanner, *shadow_scanners]:
+        """账本顺序巡检：影子先（含无闸门对照）→ 主账本后。
+
+        P1-4 顺序调整（2026-11-14）：主账本日报需引用"无闸门影子今日命中 N 个
+        信号"，故影子（含 nogate）先跑并落 data/shadow_ledger_stats.json，主账本
+        随后读取当日数据。异常口径不变：主账本异常照旧上抛（心跳 fail/ERROR 邮件），
+        影子异常只记日志、不影响主账本与其他影子；影子不写 last_scan，主账本幂等
+        判断不受顺序影响。
+        """
+        for sc in [*shadow_scanners, scanner]:
             try:
                 summary = sc.scan(n=n)
                 logger.info(f"[定时任务] [{sc.book.name}] 巡检完成: "

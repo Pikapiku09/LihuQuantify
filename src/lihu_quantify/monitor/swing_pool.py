@@ -13,6 +13,15 @@ Markdown 解析：`##` 标题分节；首个 `##` 之前的正文为「池子总
 `|...|` 表格；`>` 引用（⚠️/决定 → 琥珀色提示框，其余 → 元信息行）；
 `- ` 列表；行内 **加粗**/`代码`。解析失败的内容原样段落呈现，不丢信息。
 
+**陈旧护栏（2026-11-13 新增）**：2026-10-30 / 11-06 / 11-13 连续三封周报渲染的是
+同一份 2026-10-23 快照（根因：NAS DHCP 地址漂移 .203→.204，推送脚本硬编码过期
+地址导致推送静默失败）。本次加固：
+  ① 取本地可用候选中 **mtime 最新**的一份，而非固定优先 POOL_PATH；
+  ② 从池子文件内容提取 **快照日期**（§五 周检记录最近一次周检日 → §一 口径重算日
+     → 文件 mtime 三级回退），写入邮件主题、头部与页脚；
+  ③ 快照日期早于本周一 → 判定 **陈旧**，在头部下方插入红色高亮告警框并在主题加
+     "⚠️快照陈旧"前缀，使"静默发旧内容"不可能再无声发生。
+
 调度：scheduler.setup_scheduler 每周五 21:00（swing_weekly）；手动测试
 python run_scheduler.py --swing-now；本地预览 python -m lihu_quantify.monitor.swing_pool --preview
 """
@@ -21,7 +30,7 @@ from __future__ import annotations
 import html as _html
 import re
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -58,7 +67,7 @@ def _inline(s: str) -> str:
     t = _esc(s)
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
     t = re.sub(r"`([^`]+?)`", r"<code style='background:#f1f5f9;padding:1px 4px;"
-                                r"border-radius:3px;font-size:12px;'>\1</code>", t)
+                                "border-radius:3px;font-size:12px;'>\1</code>", t)
     return t
 
 
@@ -76,6 +85,67 @@ def _cell(s: str) -> str:
         return (f"<td style='{_TD_NUM}'><span style='color:{color};font-weight:600;'>"
                 f"{_inline(t)}</span></td>")
     return f"<td style='{_TD}'>{_inline(t)}</td>"
+
+
+# ===== 池子文件选取与快照日期（2026-11-13 新增：陈旧护栏） =====
+
+def _pick_pool_file(pool_path: Optional[Path] = None) -> Path:
+    """取本地可用候选中 mtime 最新的一份。
+
+    旧逻辑固定优先 POOL_PATH（NAS 推送件），只在其不存在时才回退 DSH 侧源文件——
+    这会让 NAS 上的陈旧推送件长期遮蔽更新的本地件，正是三周旧邮件的放大器。
+    """
+    if pool_path is not None:
+        return pool_path
+    cands = [p for p in _POOL_FALLBACKS if p.exists()]
+    if not cands:
+        return POOL_PATH
+    return max(cands, key=lambda p: p.stat().st_mtime)
+
+
+def _extract_snapshot_date(md: str, path: Path) -> Tuple[date, str]:
+    """从池子文件内容提取「快照日期」= 最近一次周检日期。
+
+    三级回退：§五 周检记录表格首列最大日期 → §一 口径重算日 → 文件 mtime。
+    返回 (日期, 来源说明)。
+    """
+    in_sec = False
+    sec_dates: List[str] = []
+    for raw in md.splitlines():
+        t = raw.strip()
+        if t.startswith("## "):
+            in_sec = "周检记录" in t
+            continue
+        if in_sec and t.startswith("|"):
+            m = re.match(r"^\|\s*\*{0,2}(20\d{2}-\d{2}-\d{2})", t)
+            if m:
+                sec_dates.append(m.group(1))
+    if sec_dates:
+        try:
+            return date.fromisoformat(max(sec_dates)), "周检记录·最近一次"
+        except ValueError:
+            pass
+    m = re.search(r"口径重算\s*·\s*\*{0,2}(20\d{2}-\d{2}-\d{2})\s*收盘", md)
+    if m:
+        try:
+            return date.fromisoformat(m.group(1)), "池内状态·口径重算日"
+        except ValueError:
+            pass
+    try:
+        return date.fromtimestamp(path.stat().st_mtime), "文件修改时间"
+    except OSError:
+        return date.today(), "未知"
+
+
+def _staleness(snap: date, today: date) -> Tuple[int, bool]:
+    """返回 (快照距今天数, 是否陈旧)。
+
+    判定口径：快照早于本周一即视为陈旧（周报每周五发，本周快照才算当期）。
+    周检若在周一补做、锚定上周五收盘，其快照日仍落在本周内 → 不误报。
+    """
+    age = (today - snap).days
+    week_start = today - timedelta(days=today.weekday())
+    return age, snap < week_start
 
 
 # ===== Markdown 解析 =====
@@ -230,7 +300,7 @@ def _weekly_action(sections: List[dict]) -> Tuple[str, int]:
 
 def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
     """生成波段池周报 (subject, html_body)。池子文件缺失时返回提示版（不抛异常）。"""
-    path = pool_path or next((p for p in _POOL_FALLBACKS if p.exists()), POOL_PATH)
+    path = _pick_pool_file(pool_path)
     today = date.today().isoformat()
     if not path.exists():
         return (
@@ -240,13 +310,18 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
             " scripts/_nas_swing_push.py 推送。</p></div>",
         )
     md = path.read_text(encoding="utf-8")
+    snap, snap_src = _extract_snapshot_date(md, path)
+    snap_iso = snap.isoformat()
+    age, stale = _staleness(snap, date.today())
     parsed = _parse_md(md)
     counts = _count_status(parsed["preamble"], parsed["sections"])
     action, n_actions = _weekly_action(parsed["sections"])
     stage = "纸面跟踪" if "暂停实盘" in md else "跟踪中"
     active = counts["建仓中"] + counts["持有"] + counts["减仓中"]
 
-    subject = (f"📈 【波段池周报】{today} {stage} · 池内 {counts['rows']} 只"
+    subject = (f"📈 【波段池周报】{today} 池内快照 {snap_iso}"
+               + (" ⚠️快照陈旧" if stale else "")
+               + f" · {stage} · 池内 {counts['rows']} 只"
                + (f" · 本周 {n_actions} 条动作" if n_actions else ""))
 
     # 头部（与日报同款深色）
@@ -257,6 +332,7 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
         f'<p style="margin:6px 0 0;font-size:13px;color:#94a3b8;">'
         f'{today} · 阶段：<b style="color:#ffffff;">{stage}</b> ｜ 池内 '
         f'<b style="color:#ffffff;">{counts["rows"]}</b> 只（纸面活跃 {active} ｜观察 {counts["观察"]}）'
+        f' ｜ 池子快照 <b style="color:#ffffff;">{snap_iso}</b>（{snap_src}，距今 {age} 天）'
         '</p></div>'
     )
 
@@ -272,6 +348,22 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
                   for b in brief_bits)
         + '</div>'
     )
+
+    # 陈旧护栏（快照早于本周一 → 红色高亮，绝不静默发旧内容）
+    stale_banner = ""
+    if stale:
+        stale_banner = (
+            '<div style="background:#fef2f2;border-left:4px solid #dc2626;'
+            'padding:10px 12px;border-radius:0 6px 6px 0;margin:12px 0;font-size:12.5px;'
+            'color:#991b1b;line-height:1.8;">'
+            f'<p style="margin:2px 0"><b>⚠️ 池子快照陈旧：{snap_iso}（距今 {age} 天，'
+            f'早于本周一）</b></p>'
+            '<p style="margin:2px 0">本邮件内容取自旧版池子文件，请依次检查：'
+            '①本周周检是否执行（池子文件 §五 周检记录）'
+            '②推送是否成功（scripts/swing-weekly.ps1 → NAS data/swing_pool/）'
+            '③NAS 容器 lihu-scheduler 是否读到最新文件。</p>'
+            '</div>'
+        )
 
     # 决策横幅（⚠️/决定 引用 → 琥珀色提示框）
     warn = [q for q in parsed["quotes"] if "⚠️" in q or "决定" in q]
@@ -309,9 +401,14 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
         'border-radius:6px;margin-top:6px;">' + _esc(md) + "</pre></details>"
     )
 
+    try:
+        mtime = date.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        mtime = "未知"
     footer = (
         '<p style="margin:16px 0 0;font-size:12px;color:#9ca3af;'
         'border-top:1px solid #e5e7eb;padding-top:10px;">'
+        f"池子快照 {snap_iso}（来源：{snap_src}）｜文件时间 {mtime}｜"
         "本邮件由 LihuQuantify 系统自动生成（lihu-scheduler · swing_weekly）。"
         "仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。</p>"
     )
@@ -322,7 +419,7 @@ def build_swing_email(pool_path: Optional[Path] = None) -> Tuple[str, str]:
         + header
         + '<div style="padding:4px 20px 16px;background:#f8fafc;'
           'border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;">'
-        + brief + callout + meta + sections_html + details + footer
+        + brief + stale_banner + callout + meta + sections_html + details + footer
         + "</div></div>"
     )
     return subject, body

@@ -11,12 +11,40 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import paramiko
 
-HOST, USER, PORT = "192.168.123.203", "931570981", 22
+# 2026-11-13 修正：该 NAS 的 DHCP 地址漂移过（.204 → .203 → .204）。
+# 硬编码 .203 导致 2026-10-23 之后的每一次波段池推送都发到了空地址，
+# NAS 上的 data/swing_pool/波段池_持仓.md 冻结在 10-23 快照，
+# 周五 21:00 的波段池周报连发三周同一份旧内容。
+# 现状：NAS 已由 DSM 固定为静态 192.168.123.204（ifcfg-eth0: BOOTPROTO=static），
+# 但脚本不能只依赖"写死的 IP"——地址再变就会重演静默失败。
+# 现在按 MAC 反查邻居表解析地址，并对 IP 变化免疫；NAS_HOST 环境变量仍可强制覆盖。
+NAS_MAC = "00-11-32-7B-55-93"          # NAS 网卡 MAC（DSM 静态地址 192.168.123.204）
+DEFAULT_HOST = "192.168.123.204"
+USER, PORT = "931570981", 22
+
+
+def resolve_host() -> str:
+    """NAS 地址解析：环境变量 NAS_HOST → 按 MAC 反查邻居表 → 默认静态地址。"""
+    env = os.environ.get("NAS_HOST")
+    if env:
+        return env
+    mac = NAS_MAC.replace("-", "").replace(":", "").lower()
+    try:
+        out = subprocess.run(["arp", "-a"], capture_output=True, text=True,
+                             timeout=15).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lower().replace("-", "").replace(":", "") == mac:
+                return parts[0]
+    except Exception:
+        pass
+    return DEFAULT_HOST
 REMOTE_DIR = "/volume2/Lihu_Quantify/data/swing_pool"
 REMOTE_OUT = "/volume2/Lihu_Quantify/outputs"
 WORKSPACE = Path(r"E:\Dsh_WorkSapce\Dify_Agents")
@@ -74,7 +102,9 @@ def main() -> None:
         sys.exit(1)
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(HOST, username=USER, password=pwd, port=PORT, timeout=15)
+    host = resolve_host()
+    print(f"NAS 地址解析：{host}（MAC {NAS_MAC} 反查；env NAS_HOST={os.environ.get('NAS_HOST')}）")
+    ssh.connect(host, username=USER, password=pwd, port=PORT, timeout=15)
 
     def run(cmd, timeout=60):
         _, so, se = ssh.exec_command(cmd, timeout=timeout)

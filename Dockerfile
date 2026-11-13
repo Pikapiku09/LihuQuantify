@@ -21,9 +21,15 @@ WORKDIR /app
 # 运行靠 PYTHONPATH=/app/src（入口脚本均有 sys.path 兜底）。
 # constraints.txt 为 NAS 目标机的已知良好版本锁定：目标 CPU 为 Intel Celeron J1900
 # （仅 SSE4.2，无 AVX），duckdb 2.x 的二进制会 SIGILL 崩溃——2026-11-10 部署事故根因。
+#
+# 2026-11-13 修正：NAS 访问 files.pythonhosted.org 会 ReadTimeout（2026-11-13 完整重建
+# 因此失败），改为国内镜像源（清华 → 阿里依次回退），并放宽超时/重试。
 COPY pyproject.toml README.md constraints.txt ./
 RUN python -c "import tomllib; deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; deps += ['fastapi>=0.110.0', 'uvicorn>=0.29.0']; print('\n'.join(deps))" > /tmp/req.txt \
-    && pip install --no-cache-dir -c constraints.txt -r /tmp/req.txt \
+    && (pip install --no-cache-dir --timeout 60 --retries 5 \
+          -i https://pypi.tuna.tsinghua.edu.cn/simple -c constraints.txt -r /tmp/req.txt \
+        || pip install --no-cache-dir --timeout 60 --retries 5 \
+          -i https://mirrors.aliyun.com/pypi/simple -c constraints.txt -r /tmp/req.txt) \
     && rm /tmp/req.txt
 
 # 代码层（data/outputs 不进镜像——通过卷挂载持久化，见 docker-compose.yml）

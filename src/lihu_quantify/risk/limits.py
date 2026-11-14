@@ -12,6 +12,7 @@ from ..config import get_settings
 
 _risk = get_settings().risk
 
-# 单票最大仓位（上限 25%）与单板块最大合计仓位（上限 40%）
+# 单票最大仓位（上限 15%，2026-11-14 由 25% 收紧以统一口径）
+# 与单板块最大合计仓位（上限 40%）
 MAX_SINGLE_POSITION: float = _risk.max_single_position
 MAX_SECTOR_POSITION: float = _risk.max_sector_position

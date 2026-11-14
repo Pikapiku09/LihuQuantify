@@ -91,18 +91,22 @@ class ChecklistGate:
             if p.ts_code == signal.ts_code and p.volume > 0
         )
         pct = (existing_mv + ctx.invest_amount) / account.total_asset
-        approved = pct <= self.MAX_SINGLE_PCT
+        # 2026-11-14：加浮点容差 + 上限文案随配置走。仓位口径统一到 15% 后，
+        # 策略侧严格按上限下单的"顶格"仓位会被 IEEE-754 误判超限
+        # （15000/100000 = 0.15000000000000002 > 0.15），导致回测 0 成交。
+        approved = pct <= self.MAX_SINGLE_PCT + 1e-9
+        _cap_txt = f"{self.MAX_SINGLE_PCT:.0%}"
         if existing_mv > 0:
             value = (f"存量 {existing_mv / account.total_asset:.1%} + "
                      f"本笔 {ctx.invest_amount / account.total_asset:.1%} "
-                     f"= {pct:.1%}（上限25%）")
+                     f"= {pct:.1%}（上限{_cap_txt}）")
         else:
-            value = f"{pct:.1%}（上限25%）"
+            value = f"{pct:.1%}（上限{_cap_txt}）"
         return ChecklistItem(
             name="仓位预算",
             approved=approved,
             value=value,
-            reason="通过" if approved else f"含存量合计 {pct:.1%} 超过 25%",
+            reason="通过" if approved else f"含存量合计 {pct:.1%} 超过 {_cap_txt}",
         )
 
     def _check_sector(

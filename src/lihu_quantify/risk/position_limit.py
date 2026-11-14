@@ -1,7 +1,7 @@
 """仓位与板块集中度限制。
 
 铁律（来自 docs/交易铁律.md）：
-    单票 ≤25%，同板块 ≤40%
+    单票 ≤15%（risk.max_single_position，2026-11-14 由 25% 收紧），同板块 ≤40%
     分散，是对自己无知的承认
     绝不向下补仓
 """
@@ -46,7 +46,11 @@ class PositionLimiter:
             p.market_value for p in account.positions if p.ts_code == ts_code
         )
         single_pct = (existing_mv + invest_amount) / account.total_asset
-        if single_pct > self.max_single:
+        # 2026-11-14：加浮点容差。仓位口径统一为 15% 后，策略侧算出的
+        # 0.15 × 总资产 恰好顶格，但 15000.0 / 100000 在 IEEE-754 下是
+        # 0.15000000000000002 > 0.15 → 所有"顶格"仓位被误拒（回测 0 成交）。
+        # 语义是"占比 ≤ 上限"，边界值必须放行，故比较时留 1e-9 容差。
+        if single_pct > self.max_single + 1e-9:
             return False, f"单票占比 {single_pct:.1%} 超过 {self.max_single:.0%}"
 
         # 板块合计
@@ -59,7 +63,7 @@ class PositionLimiter:
             # 排除本票已计入的部分，避免重复
             sector_existing_excl = sector_existing - existing_mv if sector else 0
             sector_pct = (sector_existing_excl + existing_mv + invest_amount) / account.total_asset
-            if sector_pct > self.max_sector:
+            if sector_pct > self.max_sector + 1e-9:   # 同上：边界值放行
                 return False, f"板块合计 {sector_pct:.1%} 超过 {self.max_sector:.0%}"
 
         return True, "通过"

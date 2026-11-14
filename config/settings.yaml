@@ -37,7 +37,10 @@ universe:
 # 主账本策略（2026-09-26 复盘决策 A）
 # CherryClaw 成本后年化 -5.92%、零成本仍 -3.29%，根因=入场追短期动量与已证 alpha（A股反转）相反；
 # 权重扫描：IR20 权重越高越好（0/100 唯一正收益 +10.25%）。故主账本切 IntradayReversal。
-# 过渡期以单票 15% 上限约束敞口（相对原 25% 降低 40%），1-2 个月后评估。
+# 单票上限 15% 由 risk.max_single_position 单点定义（2026-11-14 口径统一）：
+# 此前 scheduler._build_strategy 对 IntradayReversal 硬编码 min(cfg, 0.15)，
+# 而调度器 budget / invest 两条路径按 0.25 计算 —— 同一配置被解释成两个值。
+# 现统一为 0.15，禁止任何调用方再硬编码。
 main_strategy: "intraday_reversal"     # cherry_claw（旧，已停用）| intraday_reversal
 
 # 策略参数（修复4 网格搜索稳健区域：50只×2年训练段，2026-08-26）
@@ -70,11 +73,15 @@ risk:
     target_vol: 0.35
     window: 20
     min_scale: 0.3
-  max_single_position: 0.25
+  max_single_position: 0.15
   max_sector_position: 0.40
   stop_loss_warn: -0.03
   stop_loss_exec: -0.05
   stop_loss_force: -0.08
+  # 组合层 MDD 硬上限（2026-11-14 从已删除的 scale_in.mdd_limit 迁入）。
+  # 每个交易日无条件评估；触及后只阻断新开仓，绝不自动平仓、绝不自动改配置。
+  # 评估结果写 outputs/mdd_guard.json，首次触发推一条告警。
+  mdd_limit: 0.25
   trailing_profit_pullback: 0.03         # 盈利回撤 3% 离场
   trailing_break_ma: 10                   # 或破 10 日线离场
   max_trades_per_ticker_month: 3
@@ -203,17 +210,14 @@ gate_risk_budget:
   downtrend: 0.4      # 下跌
   unknown: 0.0        # 未知（数据缺失 → 保守不开仓）
 
-# ===================== 第3层：分批建仓（2026-11-14） =====================
-# 用户诉求「回撤是机会」的机制化：同一标的在下跌中分批加仓，让回撤时还有子弹。
-# **默认关闭**；开启后才存在加仓路径。⚠ 与 docs/交易铁律.md 第4条「绝不向下补仓」
-# 直接冲突（加仓按定义发生在持仓浮亏时，OMS 铁律2 必然拒绝）→ 本路径在
-# scheduler._place_scale_in_buy 内独立实现（复刻 OMS 其余前置校验与止损合并规则，
-# 只买不卖），**需人工确认后开启**。
-# 硬约束：组合层 MDD ≥ mdd_limit → 立即停止所有加仓/新开仓（只减不加，不自动平仓），
-# 写 outputs/mdd_guard.json + 告警。
-scale_in:
-  enabled: false
-  max_tranches: 2          # 最多 2 批（首笔 + 1 次加仓）
-  tranche_gap_pct: -5      # 较首笔成本再跌 5% 触发（写正数 5 亦按 -5 处理）
-  tranche_size_ratio: 0.5  # 第二批金额 = 首笔金额 × 0.5
-  mdd_limit: 0.25          # 组合层 MDD 硬上限 25%（写 25 亦按 25% 处理）
+# ===================== 分批建仓：已于 2026-11-14 永久移除 =====================
+# 移除理由（两条独立证据）：
+#   1. 与 docs/交易铁律.md 第4条「绝不向下补仓」直接冲突；
+#   2. 真实交割单实证：27.4% 的买入额（155 笔 / ¥1,391,212）发生在
+#      "持仓浮亏时加仓"，是用户最大的亏损来源。
+# 已物理删除全部代码路径（_load_scale_in / _scale_in_plan / _scale_in_entry /
+# _scale_in_candidate / _place_scale_in_buy / 状态文件读写）。**切勿恢复**。
+#
+# 原先绑在该路径上的「组合层 MDD 25% 硬守卫」已独立出来，改为每个交易日
+# 无条件评估（此前只在 scale_in.enabled 时调用，等于永不生效），阈值见 risk.mdd_limit。
+

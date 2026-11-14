@@ -201,20 +201,21 @@ def test_position_gate_includes_existing_mv():
 
 
 def test_position_gate_first_buy_bounds():
-    """首买（无存量）：25% 通过、26% 拒绝。"""
+    """首买（无存量）：15% 通过、16% 拒绝（2026-11-14 上限由 25% 收紧到 15%）。"""
     from lihu_quantify.risk.checklist import CheckContext, ChecklistGate
     from lihu_quantify.types import AccountSnapshot
 
     gate = ChecklistGate()
     acc = AccountSnapshot(total_asset=100_000.0)
+    # 顶格 15%：15000/100000 在 IEEE-754 下略大于 0.15，检查须留容差放行
     ok = gate._check_position(_pos_signal(), acc,
-                              CheckContext(invest_amount=25_000.0))
+                              CheckContext(invest_amount=15_000.0))
     assert ok.approved is True
     bad = gate._check_position(_pos_signal(), acc,
-                               CheckContext(invest_amount=26_000.0))
+                               CheckContext(invest_amount=16_000.0))
     assert bad.approved is False
-    # 存量 20% 时本笔 5% 恰好达线 → 通过
-    edge = gate._check_position(_pos_signal(), _pos_snapshot(0.20),
+    # 存量 10% 时本笔 5% 恰好达线 → 通过
+    edge = gate._check_position(_pos_signal(), _pos_snapshot(0.10),
                                 CheckContext(invest_amount=5_000.0))
     assert edge.approved is True
 

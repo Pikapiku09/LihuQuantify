@@ -1,16 +1,20 @@
-"""第2+3层回归：nogate_half 半仓影子 + 连续风险预算 + 分批建仓（MDD 25% 硬约束）。
+"""第2层回归：nogate_half 半仓影子 + 连续风险预算 + 组合层 MDD 25% 硬守卫。
 
-对应任务（2026-11-14）：
-    任务一 nogate_half：entry_scale 恒 0.5（不看 market_state），与 main 共用信号源，
-        独立 paper_state_nogate_half.json、silent 不发日报；不与 nogate（恒 1.0）混淆。
-    任务二 gate_risk_budget：连续风险预算（默认 false）；关闭时退回旧三档 0/0.5/1.0。
-    任务三 scale_in：分批建仓（默认 false）+ 组合层 MDD 25% 硬守卫
-        （outputs/mdd_guard.json + 告警；只减不加，绝不自动平仓）。
+演化史（2026-11-14）：
+    本文件原覆盖「连续风险预算 + 分批建仓 + MDD 守卫」三件事。
+    分批建仓（scale_in）已于当日**永久删除**——与 docs/交易铁律.md 第4条
+    「绝不向下补仓」冲突，且真实交割单实证 27.4% 的买入额发生在浮亏加仓。
+    文件名保留（git 历史连续），内容已不再包含该功能。
 
-三条铁律的测试落点：
-    1. 默认关闭 → 闸门逐组合对照旧实现、summary 无新键、不新增任何落盘文件；
-    2. 绝不自动平仓 → 分批加仓/MDD 守卫路径无 sell 调用（结构断言 + 端到端卖出数=0）；
-    3. market_filter_mode=block 语义不变 → 预算关闭时 block=0.0 且不买入。
+    **行为变更**：MDD 守卫原先只在 scale_in.enabled 时调用，而该开关从未开启
+    → 守卫实际从未运行。现改为每个交易日无条件评估，阈值读 risk.mdd_limit（25%），
+    结果写 outputs/mdd_guard.json。因此 summary 必然出现 mdd_guard 键（有意变更）。
+
+仍然保留的铁律落点：
+    1. 闸门默认语义 → 预算关闭时 _gate_scale 逐组合对照旧实现（block/reduce/off）；
+    2. 绝不自动平仓 → MDD 守卫路径无 sell 调用（结构断言 + 端到端卖出数=0）；
+    3. market_filter_mode=block 语义不变 → 预算关闭时 block=0.0 且不买入；
+    4. 影子账本隔离 → 各影子独立 state 文件，不混入主日报。
 """
 
 from __future__ import annotations
@@ -37,10 +41,8 @@ from lihu_quantify.monitor.scheduler import (
     _drawdown_metrics,
     _gate_scale,
     _load_risk_budget,
-    _load_scale_in,
     _merge_equity_point,
     _risk_budget_coef,
-    _scale_in_plan,
 )
 from lihu_quantify.types import Signal
 
@@ -184,14 +186,14 @@ def _wire_scan(monkeypatch, s, signals_by_code: dict, closes: dict,
 
 
 def _run_scan(s, *, market_state: str = "上涨", market_filter: bool = False,
-              mode: str = "block", budget=None, scale_in_cfg=None,
+              mode: str = "block", budget=None,
               latest: date = LATEST):
     return s._scan_impl(
         latest, market_state, n=50, days=120,
         s=StrategyConfig(market_filter=market_filter,
                          market_filter_mode=mode),
         r=RiskConfig(), prev_total_asset=None,
-        risk_budget=budget, scale_in_cfg=scale_in_cfg,
+        risk_budget=budget,
     )
 
 
@@ -218,7 +220,10 @@ def test_repo_config_all_new_switches_off_and_block_unchanged():
     """线上 settings.yaml：新开关全 false；market_filter_mode=block 语义不动。"""
     raw = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
     assert raw["gate_risk_budget"]["enabled"] is False
-    assert raw["scale_in"]["enabled"] is False
+    # 分批建仓已于 2026-11-14 永久删除：配置块不得复活
+    assert "scale_in" not in raw, "scale_in 配置块应已删除，切勿恢复"
+    # MDD 守卫阈值已从 scale_in 迁入 risk 段（守卫本身改为无条件评估）
+    assert raw["risk"]["mdd_limit"] == 0.25
     assert raw["strategy"]["market_filter_mode"] == "block"   # 既定决策，不得改动
     # 影子账本：nogate（恒 1.0）与 nogate_half（恒 0.5）同时存在且语义区分
     ledgers = {x["name"]: x for x in raw["shadow_ledgers"]}
@@ -249,7 +254,12 @@ def test_gate_scale_identical_to_legacy_when_budget_disabled(
 
 def test_default_off_scan_writes_no_new_files_and_no_new_summary_keys(
         tmp_path, monkeypatch):
-    """默认关闭全链路：成交口径不变、summary 无新键、不落 equity_curve/mdd_guard/scale_in_state。"""
+    """默认关闭全链路：成交口径不变。
+
+    2026-11-14 行为变更：MDD 守卫改为每个交易日无条件评估（原先只在
+    scale_in.enabled 时调用 → 实际从未运行），因此 summary 必然多出
+    mdd_guard 键、并落盘 equity_curve/mdd_guard。除此之外不得有其它新键。
+    """
     s, broker, _ = _make_scanner(tmp_path, monkeypatch, init=1_000_000.0)
     _wire_scan(monkeypatch, s, {"600000.SH": _sig("600000.SH", 10.0)},
                {"600000.SH": 10.0})
@@ -257,15 +267,19 @@ def test_default_off_scan_writes_no_new_files_and_no_new_summary_keys(
     summary = _run_scan(s)   # 市场过滤关闭 → 旧三档 entry_scale=1.0
 
     assert summary["entry_scale"] == 1.0
-    for key in ("risk_budget", "scale_in", "mdd_guard"):
-        assert key not in summary, f"开关关闭时 summary 不得新增键 {key}"
+    # 连续风险预算默认关闭 → 不得有 risk_budget 键
+    assert "risk_budget" not in summary
+    # 分批建仓已删除 → 永远不得出现 scale_in 键
+    assert "scale_in" not in summary
+    # MDD 守卫无条件评估 → 必须有键（这是有意变更，不是回归）
+    assert summary["mdd_guard"]["triggered"] is False
     # 旧公式逐位一致：invest = 0.10 × 总资产 × 1.0 → 100000/10 = 10000 股
     buys = _buys(broker)
     assert len(buys) == 1 and buys[0]["volume"] == 10000
     assert buys[0]["price"] == 10.0
-    # 新功能落盘文件一个都不能有
-    assert not (tmp_path / "outputs" / "mdd_guard.json").exists()
-    assert not (tmp_path / "data" / "equity_curve.json").exists()
+    # MDD 守卫自 2026-11-14 起无条件落盘（有意变更）；scale_in 状态文件已彻底不存在
+    assert (tmp_path / "outputs" / "mdd_guard.json").exists()
+    assert (tmp_path / "data" / "equity_curve.json").exists()
     assert not (tmp_path / "data" / "scale_in_state.json").exists()
     # 绝不自动平仓：本轮无卖出
     assert _sells(broker) == []
@@ -536,123 +550,12 @@ def test_scan_impl_applies_continuous_budget(tmp_path, monkeypatch):
 # 4. 任务三：分批建仓 + MDD 25% 硬守卫
 # ============================================================
 
-def test_scale_in_plan_pure_function():
-    """触发条件：较首笔成本再跌 gap% 才加仓；批数/开关/比例全部生效。"""
-    st = {"first_cost": 10.0, "first_notional": 10_000.0, "tranches": 1}
-    assert _scale_in_plan(9.6, 10.0, 1000, st, SCALE_IN_ON) is None      # 跌 4%，不触发
-    plan = _scale_in_plan(9.5, 10.0, 1000, st, SCALE_IN_ON)              # 恰好 -5%
-    assert plan is not None and plan["tranche"] == 2
-    assert plan["notional"] == 5000.0                                    # 首笔 10000 × 0.5
-    assert _scale_in_plan(9.5, 10.0, 1000, st, SCALE_IN_OFF) is None      # 开关关闭
-    assert _scale_in_plan(9.5, 10.0, 1000, {**st, "tranches": 2},
-                          SCALE_IN_ON) is None                           # 已满 2 批
-    assert _scale_in_plan(9.5, 10.0, 1000, {"first_cost": 10.0, "tranches": 1},
-                          SCALE_IN_ON)["notional"] == 5000.0             # 存量仓按 cost×vol 兜底
-    # 正/负写法归一（配置层）：-5 ↔ 5 都表示"跌 5%"
-    assert _load_scale_in()["tranche_gap_pct"] == -5.0
-
-
-def test_load_scale_in_normalizes(tmp_path):
-    p = tmp_path / "settings.yaml"
-    p.write_text(
-        "scale_in:\n"
-        "  enabled: true\n"
-        "  max_tranches: 0\n"        # 下限裁剪 → 1
-        "  tranche_gap_pct: 5\n"     # 正数写法 → -5
-        "  tranche_size_ratio: 1.5\n"  # 上限裁剪 → 1.0
-        "  mdd_limit: 25\n",         # 百分数 → 0.25
-        encoding="utf-8")
-    out = _load_scale_in(p)
-    assert out["enabled"] is True
-    assert out["max_tranches"] == 1
-    assert out["tranche_gap_pct"] == -5.0
-    assert out["tranche_size_ratio"] == 1.0
-    assert out["mdd_limit"] == 0.25
-    # 缺块 → 默认关闭
-    default = _load_scale_in(tmp_path / "missing.yaml")
-    assert default["enabled"] is False
-    assert default["max_tranches"] == 2 and default["mdd_limit"] == 0.25
-
-
 def _seed_position(broker, code: str, price: float, volume: int):
     """在"前一交易日"建仓（成本=price），返回 (cost, notional)。"""
     broker.on_new_day(date(2026, 8, 27))
     res = broker.buy(code, price, volume)
     assert res.success
     return price, price * volume
-
-
-def test_scale_in_adds_on_dip_end_to_end(tmp_path, monkeypatch):
-    """端到端：持仓跌 6% + 当日信号 → 按 0.5 比例加仓，止损合并登记，无卖出。"""
-    s, broker, made_oms = _make_scanner(tmp_path, monkeypatch, init=1_000_000.0)
-    _seed_position(broker, "600000.SH", 10.0, 5000)   # 首笔 50,000（存量仓，1 批）
-    _wire_scan(monkeypatch, s,
-               {"600000.SH": _sig("600000.SH", 9.4)},
-               {"600000.SH": 9.4}, ma10s={"600000.SH": 9.7})
-
-    summary = _run_scan(s, scale_in_cfg=SCALE_IN_ON)
-
-    assert len(_buys(broker)) == 2, "应发生一次加仓买入"
-    add = _buys(broker)[-1]
-    assert add["ts_code"] == "600000.SH" and add["price"] == 9.4
-    assert add["volume"] == 2600, "本批金额 50000×0.5=25000 / 9.4 → 2600 股"
-    # 状态落盘：批数=2、首笔成本保留
-    st = json.loads((tmp_path / "data" / "scale_in_state.json").read_text(encoding="utf-8"))
-    assert st["positions"]["600000.SH"]["tranches"] == 2
-    assert st["positions"]["600000.SH"]["first_cost"] == 10.0
-    # summary 与报告口径
-    assert summary["scale_in"]["adds"][0]["tranche"] == 2
-    assert summary["executed"][-1]["scale_in"] is True
-    # 止损合并登记（旧仓 9.2 + 新仓 8.46 → 取更保守价、累计股数）
-    stop = made_oms[-1].stop_registry["600000.SH"]
-    assert stop.volume == 7600
-    assert stop.stop_price == pytest.approx(8.46)
-    # 铁律：绝不自动平仓
-    assert _sells(broker) == []
-    assert summary["sells_today"] == []
-
-
-def test_scale_in_skips_when_no_dip_or_tranches_exhausted(tmp_path, monkeypatch):
-    """未达 -5% 或批数已满 → 不加仓；且不写 scale_in_state（无成交无状态变更）。"""
-    # 情形1：仅跌 2%（未触发）
-    s, broker, _ = _make_scanner(tmp_path, monkeypatch, init=1_000_000.0)
-    _seed_position(broker, "600000.SH", 10.0, 5000)
-    _wire_scan(monkeypatch, s, {"600000.SH": _sig("600000.SH", 9.8)},
-               {"600000.SH": 9.8})
-    _run_scan(s, scale_in_cfg=SCALE_IN_ON)
-    assert len(_buys(broker)) == 1, "未达触发线不得加仓"
-
-    # 情形2：已达 2 批（状态文件预置）
-    data = tmp_path / "data"
-    data.mkdir(parents=True, exist_ok=True)
-    (data / "scale_in_state.json").write_text(json.dumps({
-        "positions": {"600000.SH": {"first_cost": 10.0,
-                                    "first_notional": 50000.0,
-                                    "tranches": 2}}}), encoding="utf-8")
-    s2, broker2, _ = _make_scanner(tmp_path, monkeypatch, init=1_000_000.0)
-    _seed_position(broker2, "600000.SH", 10.0, 5000)
-    _wire_scan(monkeypatch, s2, {"600000.SH": _sig("600000.SH", 9.0)},
-               {"600000.SH": 9.0})
-    _run_scan(s2, scale_in_cfg=SCALE_IN_ON)
-    assert len(_buys(broker2)) == 1, "批数已满不得再加仓"
-
-
-def test_scale_in_respects_single_position_cap(tmp_path, monkeypatch):
-    """加仓不得突破单票 25% 上限：已被放到 24% 的持仓，加仓额度被裁剪到剩余空间内。"""
-    s, broker, _ = _make_scanner(tmp_path, monkeypatch, init=1_000_000.0)
-    _seed_position(broker, "600000.SH", 10.0, 24000)   # 240,000 = 24%
-    _wire_scan(monkeypatch, s, {"600000.SH": _sig("600000.SH", 9.4)},
-               {"600000.SH": 9.4}, ma10s={"600000.SH": 9.7})
-
-    _run_scan(s, scale_in_cfg=SCALE_IN_ON)
-
-    pos = broker.positions["600000.SH"]
-    total_after = broker.query_asset()["total_asset"]
-    weight = pos.volume * 9.4 / total_after
-    assert weight <= 0.25 + 1e-9, f"加仓后单票权重 {weight:.2%} 超过 25%"
-    assert pos.volume > 24000, "剩余空间内应仍然加仓（不是一刀切跳过）"
-    # 若未裁剪：50% × 24000×10 = 120,000 / 9.4 → 12700 股；裁剪后明显更少
-    assert pos.volume - 24000 < 12700
 
 
 @pytest.mark.parametrize("total_asset,expected", [
@@ -667,7 +570,7 @@ def test_mdd_guard_thresholds(tmp_path, monkeypatch, total_asset, expected):
                {"600000.SH": 10.0})
     _wire_curve(tmp_path, [("2026-08-20", 100_000.0)])
 
-    summary = _run_scan(s, scale_in_cfg=SCALE_IN_ON)
+    summary = _run_scan(s)
 
     payload = json.loads((tmp_path / "outputs" / "mdd_guard.json").read_text(
         encoding="utf-8"))
@@ -695,7 +598,7 @@ def test_mdd_guard_seeds_from_init_capital(tmp_path, monkeypatch):
                {"600000.SZ": 10.0, "600000.SH": 6.0})
     n_buys_before = len(_buys(broker))
 
-    summary = _run_scan(s, scale_in_cfg=SCALE_IN_ON)
+    summary = _run_scan(s)
 
     payload = json.loads((tmp_path / "outputs" / "mdd_guard.json").read_text(
         encoding="utf-8"))
@@ -727,7 +630,7 @@ def test_mdd_guard_exact_25_percent_and_no_auto_close(tmp_path, monkeypatch):
                {"600000.SZ": 10.0, "600000.SH": 10.0})
     _wire_curve(tmp_path, [("2026-08-20", 100_000.0)])
 
-    summary = _run_scan(s, scale_in_cfg=SCALE_IN_ON)
+    summary = _run_scan(s)
 
     payload = json.loads((tmp_path / "outputs" / "mdd_guard.json").read_text(
         encoding="utf-8"))
@@ -751,8 +654,8 @@ def test_mdd_guard_exact_25_percent_and_no_auto_close(tmp_path, monkeypatch):
     curve = json.loads((tmp_path / "data" / "equity_curve.json").read_text(encoding="utf-8"))
     assert len(curve["points"]) == 2
     assert curve["points"][-1] == {"date": str(LATEST), "total_asset": broker.query_asset()["total_asset"]}
-    # summary 同时登记
-    assert summary["scale_in"]["adds"] == []
+    # summary 同时登记 MDD 守卫状态（scale_in 键已随功能一并删除）
+    assert summary["mdd_guard"]["triggered"] is True
 
 
 def test_mdd_guard_alert_once_per_trigger_state(tmp_path, monkeypatch):
@@ -763,8 +666,7 @@ def test_mdd_guard_alert_once_per_trigger_state(tmp_path, monkeypatch):
     _wire_curve(tmp_path, [("2026-08-20", 100_000.0)])
 
     for _ in range(2):
-        _run_scan(s, market_state="下跌", market_filter=True, mode="block",
-                  scale_in_cfg=SCALE_IN_ON)
+        _run_scan(s, market_state="下跌", market_filter=True, mode="block")
 
     alerts = [a for a in s.alerter.history if "MDD 守卫" in a["title"]]
     assert len(alerts) == 1, f"重复告警 {len(alerts)} 次"
@@ -794,38 +696,3 @@ def test_drawdown_helpers_exact():
 # ============================================================
 # 5. 结构边界：只买不卖 / 默认关闭时无副作用
 # ============================================================
-
-def test_scale_in_and_guard_never_sell():
-    """结构断言：分批建仓/MDD 守卫全路径无卖出调用，且 policy 明确不自动平仓。"""
-    for fn in (DailyScanner._place_scale_in_buy, DailyScanner._scale_in_candidate,
-               DailyScanner._mdd_guard):
-        src = inspect.getsource(fn)
-        for forbidden in (".sell(", "broker.sell", "auto_close"):
-            assert forbidden not in src, f"{fn.__name__} 不得出现 {forbidden}"
-    src = inspect.getsource(sched_mod._scale_in_plan)
-    assert ".sell(" not in src
-    assert MDD_GUARD_POLICY["auto_close_position"] is False
-    assert MDD_GUARD_POLICY["auto_reduce_position"] is False
-    assert MDD_GUARD_POLICY["auto_modify_config"] is False
-
-
-def test_scan_impl_off_path_does_not_read_scale_in_files(tmp_path, monkeypatch):
-    """关闭时连状态文件都不读（预置脏状态也不影响成交口径）。"""
-    data = tmp_path / "data"
-    data.mkdir(parents=True, exist_ok=True)
-    (data / "scale_in_state.json").write_text(json.dumps({
-        "positions": {"600000.SH": {"first_cost": 999.0, "first_notional": 1e9,
-                                    "tranches": 1}}}), encoding="utf-8")
-    (data / "equity_curve.json").write_text(json.dumps({
-        "points": [{"date": "2026-08-20", "total_asset": 100_000.0}]}),
-        encoding="utf-8")
-
-    s, broker, _ = _make_scanner(tmp_path, monkeypatch, init=50_000.0)
-    _wire_scan(monkeypatch, s, {"600000.SH": _sig("600000.SH", 10.0)},
-               {"600000.SH": 10.0})
-
-    summary = _run_scan(s)   # 默认关闭：即便曲线显示 -50%，也不得触发守卫
-
-    assert len(_buys(broker)) == 1
-    assert "mdd_guard" not in summary
-    assert not (tmp_path / "outputs" / "mdd_guard.json").exists()

@@ -197,7 +197,7 @@ class _StubBuyStrategy:
     stateless = True
     name = "stub"
 
-    def __init__(self, pct=0.25, signal_dates=None):
+    def __init__(self, pct=0.15, signal_dates=None):
         self.pct = pct
         self.signal_dates = signal_dates
 
@@ -247,7 +247,7 @@ def test_p14_cash_shrink_to_lots_no_overdraft():
     df["open"] = opens
     df["high"] = [o + 0.3 for o in opens]
     df["low"] = [o - 0.3 for o in opens]
-    engine = EventDrivenEngine(strategy=_StubBuyStrategy(pct=0.25,
+    engine = EventDrivenEngine(strategy=_StubBuyStrategy(pct=0.15,
                                                          signal_dates={signal_date}))
     result = engine.run({"888888.SH": df}, init_capital=100_000)
     buys = [t for t in result.trades if t.side == "buy"]
@@ -260,13 +260,14 @@ def test_p14_cash_shrink_to_lots_no_overdraft():
 
 
 def test_p14_no_overdraft_multi_same_day():
-    """多只同日撮合 → 消费顺序缩量，整体不透支（5 只 ×25% > 现金）。"""
+    """多只同日撮合 → 消费顺序缩量，整体不透支（7 只 ×15% > 现金）。"""
     from lihu_quantify.backtest.engine import EventDrivenEngine
 
     signal_date = date(2026, 1, 1) + timedelta(days=37)
-    data = {f"60100{k}.SH": _df(f"60100{k}.SH") for k in range(1, 6)}
+    # 7 × 15% = 105% > 100%：总需求超出现金，必须触发缩量
+    data = {f"60100{k}.SH": _df(f"60100{k}.SH") for k in range(1, 8)}
     engine = EventDrivenEngine(
-        strategy=_StubBuyStrategy(pct=0.25, signal_dates={signal_date}))
+        strategy=_StubBuyStrategy(pct=0.15, signal_dates={signal_date}))
     result = engine.run(data, init_capital=100_000)
     assert result.portfolio.cash >= -1e-9, "买入不得透支现金"
     assert result.portfolio.total_asset >= 0
@@ -281,7 +282,7 @@ def test_p14_cash_only_half_lot_rejected():
     signal_date = date(2026, 1, 1) + timedelta(days=37)
     df = _df("777777.SH", closes=[60.0] * 40)   # 一股 60 元，1 手 = 6000 元
     engine = EventDrivenEngine(
-        strategy=_StubBuyStrategy(pct=0.25, signal_dates={signal_date}))
+        strategy=_StubBuyStrategy(pct=0.12, signal_dates={signal_date}))
     result = engine.run({"777777.SH": df}, init_capital=5000)
     buys = [t for t in result.trades if t.side == "buy"]
     assert buys == [], "现金不足 1 手应拒单"

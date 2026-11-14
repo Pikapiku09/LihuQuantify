@@ -64,11 +64,11 @@ def test_checklist_all_pass():
     signal = Signal(
         kind="buy", ts_code="600519.SH", suggested_price=1800,
         stop_loss=1656, take_profit=[1890, 1980, 2070, 2160],
-        suggested_position_pct=0.20, trade_date=date(2026, 8, 19),
+        suggested_position_pct=0.12, trade_date=date(2026, 8, 19),
     )
     ctx = CheckContext(
         current_price=1800, ma10=1790, sector="白酒",
-        invest_amount=20000, fundamentals={"logic": "高端白酒回暖"},
+        invest_amount=12000, fundamentals={"logic": "高端白酒回暖"},
     )
     result = ChecklistGate().check(signal, account, ctx)
     assert result.approved, f"应全部通过，拒绝项：{[r.name for r in result.rejected_items()]}"
@@ -205,12 +205,12 @@ def test_stop_loss_calc_price():
 
 def test_position_limiter_single_reject():
     limiter = PositionLimiter()
-    # 总资产 10万，已持 2万，再加 1万 → 单票 30% > 25%
+    # 总资产 10万，已持市值 2万，再加 1万 → 单票 30% > 15% 上限（2026-11-14 由 25% 收紧）
     positions = [Position(ts_code="600519.SH", volume=100, cost=180, current_price=200, sector="白酒")]
     account = AccountSnapshot(total_asset=100000, cash=80000, positions=positions)
     ok, reason = limiter.can_add("600519.SH", 10000, account, sector="白酒")
     assert not ok
-    assert "25%" in reason
+    assert "15%" in reason
 
 
 def test_position_limiter_sector_reject():
@@ -226,8 +226,14 @@ def test_position_limiter_sector_reject():
 def test_position_limiter_pass():
     limiter = PositionLimiter()
     account = AccountSnapshot(total_asset=100000, cash=100000, positions=[])
-    ok, reason = limiter.can_add("600519.SH", 20000, account, sector="白酒")
+    # 12% < 15% 单票上限（2026-11-14 由 25% 收紧）
+    ok, reason = limiter.can_add("600519.SH", 12000, account, sector="白酒")
     assert ok, reason
+    # 边界回归：恰好顶格 15% 必须放行。
+    # 15000/100000 在 IEEE-754 下 = 0.15000000000000002，此前无容差比较会把
+    # 所有"顶格"仓位误拒（曾导致回测 0 成交），见 position_limit.can_add 注释。
+    ok_edge, reason_edge = limiter.can_add("600519.SH", 15000, account, sector="白酒")
+    assert ok_edge, f"顶格 15% 应放行，实际：{reason_edge}"
 
 
 def test_position_limiter_no_averaging_down():

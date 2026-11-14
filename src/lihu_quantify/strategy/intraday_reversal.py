@@ -17,7 +17,7 @@
 
 持有周期：与门禁一致按 20 日兑现（目标/止损/移动止盈由风控层执行）。
 
-铁律对齐：止损=成本-8% 或破10日线（先到先走）；单票仓位 ≤25%。
+铁律对齐：止损=成本-8% 或破10日线（先到先走）；单票仓位 ≤ risk.max_single_position（默认 15%）。
 """
 
 from __future__ import annotations
@@ -25,11 +25,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ..config import get_settings
 from ..data import adjustment  # noqa: F401  (保持包引用一致性)
 from ..indicators.standard import add_all_standard
 from ..risk.stop_loss import StopLossManager
 from ..types import Signal
 from .base import StrategyBase
+
+# 2026-11-14 口径统一：单票仓位上限默认值不再硬编码 0.25，改为跟随
+# risk.max_single_position（与 scheduler budget/invest、risk/position_limit、
+# risk/checklist 共用同一来源）。import 时解析，运行期改配置需重启生效。
+_DEFAULT_MAX_POSITION_PCT: float = get_settings().risk.max_single_position
 
 
 class IntradayReversal(StrategyBase):
@@ -47,7 +53,7 @@ class IntradayReversal(StrategyBase):
         lookback: int = 20,               # 日内收益累计窗口
         entry_pct: float = 0.20,          # 尾部比例：取因子最高的 20% 分位（≥0.80）入场
         hist_window: int = 250,           # 分位参考的历史窗口
-        max_position_pct: float = 0.25,
+        max_position_pct: float = _DEFAULT_MAX_POSITION_PCT,   # 跟随 risk.max_single_position
         stop_loss_force_pct: float = -0.08,
         trend_filter: bool = False,      # CC-Reversal v2（2026-09-27）：MA20 趋势过滤
         **kwargs,

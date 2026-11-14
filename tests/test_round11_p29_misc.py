@@ -45,7 +45,7 @@ def test_p29_limits_constants_read_settings(tmp_path, monkeypatch):
     from lihu_quantify.risk.limits import MAX_SECTOR_POSITION, MAX_SINGLE_POSITION
 
     st = get_settings()
-    assert MAX_SINGLE_POSITION == st.risk.max_single_position == 0.25
+    assert MAX_SINGLE_POSITION == st.risk.max_single_position == 0.15
     assert MAX_SECTOR_POSITION == st.risk.max_sector_position == 0.40
     # checklist / position_limit 引用同一常量来源
     from lihu_quantify.risk.checklist import ChecklistGate

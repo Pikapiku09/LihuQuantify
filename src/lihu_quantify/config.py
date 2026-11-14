@@ -100,13 +100,19 @@ class VolTargetConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
-    max_single_position: float = 0.25
+    # 2026-11-14 口径统一：此前 scheduler._build_strategy 对 IntradayReversal 硬编码
+    # min(cfg, 0.15)，而调度器 budget/invest 两处按 0.25 计算 —— 同一配置被解释成
+    # 两个不同值。现将 15% 收敛为唯一定义，禁止任何调用方再硬编码。
+    max_single_position: float = 0.15
     vol_target: VolTargetConfig = VolTargetConfig()   # P4（2026-09-26）主账本默认启用
     sentiment_filter: SentimentFilterConfig = SentimentFilterConfig()   # P6（2026-09-27）
     max_sector_position: float = 0.40
     stop_loss_warn: float = -0.03
     stop_loss_exec: float = -0.05
     stop_loss_force: float = -0.08
+    # 组合层 MDD 硬上限（2026-11-14 从已删除的 scale_in.mdd_limit 迁入）。
+    # 触及后只阻断新开仓，绝不自动平仓、绝不自动改配置。
+    mdd_limit: float = 0.25
     trailing_profit_pullback: float = 0.03
     trailing_break_ma: int = 10
     max_trades_per_ticker_month: int = 3

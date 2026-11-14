@@ -4,7 +4,8 @@
     三层过滤：MA5 上穿 MA10 金叉 + 量比>1.0 + 收红；实体占比≥40%；
               收盘贴近 MA5；MA20 斜率向上；金叉新鲜度≤7天
     前置硬过滤：排除 688/300/301/ST/上市不足60日/近20日日均成交额<1亿
-    候选硬约束：每只候选必须给出建议仓位（单票≤25%）与止损位（成本-8%或破10日线）
+    候选硬约束：每只候选必须给出建议仓位（单票 ≤ risk.max_single_position，默认 15%）
+                与止损位（成本-8%或破10日线）
 """
 
 from __future__ import annotations
@@ -12,10 +13,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ..config import get_settings
 from ..indicators.standard import add_all_standard
 from ..risk.stop_loss import StopLossManager
 from ..types import Signal
 from .base import StrategyBase
+
+# 2026-11-14 口径统一：单票仓位上限的默认值不再硬编码 0.25，改为跟随
+# risk.max_single_position（与 scheduler 的 budget/invest、risk/position_limit、
+# risk/checklist 共用同一来源）。与 risk/limits.py 同一模式：import 时解析，
+# 运行期改配置需重启进程生效。
+_DEFAULT_MAX_POSITION_PCT: float = get_settings().risk.max_single_position
 
 
 class CherryClaw(StrategyBase):
@@ -36,7 +44,7 @@ class CherryClaw(StrategyBase):
         volume_ratio_threshold: float = 1.0,
         entity_ratio_threshold: float = 0.40,
         close_to_ma5_max_dev: float = 0.015,
-        max_position_pct: float = 0.25,
+        max_position_pct: float = _DEFAULT_MAX_POSITION_PCT,   # 跟随 risk.max_single_position
         stop_loss_force_pct: float = -0.08,
         **kwargs,
     ):

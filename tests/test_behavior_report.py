@@ -156,10 +156,27 @@ def test_render_behavior_flags_stale_cache():
 # scheduler 侧：缓存读取开关
 # ============================================================
 
-def test_load_behavior_audit_disabled_by_default():
-    """线上 settings.yaml 默认关闭 → 返回 None，日报整节省略（零行为变化）。"""
-    from lihu_quantify.monitor.scheduler import _load_behavior_audit
-    assert _load_behavior_audit() is None
+def test_load_behavior_audit_disabled_returns_none(monkeypatch):
+    """enabled=false → 返回 None，日报整节省略（零行为变化）。
+
+    用 monkeypatch 而非真实 settings.yaml：线上该开关会被人为打开/关闭，
+    测试若不注入配置就会随配置漂移而误报（本测试首版就踩过这个坑）。
+    """
+    from lihu_quantify.monitor import scheduler as sched_mod
+
+    monkeypatch.setattr(
+        sched_mod, "_read_settings_yaml",
+        lambda path=None: {"behavior_audit": {"enabled": False}},
+    )
+    assert sched_mod._load_behavior_audit() is None
+
+
+def test_load_behavior_audit_missing_block_returns_none(monkeypatch):
+    """配置里压根没有 behavior_audit 块 → 同样返回 None（老配置文件兼容）。"""
+    from lihu_quantify.monitor import scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "_read_settings_yaml", lambda path=None: {})
+    assert sched_mod._load_behavior_audit() is None
 
 
 def test_load_behavior_audit_reads_cache_when_enabled(tmp_path, monkeypatch):

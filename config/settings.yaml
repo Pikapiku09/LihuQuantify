@@ -157,9 +157,11 @@ review_block_min_win_rate: 0.45         # 预检胜率线（低于此值触发�
 # 数据来源是 scripts/behavior_audit.py --json 写出的缓存——**巡检本身不读交割单、
 # 不连 DuckDB**，避免把每日流程拖慢。开启前先手动跑一次生成缓存：
 #   python scripts/behavior_audit.py --fills <交割单.csv> --json outputs/behavior_report.json --capital <账户规模>
-# 默认关闭：缺省或 enabled=false 时日报不渲染该节，行为与改造前一致。
+# 2026-11-14 已开启（账户规模 11 万，缓存 outputs/behavior_report.json 已生成）。
+# 缓存由 CLI 定期重跑刷新；缓存缺失/损坏/过期时自动降级（整节省略或标黄提示），
+# 绝不影响巡检主流程。改回 false 即整体下线。
 behavior_audit:
-  enabled: false
+  enabled: true
   cache_json: "outputs/behavior_report.json"
   stale_days: 7                         # 缓存超过 N 天 → 日报标黄提示"数据陈旧"
 

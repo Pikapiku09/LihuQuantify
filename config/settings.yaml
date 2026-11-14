@@ -152,6 +152,17 @@ ai_summary:
 review_block_min_rounds: 50             # 预检轮次门槛（已平仓轮次，review_progress 口径）
 review_block_min_win_rate: 0.45         # 预检胜率线（低于此值触发阻断告警）
 
+# 行为体检（2026-11-14）：日报里附上「交易者行为」摘要（浮亏加仓 / 卖飞 / 换手）。
+# 纯展示层，不参与任何信号、下单、风控决策。
+# 数据来源是 scripts/behavior_audit.py --json 写出的缓存——**巡检本身不读交割单、
+# 不连 DuckDB**，避免把每日流程拖慢。开启前先手动跑一次生成缓存：
+#   python scripts/behavior_audit.py --fills <交割单.csv> --json outputs/behavior_report.json --capital <账户规模>
+# 默认关闭：缺省或 enabled=false 时日报不渲染该节，行为与改造前一致。
+behavior_audit:
+  enabled: false
+  cache_json: "outputs/behavior_report.json"
+  stale_days: 7                         # 缓存超过 N 天 → 日报标黄提示"数据陈旧"
+
 # 影子账本（第十二轮：多池并行积累参考样本）
 # 统计纪律：评审进度/胜率以主账本（paper_state.json）为准；影子仅跨池稳健性对照，
 # 同期账本间有市场相关性，不得当独立样本合并。

@@ -445,6 +445,89 @@ def _render_ai_summary(d: dict) -> str:
     return _section("八、AI 收盘总结", body)
 
 
+def _render_behavior(d: dict) -> str:
+    """行为体检小节（纯展示层；None/缺失 → 整节省略）。
+
+    数据来自 ``scripts/behavior_audit.py --json`` 的缓存，由 scheduler 读进
+    ``summary["behavior_audit"]``。缓存过期（``_stale``）标黄提示而不丢弃数据。
+    本节不参与任何信号/下单/风控决策。
+    """
+    ba = d.get("behavior_audit")
+    if not isinstance(ba, dict) or not ba:
+        return ""
+    fills = ba.get("fills") or {}
+    rounds = ba.get("rounds") or {}
+    la = ba.get("loss_add_ratio") or {}
+    ps = ba.get("position_sizing") or {}
+    tu = ba.get("turnover") or {}
+    pc = ba.get("peak_capture") or {}
+    pu = ba.get("post_sell_upside") or {}
+    pgr = ba.get("pgr_plr") or {}
+
+    def _f(v, default=0.0) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    rows = [
+        ["浮亏加仓占买入额",
+         f"{_f(la.get('ratio')):.1%}",
+         f"{int(_f(la.get('n_adds')))} 笔 / {_f(la.get('add_amount')):,.0f} 元"],
+        ["盈亏单规模比",
+         f"{_f(ps.get('loss_to_win_ratio')):.2f}x",
+         f"盈 {_f(ps.get('win_cost_mean')):,.0f} vs 亏 {_f(ps.get('loss_cost_mean')):,.0f}"],
+        ["年化换手",
+         f"{_f(tu.get('turnover_annual')):.1f} 倍",
+         f"摩擦成本 {_f(tu.get('friction_cost_pct')):.2%}/年（{tu.get('basis', '-')}）"],
+        ["峰值捕获率（中位）",
+         f"{_f(pc.get('median')):.1%}",
+         f"低于 50% 占 {_f(pc.get('below_half_pct')):.1%}"],
+        ["卖出后继续上涨",
+         f"{_f(pu.get('continued_up_pct')):.1%}",
+         f"平均还能涨 {_f(pu.get('mean_gain_pct')):.2%}"],
+        ["持有期差（盈利-亏损）",
+         f"{_f(pgr.get('hold_diff')):+.1f} 天",
+         "显著" if pgr.get("significant") else "CI 跨 0，不显著"],
+    ]
+
+    # 阈值告警（与 behavior/report.THRESHOLDS 同源，此处内联避免展示层依赖业务包）
+    alerts = []
+    if _f(la.get("ratio")) > 0.10:
+        alerts.append(f"浮亏加仓 {_f(la.get('ratio')):.1%} > 10%")
+    if _f(ps.get("loss_to_win_ratio")) > 1.10:
+        alerts.append(f"盈亏单规模比 {_f(ps.get('loss_to_win_ratio')):.2f}x > 1.10x")
+    if _f(tu.get("turnover_annual")) > 6.0:
+        alerts.append(f"年化换手 {_f(tu.get('turnover_annual')):.1f} 倍 > 6 倍")
+    if 0 < _f(pc.get("median")) < 0.50:
+        alerts.append(f"峰值捕获率 {_f(pc.get('median')):.1%} < 50%")
+
+    summary_line = (
+        f"样本 {int(_f(fills.get('n_fills')))} 笔成交 / "
+        f"{int(_f(rounds.get('n_rounds')))} 轮配对，"
+        f"已实现 {_f(rounds.get('total_pnl')):+,.0f} 元，"
+        f"胜率 {_f(rounds.get('win_rate')):.1%}"
+    )
+    body = (
+        f'<p style="margin:0 0 8px;font-size:12px;color:#64748b;">'
+        f'{_esc(summary_line)} · 缓存时间 {_esc(ba.get("_cached_at") or "-")}</p>'
+    )
+    if ba.get("_stale"):
+        body += (
+            '<p style="margin:0 0 8px;font-size:12px;color:#b45309;'
+            'background:#fef3c7;padding:6px 10px;border-radius:4px;">'
+            '⚠ 行为体检缓存已过期，请重跑 '
+            'scripts/behavior_audit.py --json outputs/behavior_report.json</p>'
+        )
+    if alerts:
+        body += (
+            '<p style="margin:0 0 8px;font-size:12px;color:#b91c1c;">'
+            f'告警：{_esc("；".join(alerts))}</p>'
+        )
+    body += _table(["指标", "实测", "说明"], rows)
+    return _section("九、行为体检（交易者画像）", body)
+
+
 # ===== 主入口 =====
 
 def build_daily_report_email(d: dict) -> tuple[str, str]:
@@ -479,6 +562,7 @@ def build_daily_report_email(d: dict) -> tuple[str, str]:
         _render_risk(d),
         _render_capital(d),
         _render_ai_summary(d),
+        _render_behavior(d),
     ])
 
     report = d.get("report", "")

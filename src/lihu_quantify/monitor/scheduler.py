@@ -247,6 +247,37 @@ def _risk_budget_coef(budget: dict, market_state: str) -> float:
     return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
 
 
+def _load_behavior_audit() -> Optional[dict]:
+    """读行为体检缓存，供日报展示（纯只读展示层）。
+
+    为什么只读缓存而不现场计算：行为体检要读几百笔交割单并逐轮查 DuckDB 行情，
+    放在每日巡检里会显著拖慢流程。故由 ``scripts/behavior_audit.py --json``
+    定期生成缓存，巡检只做一次 JSON 读取。
+
+    返回 None 的情形（日报整节省略、线上行为与改造前一致）：
+        - settings.yaml 无 behavior_audit 块，或 enabled != true
+        - 缓存文件不存在 / JSON 损坏 / 结构不是 dict
+    读到但过期时返回体带 ``_stale=True``，日报据此标黄提示而不丢弃数据。
+    """
+    try:
+        cfg = _read_settings_yaml().get("behavior_audit") or {}
+    except Exception:  # noqa: BLE001 - 坏配置不得杀死巡检
+        return None
+    if not isinstance(cfg, dict) or not _as_bool(cfg.get("enabled"), False):
+        return None
+    cache = cfg.get("cache_json") or "outputs/behavior_report.json"
+    path = Path(str(cache))
+    if not path.is_absolute():
+        path = _ROOT / str(cache)
+    stale_days = _as_int_between(cfg.get("stale_days"), 7, 1, 365)
+    try:
+        from ..behavior.report import load_cached
+        return load_cached(path, stale_days=stale_days)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[行为体检] 缓存读取失败（不影响巡检）: {exc}")
+        return None
+
+
 def _drawdown_metrics(points) -> dict:
     """权益曲线 → 回撤指标（只读纯函数）。
 
@@ -1323,6 +1354,8 @@ class DailyScanner:
                         ("uptrend", "rangebound", "downtrend", "unknown")},
             }
         summary["mdd_guard"] = mdd_guard
+        # 行为体检摘要（纯展示层；未启用或无缓存 → None，日报整节省略）
+        summary["behavior_audit"] = _load_behavior_audit()
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
         #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
         #      结果随 last_scan.json 持久化） ----

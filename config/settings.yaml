@@ -162,6 +162,9 @@ shadow_books:
   - name: "nogate"                      # P1-4 无闸门影子（2026-11-14）：主账本同信号源，仅闸门恒 off
     seed: 42
     strategy: "intraday_reversal"
+  - name: "nogate_half"                 # P2 半仓影子（2026-11-14）：主账本同信号源，闸门恒半仓
+    seed: 42                            # 与 nogate 的区别：entry_scale 恒 0.5（不是 1.0）
+    strategy: "intraday_reversal"
 
 # 影子账本行为配置（P1-4，2026-11-14）：pydantic Settings 未建模该块，
 # 由 monitor/scheduler._load_shadow_ledgers() 直读原始 YAML（生效前提：
@@ -174,3 +177,43 @@ shadow_ledgers:
     enabled: true
     signal_source: "main"               # 与主账本共用同一信号源（同池 seed、同策略）
     market_gate: "off"                  # 闸门恒 off → entry_scale 恒 1.0，不看 market_state
+  - name: "nogate_half"                 # P2 半仓影子（2026-11-14）
+    enabled: true
+    signal_source: "main"               # 同主账本信号源（唯一差异只剩闸门）
+    market_gate: "half"                 # 闸门恒半仓 → entry_scale 恒 0.5，不看 market_state
+                                        # 别名 "reduce" 在本块内等价 half（注意：与
+                                        # strategy.market_filter_mode 的 reduce 无关）
+                                        # 独立 paper_state_nogate_half.json，silent 不发日报
+
+# ===================== 第2层：连续风险预算（2026-11-14） =====================
+# 把闸门从 0/0.5/1.0 三档改为"按市场状态连续给仓位"（用户风险偏好：收益优先，
+# 可接受回撤；MDD 硬上限 25% 见下方 scale_in）。
+# **默认关闭**：关闭/缺块时 _gate_scale 与改造前逐位一致（block=0 / reduce=0.5 /
+# off=1.0，tests/test_scale_in_risk_budget.py 有逐组合对照测试）。
+# 开启后：接管 market_filter_mode 的 block/reduce 语义（系数按本块映射），但
+#   - P6 情绪退潮仍独立禁开仓（block）；
+#   - strategy.market_filter=false 时闸门整体关闭，本块不生效；
+#   - gate=off / gate=half 的影子账本不受影响（各自恒定系数）；
+#   - 作用域是"所有 gate=follow 的账本"（主账本 + s43/s44/ir20/wbr25 等对照腿），
+#     影子 silent 不告警；若只想主账本生效，请在此开关之外另建独立配置。
+gate_risk_budget:
+  enabled: false
+  uptrend: 1.0        # 上涨
+  rangebound: 0.7     # 震荡
+  downtrend: 0.4      # 下跌
+  unknown: 0.0        # 未知（数据缺失 → 保守不开仓）
+
+# ===================== 第3层：分批建仓（2026-11-14） =====================
+# 用户诉求「回撤是机会」的机制化：同一标的在下跌中分批加仓，让回撤时还有子弹。
+# **默认关闭**；开启后才存在加仓路径。⚠ 与 docs/交易铁律.md 第4条「绝不向下补仓」
+# 直接冲突（加仓按定义发生在持仓浮亏时，OMS 铁律2 必然拒绝）→ 本路径在
+# scheduler._place_scale_in_buy 内独立实现（复刻 OMS 其余前置校验与止损合并规则，
+# 只买不卖），**需人工确认后开启**。
+# 硬约束：组合层 MDD ≥ mdd_limit → 立即停止所有加仓/新开仓（只减不加，不自动平仓），
+# 写 outputs/mdd_guard.json + 告警。
+scale_in:
+  enabled: false
+  max_tranches: 2          # 最多 2 批（首笔 + 1 次加仓）
+  tranche_gap_pct: -5      # 较首笔成本再跌 5% 触发（写正数 5 亦按 -5 处理）
+  tranche_size_ratio: 0.5  # 第二批金额 = 首笔金额 × 0.5
+  mdd_limit: 0.25          # 组合层 MDD 硬上限 25%（写 25 亦按 25% 处理）

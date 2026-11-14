@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import json
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -82,6 +82,7 @@ def _gate_scale(
     strategy_cfg,
     market_state: str,
     sentiment_ebb: bool = False,
+    risk_budget: Optional[dict] = None,
 ) -> tuple[bool, float]:
     """市场闸门 → (是否禁开新仓 block_mode, 有效仓位系数 entry_scale)。
 
@@ -89,6 +90,13 @@ def _gate_scale(
     P1-4（2026-11-14）：无闸门影子账本（BookSpec.gate=="off"）闸门恒 off——
     entry_scale 恒 1.0、不看 market_state；**只改闸门行为**，策略/仓位上限/
     风控铁律全部沿用原配置。其余账本（gate="follow"，默认）行为不变。
+
+    2026-11-14（第2层）：账本 gate="half"（半仓影子）→ entry_scale 恒 0.5，
+    不看 market_state（与 settings 里状态相关的 reduce 语义无关）。
+    连续风险预算（settings.yaml `gate_risk_budget.enabled: true`）开启后接管
+    block/reduce 三档语义：entry_scale = 该市场状态的预算系数；**默认关闭**
+    （缺块/关开关 → 上方三档旧口径逐位不变）；P6 情绪退潮仍独立禁开仓；
+    `market_filter: false` 时闸门整体关闭，本块不生效。
     """
     block_mode = bool(
         getattr(strategy_cfg, "market_filter", False)
@@ -104,9 +112,269 @@ def _gate_scale(
     if sentiment_ebb:
         block_mode = True
         reduce_scale = 0.0
-    if getattr(book, "gate", "follow") == "off":
+    # 账本级闸门（P1-4 off / 2026-11-14 half）：恒定系数，不看 market_state
+    _gate = getattr(book, "gate", "follow")
+    if _gate == "off":
         return False, 1.0
+    if _gate == "half":
+        return False, 0.5
+    # 连续风险预算（默认关闭）：开启且市场过滤本身启用时才接管
+    if risk_budget is None:
+        risk_budget = _load_risk_budget()
+    if isinstance(risk_budget, dict) and risk_budget.get("enabled") \
+            and getattr(strategy_cfg, "market_filter", False):
+        coef = _risk_budget_coef(risk_budget, market_state)
+        block_mode = bool(sentiment_ebb)   # 预算接管三档后，只有情绪退潮还禁开仓
+        return block_mode, (0.0 if block_mode else coef)
     return block_mode, (0.0 if block_mode else reduce_scale)
+
+
+# ======================================================================
+# 第2层：连续风险预算 + 第3层：分批建仓（2026-11-14）
+# 全部默认关闭（enabled: false）——关闭时上述 _gate_scale 与 _scan_impl
+# 的买入路径与改造前逐位一致（tests/test_scale_in_risk_budget.py 有对照证明）。
+# 配置块未进 pydantic Settings 模型（config.py 不在本任务写作用域），故直读
+# 原始 YAML；字段缺失/类型异常 → 退回默认值，绝不因坏配置杀死巡检。
+# ======================================================================
+
+# 连续风险预算：market_state → 仓位系数（settings.yaml 的 gate_risk_budget 块）
+_DEFAULT_RISK_BUDGET: dict = {
+    "enabled": False,
+    "uptrend": 1.0,
+    "rangebound": 0.7,
+    "downtrend": 0.4,
+    "unknown": 0.0,
+}
+# classify_market_state 的四种取值 → 预算键（其余/None → unknown）
+_MARKET_STATE_BUCKET = {"上涨": "uptrend", "下跌": "downtrend", "震荡": "rangebound"}
+
+# 分批建仓（settings.yaml 的 scale_in 块）
+_DEFAULT_SCALE_IN: dict = {
+    "enabled": False,
+    "max_tranches": 2,
+    "tranche_gap_pct": -5.0,
+    "tranche_size_ratio": 0.5,
+    "mdd_limit": 0.25,
+}
+
+# MDD 守卫边界（写入 outputs/mdd_guard.json，供人工/看板核对）：
+# 与 auto_block 同款纪律——只阻断买入，绝不下卖单、绝不改配置。
+MDD_GUARD_POLICY: dict = {
+    "scope": "组合层（账本权益曲线，含初始资金起点）",
+    "action": "停止所有加仓/新开仓（只减不加）",
+    "auto_close_position": False,
+    "auto_reduce_position": False,
+    "auto_modify_config": False,
+    "note": "MDD 硬上限；本守卫只阻断买入，绝不下卖单——减仓由人工决策（延续 P0-3 边界）",
+}
+
+_EQUITY_CURVE_MAX_POINTS = 500   # 权益曲线保留上限（约两年交易日）
+
+
+def _read_settings_yaml(path=None) -> dict:
+    """读 config/settings.yaml 原始 YAML（新配置块未进 pydantic 模型）。
+
+    路径缺省 `_ROOT/config/settings.yaml`（测试 monkeypatch _ROOT 即隔离）；
+    缺失/损坏 → {}（调用方退回默认值）。
+    """
+    p = Path(path) if path is not None else (_ROOT / "config" / "settings.yaml")
+    try:
+        if not p.exists():
+            return {}
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.warning(f"[配置] settings.yaml 读取失败（用默认值）: {e}")
+        return {}
+
+
+def _as_bool(v, default: bool) -> bool:
+    """宽松布尔（YAML true/false、字符串 yes/no、数字 1/0）；异常回退默认。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        try:
+            return float(v) != 0.0
+        except (TypeError, ValueError, OverflowError):
+            return default
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "on", "启用", "开"):
+            return True
+        if s in ("0", "false", "no", "off", "禁用", "关"):
+            return False
+    return default
+
+
+def _as_float_between(v, default: float, lo: float, hi: float) -> float:
+    """宽松浮点 + 区间裁剪（NaN/布尔/魔法对象 → 默认值）。"""
+    if isinstance(v, bool):
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if f != f:            # NaN
+        return default
+    return min(max(f, lo), hi)
+
+
+def _as_int_between(v, default: int, lo: int, hi: int) -> int:
+    """宽松整数 + 区间裁剪。"""
+    if isinstance(v, bool):
+        return default
+    try:
+        i = int(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return min(max(i, lo), hi)
+
+
+def _load_risk_budget(path=None) -> dict:
+    """读 gate_risk_budget 块 → 归一化配置（缺块/关闭 → enabled=False）。"""
+    out = dict(_DEFAULT_RISK_BUDGET)
+    raw = _read_settings_yaml(path).get("gate_risk_budget")
+    if not isinstance(raw, dict):
+        return out
+    out["enabled"] = _as_bool(raw.get("enabled"), False)
+    _alias = {"uptrend": "上涨", "rangebound": "震荡",
+              "downtrend": "下跌", "unknown": "未知"}
+    for key, cn in _alias.items():
+        v = raw[key] if key in raw else raw.get(cn)
+        if v is not None:
+            out[key] = _as_float_between(v, _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
+    return out
+
+
+def _risk_budget_coef(budget: dict, market_state: str) -> float:
+    """市场状态 → 仓位系数（未知状态一律 unknown 档，数据缺失保守处理）。"""
+    key = _MARKET_STATE_BUCKET.get(str(market_state or ""), "unknown")
+    return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
+
+
+def _load_scale_in(path=None) -> dict:
+    """读 scale_in 块 → 归一化配置（缺块/关闭 → enabled=False）。"""
+    out = dict(_DEFAULT_SCALE_IN)
+    raw = _read_settings_yaml(path).get("scale_in")
+    if not isinstance(raw, dict):
+        return out
+    out["enabled"] = _as_bool(raw.get("enabled"), False)
+    out["max_tranches"] = _as_int_between(raw.get("max_tranches"), 2, 1, 10)
+    # tranche_gap_pct 语义为"较首笔成本下跌百分比"：写 -5 或 5 都归一为 -5
+    _gap_raw = raw.get("tranche_gap_pct")
+    if isinstance(_gap_raw, bool):
+        _gap_raw = None
+    try:
+        _gap_abs = abs(float(_gap_raw))
+    except (TypeError, ValueError, OverflowError):
+        _gap_abs = abs(float(_DEFAULT_SCALE_IN["tranche_gap_pct"]))
+    if _gap_abs != _gap_abs or _gap_abs <= 0:   # NaN / 0 → 默认 5%
+        _gap_abs = 5.0
+    out["tranche_gap_pct"] = -min(_gap_abs, 99.0)
+    out["tranche_size_ratio"] = _as_float_between(
+        raw.get("tranche_size_ratio"), 0.5, 0.01, 1.0)
+    mdd = _as_float_between(raw.get("mdd_limit"), 0.25, 0.0, 100.0)
+    if mdd > 1.0:          # 兼容百分数写法（25 → 0.25）
+        mdd = mdd / 100.0
+    out["mdd_limit"] = mdd if mdd > 0 else _DEFAULT_SCALE_IN["mdd_limit"]
+    return out
+
+
+def _scale_in_plan(price, cost, volume, state: dict, cfg: dict) -> Optional[dict]:
+    """分批加仓判定（纯函数，无 IO / 不下单）。
+
+    全部满足才返回计划，否则 None：
+        1. scale_in.enabled
+        2. 已完成批数 < max_tranches
+        3. 现价 ≤ 首笔成本 ×(1 + tranche_gap_pct/100)（gap 为负 = 下跌触发）
+        4. 本批金额 = 首笔金额 × tranche_size_ratio > 0
+
+    首笔成本/金额取 state（scale_in_state{后缀}.json）；存量持仓（开关开启前
+    已建立）由调用方按 1 批懒初始化。
+    """
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return None
+    try:
+        price = float(price)
+        cost = float(cost)
+        volume = int(volume)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if price <= 0 or cost <= 0:
+        return None
+    state = state if isinstance(state, dict) else {}
+    tranches = _as_int_between(state.get("tranches"), 1, 1, 999)
+    if tranches >= _as_int_between(cfg.get("max_tranches"), 2, 1, 10):
+        return None
+    gap = _as_float_between(cfg.get("tranche_gap_pct"), -5.0, -99.0, -0.01) / 100.0
+    first_cost = _as_float_between(state.get("first_cost"), cost, 1e-9, 1e12)
+    trigger_price = first_cost * (1.0 + gap)
+    if price > trigger_price:
+        return None
+    base = _as_float_between(state.get("first_notional"), 0.0, 0.0, 1e15)
+    if base <= 0:
+        base = first_cost * max(volume, 0)
+    notional = base * _as_float_between(
+        cfg.get("tranche_size_ratio"), 0.5, 0.01, 1.0)
+    if notional <= 0:
+        return None
+    return {
+        "tranche": tranches + 1,
+        "notional": notional,
+        "first_cost": first_cost,
+        "trigger_price": round(trigger_price, 4),
+        "drop_pct": round(price / first_cost - 1.0, 4),
+    }
+
+
+def _drawdown_metrics(points) -> dict:
+    """权益曲线 → 回撤指标（只读纯函数）。
+
+    points: [{"date": "YYYY-MM-DD", "total_asset": float}, ...]（顺序无关，内部排序）。
+    返回 current_drawdown（当前点相对峰值）/ max_drawdown（历史最大）/ peak 等；
+    空曲线 → 全部 None（调用方视为未触发）。
+    """
+    vals: list[tuple[str, float]] = []
+    for p in points or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            v = float(p.get("total_asset"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if v != v or v <= 0:
+            continue
+        vals.append((str(p.get("date") or ""), v))
+    if not vals:
+        return {"points": 0, "peak": None, "peak_date": None,
+                "current_drawdown": None, "max_drawdown": None, "trough_date": None}
+    vals.sort(key=lambda x: x[0])
+    peak, peak_date = vals[0][1], vals[0][0]
+    mdd, trough_date, current = 0.0, None, 0.0
+    for d, v in vals:
+        if v > peak:
+            peak, peak_date = v, d
+        dd = (peak - v) / peak if peak > 0 else 0.0
+        current = dd
+        if dd > mdd:
+            mdd, trough_date = dd, d
+    return {"points": len(vals), "peak": round(peak, 4), "peak_date": peak_date,
+            "current_drawdown": round(current, 6),
+            "max_drawdown": round(mdd, 6), "trough_date": trough_date}
+
+
+def _merge_equity_point(points, trade_date, total_asset, max_points=_EQUITY_CURVE_MAX_POINTS) -> list[dict]:
+    """权益曲线追加/覆盖某交易日（同日幂等覆盖），按日期升序裁剪尾部。"""
+    key = str(trade_date)
+    try:
+        value = float(total_asset)
+    except (TypeError, ValueError, OverflowError):
+        return [p for p in (points or []) if isinstance(p, dict)]
+    out = [p for p in (points or [])
+           if isinstance(p, dict) and str(p.get("date")) != key]
+    out.append({"date": key, "total_asset": round(value, 4)})
+    out.sort(key=lambda p: str(p.get("date")))
+    return out[-int(max_points):]
 
 
 def _load_shadow_ledgers() -> dict[str, dict]:
@@ -319,8 +587,15 @@ def _build_daily_summary(
     # 需求5（第十轮）：规则版简报（确定性兜底——AI 未配置/失败时永不为空）。
     # summary["brief"] = ai_summary or brief_rule（_scan_impl 中赋值）。
     _scale = entry_scale if entry_scale is not None else 1.0
-    _filter = ("block（禁止开新仓）" if _scale == 0.0
-               else "reduce（新仓减半）" if _scale == 0.5 else "off（正常开仓）")
+    if _scale == 0.0:
+        _filter = "block（禁止开新仓）"
+    elif _scale == 0.5:
+        _filter = "reduce（新仓减半）"
+    elif _scale == 1.0:
+        _filter = "off（正常开仓）"
+    else:
+        # 2026-11-14：连续风险预算系数（非 0/0.5/1；旧三档口径下不可达）
+        _filter = f"风险预算 {_scale:.0%}（连续仓位系数）"
     _cum = (total_asset / init_cap - 1) if init_cap else None
     _day = (total_asset - prev_total_asset) \
         if (prev_total_asset is not None and prev_total_asset > 0) else None
@@ -373,6 +648,8 @@ class BookSpec:
     strategy: str = "cherry_claw" # ir20 账本用 "intraday_reversal"（P1 对照腿）
     # P1-4（2026-11-14）：闸门行为。follow=按 settings（默认，现行行为）；
     # off=闸门恒关（entry_scale=1.0），仅用于"无闸门影子"反事实对照账本。
+    # 2026-11-14（第2层）：half=闸门恒半仓（entry_scale 恒 0.5，不看 market_state），
+    # 仅用于 "nogate_half" 半仓影子账本——注意与 off（恒 1.0）的区别。
     gate: str = "follow"
 
     @property
@@ -784,15 +1061,27 @@ class DailyScanner:
     def _scan_impl(
         self, latest: date, market_state: str, n: int, days: int, s, r,
         prev_total_asset: Optional[float] = None,
+        risk_budget: Optional[dict] = None,
+        scale_in_cfg: Optional[dict] = None,
     ) -> dict:
         """巡检主体（由 scan() 包装：幂等/心跳/日报邮件在包装层）。
 
         第五轮：summary 扩展字段（持仓明细/当日卖出盈亏/待执行止损/股票名称/
         prev_total_asset 等），供每日综合日报邮件渲染（monitor/daily_report.py）。
+
+        2026-11-14：risk_budget / scale_in_cfg 为连续风险预算与分批建仓配置
+        （缺省从 settings.yaml 直读）。两者默认 enabled=false，关闭时本函数
+        的闸门/买入/汇总路径与改造前逐位一致（summary 不多出任何键、
+        不多写任何文件）。
         """
         logger.info(f"[巡检] 基准日 {latest}，市场状态 {market_state}")
         # 告警历史基线（常驻进程跨日累积，取当日增量）
         hist_start = len(self.alerter.history)
+        # 2026-11-14：新功能配置（默认关闭；关闭时下方全部走旧路径）
+        if risk_budget is None:
+            risk_budget = _load_risk_budget()
+        if scale_in_cfg is None:
+            scale_in_cfg = _load_scale_in()
 
         # 修复2（第五轮清单）：日期切换（解冻 T+1 + trade_day=latest）必须在
         # 任何交易之前——否则当日买入/卖出被记到上一交易日，
@@ -907,9 +1196,19 @@ class DailyScanner:
 
         # 市场参考信号（修复A：reduce=非上涨段仓位减半；block=禁止）
         # P1-4：无闸门影子账本单独记日志（闸门恒 off，不看市场状态）
-        if getattr(self.book, "gate", "follow") == "off":
+        # 2026-11-14：half 影子 / 连续风险预算 各记一行（默认关闭时零新增日志）
+        _gate_kind = getattr(self.book, "gate", "follow")
+        if _gate_kind == "off":
             logger.info(f"[巡检] [{self._state_label}] 闸门恒 off（无闸门对照），"
                         f"当日市场状态 {market_state} 不参与开仓判定")
+        elif _gate_kind == "half":
+            logger.info(f"[巡检] [{self._state_label}] 闸门恒半仓（gate=half），"
+                        f"entry_scale 恒 0.5，市场状态 {market_state} 不参与判定")
+        elif isinstance(risk_budget, dict) and risk_budget.get("enabled") \
+                and getattr(s, "market_filter", False):
+            logger.info(f"[巡检] 连续风险预算：市场{market_state} → "
+                        f"entry_scale {_risk_budget_coef(risk_budget, market_state):.2f}"
+                        f"（三档 block/reduce 已由预算接管）")
         elif market_state != "上涨" and s.market_filter:
             if s.market_filter_mode == "block":
                 logger.info("[巡检] 市场过滤(block)：非上涨段，不开新仓")
@@ -927,10 +1226,30 @@ class DailyScanner:
         total_asset = asset.get("total_asset", 0)
         cash = asset.get("cash", 0)
 
-        # 市场闸门 + P6 情绪退潮叠加（P1-4：gate=off 的账本恒 entry_scale=1.0）
+        # 市场闸门 + P6 情绪退潮叠加（P1-4：gate=off 的账本恒 entry_scale=1.0；
+        # 2026-11-14：gate_risk_budget 开启时连续预算接管三档，默认关闭=旧口径）
         block_mode, entry_scale = _gate_scale(
-            self.book, s, market_state, sentiment_ebb)
-        held = {p.ts_code for p in self.broker.query_positions()}
+            self.book, s, market_state, sentiment_ebb, risk_budget=risk_budget)
+        held_positions = {p.ts_code: p for p in self.broker.query_positions()}
+
+        # ---- 第3层（2026-11-14）：分批建仓 + MDD 25% 硬守卫（默认关闭）----
+        # 关闭时：不读状态文件、不写权益曲线、不写 mdd_guard.json、summary 无新键。
+        mdd_guard: Optional[dict] = None
+        guard_blocked = False
+        scale_in_state: dict = {"positions": {}}
+        if isinstance(scale_in_cfg, dict) and scale_in_cfg.get("enabled"):
+            scale_in_state = self._load_scale_in_state()
+            mdd_guard = self._mdd_guard(latest, total_asset, scale_in_cfg)
+            if mdd_guard.get("triggered"):
+                guard_blocked = True
+                _guard_msg = (
+                    f"MDD 守卫：组合回撤 {mdd_guard['mdd_pct']} ≥ 硬上限 "
+                    f"{mdd_guard['mdd_limit_pct']}，立即停止所有加仓/新开仓"
+                    f"（只减不加；系统不自动平仓）")
+                logger.warning(f"[MDD 守卫] [{self._state_label}] {_guard_msg}")
+                rejected.append({"ts_code": "-", "name": "MDD 守卫",
+                                 "price": 0, "reasons": _guard_msg})
+
         # 需求1（第八轮）：资金守卫与 top-N 筛选配置
         # isinstance 守卫：MagicMock settings（测试）/异常配置 → 不启用
         cg = getattr(self.settings, "capital_guard", None)
@@ -939,7 +1258,8 @@ class DailyScanner:
         guard_skipped = False
         topn_used, topn_skipped = 0, 0
 
-        if not block_mode:
+        # MDD 守卫触发 → 本轮一个买单都不下（只减不加；不自动平仓）
+        if not block_mode and not guard_blocked:
             # ---- 需求1：可用资金过低 → 本轮跳过全部买入尝试（汇总一条） ----
             if cg_enabled and cash < cg.min_cash_threshold:
                 guard_skipped = True
@@ -952,9 +1272,24 @@ class DailyScanner:
                                  "price": 0, "reasons": msg})
             else:
                 # 预筛（已持仓/停手期）——闸门与下单仍逐票实时执行（行为兼容）
-                candidates: list[tuple] = []   # (score, idx, sig, last_bar)
+                scale_in_on = bool(
+                    isinstance(scale_in_cfg, dict) and scale_in_cfg.get("enabled"))
+                candidates: list[tuple] = []       # (score, idx, sig, last_bar, add)
+                add_candidates: list[tuple] = []   # 分批加仓候选（排在新仓之后）
                 for idx, (sig, last_bar, score) in enumerate(signals):
-                    if sig.ts_code in held:
+                    _pos = held_positions.get(sig.ts_code)
+                    if _pos is not None:
+                        # 已持仓默认不重复买；仅分批建仓开关开启时评估"下跌加仓"。
+                        # 加仓候选排在新仓之后 → 先给新标的分配资金，剩余额度才加仓。
+                        if scale_in_on:
+                            _add = self._scale_in_candidate(
+                                sig, last_bar, _pos, scale_in_cfg, scale_in_state,
+                                total_asset=total_asset, cash=cash,
+                                max_single_pct=r.max_single_position,
+                            )
+                            if _add is not None:
+                                add_candidates.append(
+                                    (score, idx, sig, last_bar, _add))
                         continue   # 已持仓不重复买
                     # 修复F：连亏停手检查
                     if getattr(self.broker, "is_halted", None) and self.broker.is_halted(
@@ -966,7 +1301,7 @@ class DailyScanner:
                                          "reasons": "铁律F：连亏3笔停手期内"})
                         self.alerter.alert_halt(sig.ts_code, "停手期内")
                         continue
-                    candidates.append((score, idx, sig, last_bar))
+                    candidates.append((score, idx, sig, last_bar, None))
 
                 # ---- 需求1：资金紧张 → top-N 筛选（按评分只尝试前 N 个） ----
                 slots = int(cash // budget) if budget > 0 else 0
@@ -983,20 +1318,34 @@ class DailyScanner:
                     rejected.append({"ts_code": "-", "name": "Top-N 筛选",
                                      "price": 0, "reasons": msg})
 
-                for score, idx, sig, last_bar in candidates:
+                for score, idx, sig, last_bar, add in candidates + add_candidates:
                     # 修复E：执行价一律用最新交易日收盘
                     price = float(last_bar["close"])
-                    invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * entry_scale
+                    if add is not None:
+                        # 分批加仓：额度 = 首笔金额 × ratio，且已被单票/现金上限预裁剪
+                        invest = float(add["invest"])
+                        if invest <= 0 or price <= 0 or int(invest / price / 100) < 1:
+                            rejected.append({"ts_code": sig.ts_code,
+                                             "name": name_map.get(sig.ts_code, ""),
+                                             "price": price,
+                                             "reasons": "分批加仓：加仓额度不足一手"})
+                            continue
+                    else:
+                        invest = min(sig.suggested_position_pct, r.max_single_position) * total_asset * entry_scale
                     volume = int(invest / price / 100) * 100
                     if volume < 100:
                         continue
                     snapshot = self._snapshot()
                     # 修复C：板块传入（同板块 ≤40% 校验生效）
+                    # 加仓候选的拟投入金额用**实际成交额**（volume×price）——
+                    # 止损/上限校验须按真实下单金额算，避免"预裁剪值=25% 边界"
+                    # 因浮点误差被闸门误拒（普通新仓口径保持不变）。
+                    _invest_for_ctx = invest if add is None else volume * price
                     check_ctx = CheckContext(
                         current_price=price,
                         ma10=float(last_bar.get("ma10", 0)) if pd.notna(last_bar.get("ma10")) else 0.0,
                         sector=sector_map.get(sig.ts_code, ""),
-                        invest_amount=invest,
+                        invest_amount=_invest_for_ctx,
                     )
                     result = gate.check(sig, snapshot, check_ctx)
                     if not result.approved:
@@ -1008,19 +1357,50 @@ class DailyScanner:
                                          "price": price, "reasons": reasons})
                         self.alerter.alert_checklist_reject(sig.ts_code, reasons)
                         continue
-                    buy_result, stop = oms.place_buy_with_stop(sig, volume, price)
+                    if add is not None:
+                        buy_result, stop = self._place_scale_in_buy(
+                            sig, volume, price, oms)
+                    else:
+                        buy_result, stop = oms.place_buy_with_stop(sig, volume, price)
                     if buy_result.success and stop:
-                        executed.append({
+                        _filled = {
                             "ts_code": sig.ts_code,
                             "name": name_map.get(sig.ts_code, ""),
                             "volume": volume, "price": price, "stop": stop.stop_price,
-                        })
+                        }
+                        if add is not None:
+                            _filled.update({"scale_in": True,
+                                            "tranche": add["tranche"]})
+                        executed.append(_filled)
                         self.alerter.alert_bought(sig.ts_code, volume, price, stop.stop_price)
+                        # 加仓状态落盘（下次巡检据此判断批数与首笔成本）
+                        if scale_in_on:
+                            if add is not None:
+                                _st = scale_in_state.setdefault(
+                                    "positions", {}).setdefault(sig.ts_code, {})
+                                _st.update({
+                                    "tranches": add["tranche"],
+                                    "last_tranche_date": str(latest),
+                                    "last_tranche_price": price,
+                                    "last_tranche_volume": volume,
+                                })
+                            else:
+                                scale_in_state.setdefault("positions", {})[
+                                    sig.ts_code] = {
+                                    "first_cost": price,
+                                    "first_notional": price * volume,
+                                    "tranches": 1,
+                                    "first_date": str(latest),
+                                }
                     elif not buy_result.success:
                         rejected.append({"ts_code": sig.ts_code,
                                          "name": name_map.get(sig.ts_code, ""),
                                          "price": price, "reasons": buy_result.msg})
                         self.alerter.alert_checklist_reject(sig.ts_code, buy_result.msg)
+
+                # 分批建仓状态持久化（仅开关开启且本轮实际走过买入路径）
+                if scale_in_on:
+                    self._save_scale_in_state(scale_in_state)
 
         # 止损收盘判定（修复D：收盘判断→次日开盘执行，与回测口径对齐）
         # 需求3（第八轮）：执行已在买入前完成（先卖后买），此处只做新登记
@@ -1070,6 +1450,28 @@ class DailyScanner:
             "topn_used": topn_used,                       # top-N 实际保留数（0=未启用）
             "topn_skipped": topn_skipped,                 # top-N 未尝试数
         }
+        # ---- 2026-11-14：连续风险预算 / 分批建仓 / MDD 守卫 ----
+        # 仅开关开启时写入（默认关闭 → summary 键集合与改造前逐位一致）
+        if isinstance(risk_budget, dict) and risk_budget.get("enabled"):
+            summary["risk_budget"] = {
+                "enabled": True,
+                "market_state": market_state,
+                "coef": entry_scale,
+                "ledger_gate": getattr(self.book, "gate", "follow"),
+                "map": {k: risk_budget.get(k) for k in
+                        ("uptrend", "rangebound", "downtrend", "unknown")},
+            }
+        if isinstance(scale_in_cfg, dict) and scale_in_cfg.get("enabled"):
+            summary["scale_in"] = {
+                "enabled": True,
+                "max_tranches": scale_in_cfg.get("max_tranches"),
+                "tranche_gap_pct": scale_in_cfg.get("tranche_gap_pct"),
+                "tranche_size_ratio": scale_in_cfg.get("tranche_size_ratio"),
+                "adds": [e for e in executed if e.get("scale_in")],
+                "positions": scale_in_state.get("positions") or {},
+            }
+            if mdd_guard is not None:
+                summary["mdd_guard"] = mdd_guard
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
         #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
         #      结果随 last_scan.json 持久化） ----
@@ -1267,6 +1669,244 @@ class DailyScanner:
         """P0-5（第十一轮）：委托 build_account_snapshot（补全 trades/
         halted_until/psychology_alert，恢复 checklist 8 项闸门）。"""
         return build_account_snapshot(self.broker)
+
+    # ===== 第3层（2026-11-14）：分批建仓 + MDD 25% 硬守卫（默认关闭） =====
+    # 边界：只买不卖——本段全部方法不调用任何卖出接口（"只减不加"里的"减"
+    # 由人工决策）；只在 scale_in.enabled 时才被调用，关闭时零文件、零副作用。
+
+    @property
+    def _equity_curve_path(self) -> Path:
+        """账本权益曲线（MDD 唯一数据源；影子按后缀隔离，主账本无后缀）。"""
+        return _ROOT / "data" / f"equity_curve{self.book.suffix()}.json"
+
+    @property
+    def _scale_in_state_path(self) -> Path:
+        """分批建仓状态（首笔成本/金额/已完成批数；影子按后缀隔离）。"""
+        return _ROOT / "data" / f"scale_in_state{self.book.suffix()}.json"
+
+    @property
+    def _mdd_guard_path(self) -> Path:
+        """MDD 守卫审计文件（主账本=outputs/mdd_guard.json）。"""
+        return _ROOT / "outputs" / f"mdd_guard{self.book.suffix()}.json"
+
+    @staticmethod
+    def _read_json_file(path: Path) -> dict:
+        """读 JSON 对象（缺失/损坏 → {}，绝不抛异常）。"""
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            logger.warning(f"[分批建仓] {path.name} 读取失败（按空处理）: {e}")
+        return {}
+
+    @staticmethod
+    def _write_json_file(path: Path, payload: dict) -> bool:
+        """原子写 JSON（临时文件 + os.replace）；失败只告警，不影响巡检。"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except (OSError, TypeError, ValueError) as e:
+            logger.warning(f"[分批建仓] {path.name} 写入失败: {e}")
+            return False
+
+    def _load_scale_in_state(self) -> dict:
+        """读分批建仓状态（缺失 → 空；存量持仓由 _scale_in_entry 懒初始化）。"""
+        data = self._read_json_file(self._scale_in_state_path)
+        pos = data.get("positions")
+        return {"positions": pos if isinstance(pos, dict) else {}}
+
+    def _save_scale_in_state(self, state: dict) -> None:
+        pos = (state or {}).get("positions")
+        self._write_json_file(self._scale_in_state_path,
+                              {"positions": pos if isinstance(pos, dict) else {}})
+
+    @staticmethod
+    def _scale_in_entry(state: dict, code: str, pos) -> dict:
+        """取该票加仓状态；存量持仓（开关开启前建仓）按 1 批懒初始化。
+
+        初始化字段取持仓加权成本与存量金额——保守口径：假设当前持仓即"首笔"，
+        因此只允许再加 1 批（max_tranches=2 时），绝不因状态缺失而多买。
+        """
+        entry = (state.get("positions") or {}).get(code)
+        if isinstance(entry, dict):
+            return entry
+        try:
+            cost = float(getattr(pos, "cost", 0) or 0)
+            volume = int(getattr(pos, "volume", 0) or 0)
+        except (TypeError, ValueError):
+            cost, volume = 0.0, 0
+        entry = {
+            "first_cost": cost,
+            "first_notional": cost * volume,
+            "tranches": 1,
+            "first_date": None,
+            "note": "存量持仓（scale_in 开启前已建立），按 1 批计",
+        }
+        state.setdefault("positions", {})[code] = entry
+        return entry
+
+    def _scale_in_candidate(
+        self, sig, last_bar, pos, cfg: dict, state: dict,
+        *, total_asset: float, cash: float, max_single_pct: float,
+    ) -> Optional[dict]:
+        """已持仓标的的"下跌加仓"计划（只算额度，不下单）。
+
+        硬上限（任一不足即放弃，绝不突破）：
+          - 批数：已完成批数 < max_tranches
+          - 触发：现价 ≤ 首笔成本 ×(1 + tranche_gap_pct/100)
+          - 单票：存量市值 + 本批投入 ≤ max_single_position × 总资产
+          - 现金：本批投入 ≤ 可用现金（预留佣金）
+        板块 ≤40% 由 Checklist 闸门逐票校验（单一事实来源，不在此重复实现）。
+        """
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return None
+        try:
+            price = float(last_bar.get("close") or 0)
+        except (TypeError, ValueError):
+            return None
+        entry = self._scale_in_entry(state, sig.ts_code, pos)
+        plan = _scale_in_plan(price, getattr(pos, "cost", 0),
+                              getattr(pos, "volume", 0), entry, cfg)
+        if plan is None:
+            return None
+        try:
+            existing_mv = float(getattr(pos, "market_value", 0) or 0)
+        except (TypeError, ValueError):
+            existing_mv = 0.0
+        if existing_mv <= 0:
+            existing_mv = float(getattr(pos, "volume", 0) or 0) * price
+        room_single = float(max_single_pct) * float(total_asset) - existing_mv
+        invest = min(plan["notional"], max(room_single, 0.0),
+                     max(float(cash), 0.0) * 0.999)
+        if invest <= 0 or price <= 0 or int(invest / price / 100) < 1:
+            logger.info(f"[分批加仓] {sig.ts_code} 额度不足"
+                        f"（单票余量 {room_single:,.0f}、现金 {cash:,.0f}），跳过")
+            return None
+        plan.update({"invest": invest, "existing_mv": existing_mv,
+                     "room_single": room_single})
+        return plan
+
+    def _place_scale_in_buy(self, sig, volume: int, price: float, oms):
+        """分批加仓下单 → (OrderResult, StopOrder|None)；只在 scale_in.enabled 路径调用。
+
+        为什么不用 `oms.place_buy_with_stop`：其铁律2「绝不向下补仓」会 100% 拒绝
+        本路径的唯一使用场景（相对首笔成本下跌 gap% 后加仓）。此处显式复刻其余
+        全部前置校验（止损价必须给出且低于买入价、股数 100 倍数），并在买入成功后
+        按 OMS 同款规则合并止损登记（不覆盖旧止损、累计监控股数、取更保守止损价）。
+
+        边界：**只买不卖**；额度已由调用方按单票/现金上限预裁剪，Checklist 再校验。
+        """
+        from ..execution.base import OrderResult
+        from ..execution.oms import StopOrder
+
+        if not sig.stop_loss or sig.stop_loss <= 0:
+            return OrderResult(
+                success=False, msg="铁律1：买入信号未给出止损价，拒绝下单"), None
+        if sig.stop_loss >= price:
+            return OrderResult(
+                success=False,
+                msg=(f"铁律1：止损价 {sig.stop_loss:.2f} 不低于买入价 "
+                     f"{price:.2f}，拒绝下单")), None
+        if volume <= 0 or volume % 100 != 0:
+            return OrderResult(
+                success=False, msg=f"股数 {volume} 必须为 100 的正倍数"), None
+        buy_result = self.broker.buy(
+            sig.ts_code, price, volume,
+            reason=f"{sig.reason or '策略买入'}（分批加仓）",
+        )
+        if not buy_result.success:
+            logger.error(f"[分批加仓] 买入失败，不登记止损：{buy_result.msg}")
+            return buy_result, None
+        stop = StopOrder(
+            ts_code=sig.ts_code, volume=volume, stop_price=sig.stop_loss,
+            buy_order_id=buy_result.order_id,
+            reason=f"加仓@{price:.2f} 止损@{sig.stop_loss:.2f}",
+        )
+        existing = oms.stop_registry.get(sig.ts_code)
+        if existing is not None and not existing.triggered:
+            stop.volume = existing.volume + stop.volume
+            stop.stop_price = min(existing.stop_price, stop.stop_price)
+            stop.buy_order_id = existing.buy_order_id or stop.buy_order_id
+        oms.stop_registry[sig.ts_code] = stop
+        oms._save_registry()   # 与 OMS 一致：持久化（测试替身无副作用）
+        logger.info(f"[分批加仓] {sig.ts_code} {volume}股 @{price:.2f}"
+                    f"（止损 {stop.stop_price:.2f}，累计监控 {stop.volume} 股）")
+        return buy_result, stop
+
+    def _mdd_guard(self, latest: date, total_asset: float, cfg: dict) -> dict:
+        """组合层 MDD 硬守卫：更新权益曲线 → 判定回撤 → 落盘 + 告警。
+
+        仅在 scale_in.enabled 时调用（默认关闭 → 不写任何文件，线上零行为变化）。
+        触及 mdd_limit（默认 25%）→ triggered=True，调用方立即停止所有加仓/开仓。
+        边界：**只阻断买入，绝不下卖单、绝不改配置**。
+        """
+        limit = _as_float_between(cfg.get("mdd_limit"), 0.25, 0.0, 1.0)
+        curve = self._read_json_file(self._equity_curve_path).get("points") or []
+        # 首次启用（无曲线文件）：以"初始资金"为高水位锚点——否则权益曲线从
+        # 启用日才开始，无法反映启用前已发生的回撤（MDD 25% 是组合层硬上限，
+        # 口径必须是"相对历史峰值"，不能只看启用后的相对涨跌）。
+        seeded = False
+        init_cap = _as_float_between(
+            getattr(self.broker, "init_capital", 0), 0.0, 0.0, 1e15)
+        if not curve and init_cap > 0:
+            curve = [{"date": "1900-01-01", "total_asset": round(init_cap, 4)}]
+            seeded = True
+        curve = _merge_equity_point(curve, latest, total_asset)
+        self._write_json_file(self._equity_curve_path,
+                              {"updated": str(latest), "points": curve})
+        metrics = _drawdown_metrics(curve)
+        mdd = float(metrics.get("max_drawdown") or 0.0)
+        triggered = bool(mdd + 1e-9 >= limit)
+        prev = self._read_json_file(self._mdd_guard_path)
+        first_trigger = bool(
+            triggered and not (
+                prev.get("triggered") is True
+                and str(prev.get("trade_date")) == str(latest)))
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload = {
+            "enabled": True,
+            "book": self.book.name,
+            "trade_date": str(latest),
+            "checked_at": now_str,
+            "triggered": triggered,
+            "mdd_limit": round(limit, 6),
+            "mdd_limit_pct": f"{limit:.0%}",
+            "mdd": round(mdd, 6),
+            "mdd_pct": f"{mdd:.2%}",
+            "current_drawdown": metrics.get("current_drawdown"),
+            "peak": metrics.get("peak"),
+            "peak_date": metrics.get("peak_date"),
+            "trough_date": metrics.get("trough_date"),
+            "curve_points": metrics.get("points"),
+            "equity_curve": str(self._equity_curve_path),
+            "init_capital": round(init_cap, 4) if init_cap else None,
+            "seeded_from_init_capital": seeded,
+            "triggered_at": (now_str if first_trigger
+                             else prev.get("triggered_at")),
+            "policy": dict(MDD_GUARD_POLICY),
+        }
+        self._write_json_file(self._mdd_guard_path, payload)
+        if first_trigger:
+            try:
+                self.alerter.send(
+                    f"MDD 守卫触发：{self.book.name} 组合回撤 {mdd:.2%} ≥ {limit:.0%}",
+                    (f"账本 {self.book.name} 组合回撤已达 {mdd:.2%}"
+                     f"（硬上限 {limit:.0%}；峰 {metrics.get('peak')} @ "
+                     f"{metrics.get('peak_date')} → 谷 {metrics.get('trough_date')}）。\n"
+                     "已立即停止所有加仓/新开仓（只减不加）；系统不会自动平仓、"
+                     "不会自动修改配置，减仓与参数调整请人工复核。"),
+                    level="error",
+                )
+            except Exception as e:  # noqa: BLE001 - 告警失败不得杀死巡检
+                logger.warning(f"[MDD 守卫] 告警发送失败（不影响巡检）: {e}")
+            logger.warning(f"[MDD 守卫] {self.book.name} 回撤 {mdd:.2%} ≥ "
+                           f"{limit:.0%}，已停止加仓/开仓（不自动平仓）")
+        return {**payload, "notified_now": first_trigger}
 
     # ===== P0-3 / P1-4（2026-11-14）：评审阻断 + 无闸门影子日报 =====
 
@@ -1730,8 +2370,12 @@ def setup_scheduler(
             _strategy = (getattr(settings, "main_strategy", "cherry_claw")
                          if _from_main
                          else getattr(_sb, "strategy", "cherry_claw"))
-            _gate = ("off" if str(_ov.get("market_gate", "follow")).strip().lower()
-                     == "off" else "follow")
+            _gate = {"off": "off", "half": "half",
+                     # reduce 别名：本块内等价 half（恒 0.5，不看 market_state），
+                     # 与 settings.strategy.reduce（状态相关）语义不同，故要显式登记。
+                     "reduce": "half"}.get(
+                         str(_ov.get("market_gate", "follow")).strip().lower(),
+                         "follow")
             _s2 = settings.model_copy(deep=True)   # pydantic v2 深拷贝嵌套 model
             _s2.universe.pool_seed = _seed
             shadow_scanners.append(DailyScanner(
@@ -1742,6 +2386,9 @@ def setup_scheduler(
             if _gate == "off":
                 logger.info(f"[影子{_sb.name}] 无闸门对照账本：同主账本信号源，"
                             f"entry_scale 恒 1.0（gate=off）")
+            elif _gate == "half":
+                logger.info(f"[影子{_sb.name}] 半仓影子账本：同主账本信号源，"
+                            f"entry_scale 恒 0.5（gate=half，不看 market_state）")
         except Exception as e:
             logger.warning(f"[影子{_sb.name}] 构建失败（跳过）: {e}")
 
@@ -1957,6 +2604,12 @@ def _monthly_review(scanner: DailyScanner) -> None:
     non_uptrend_days = sum(1 for s in filter_stats if s.get("market_state") != "上涨")
     reduced_days = sum(1 for s in filter_stats if s.get("entry_scale") == 0.5)
     blocked_days = sum(1 for s in filter_stats if s.get("entry_scale") == 0.0)
+    # 2026-11-14：连续风险预算生效天数（entry_scale 落在 0/0.5/1 之外）
+    # 开关关闭时恒为 0 → 月度复盘报告逐字不变（下方按需插入行）。
+    budget_days = sum(
+        1 for s in filter_stats
+        if isinstance(s.get("entry_scale"), (int, float))
+        and s.get("entry_scale") not in (0.0, 0.5, 1.0))
     signals_seen = sum(s.get("signals", 0) for s in filter_stats)
     executed_count = sum(s.get("executed", 0) for s in filter_stats)
 
@@ -1999,6 +2652,9 @@ def _monthly_review(scanner: DailyScanner) -> None:
         "---",
         "以上内容仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。",
     ]
+    if budget_days:
+        _pos = next(i for i, ln in enumerate(lines) if "完全拦截天数" in ln)
+        lines.insert(_pos + 1, f"| 连续风险预算天数 | {budget_days} |")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines), encoding="utf-8")
     logger.info(f"[月度复盘] 已生成 {out}")

@@ -95,21 +95,23 @@ def compute_metrics(
     }
 
 
-def _pair_rounds(trades: list[TradeRecord]) -> list[float]:
-    """按 ts_code FIFO 配对买入-卖出轮次，每轮一个 pnl。
+def _iter_fifo_matches(trades: list[TradeRecord]):
+    """FIFO 配对生成器：产出 (buy_record, sell_record, consumed_volume, pnl)。
+
+    **单一配对算法来源**——`_pair_rounds` 与 `pair_round_details` 都基于它。
+    纪律：禁止在别处另写一套配对逻辑（见 docs/决策日志.md）。
 
     修复5c：胜率按轮次而非单笔 sell 统计。
     注意：不修改原始 TradeRecord（用独立剩余量计数器）。
     """
-    open_buys: dict[str, list] = {}   # 每项 = (buy_record, remaining_volume)
-    rounds: list[float] = []
+    open_buys: dict[str, list] = {}   # 每项 = [buy_record, remaining_volume]
     sorted_trades = sorted(
         trades,
         key=lambda t: t.trade_date if isinstance(t.trade_date, date) else 0,
     )
     for t in sorted_trades:
         if t.side == "buy":
-            open_buys.setdefault(t.ts_code, []).append([t, t.volume])  # [record, remaining]
+            open_buys.setdefault(t.ts_code, []).append([t, t.volume])
         else:  # sell
             queue = open_buys.get(t.ts_code)
             if not queue:
@@ -125,12 +127,49 @@ def _pair_rounds(trades: list[TradeRecord]) -> list[float]:
                 # 费用按比例分摊（修复H.1：含买入侧佣金）
                 buy_fee_share = buy.commission * consume / max(1, buy.volume)
                 sell_fee_share = (t.commission + t.stamp_tax) * consume / max(1, t.volume)
-                rounds.append(proceeds - cost - buy_fee_share - sell_fee_share)
+                pnl = proceeds - cost - buy_fee_share - sell_fee_share
+                yield buy, t, consume, pnl
                 entry[1] -= consume
                 remaining -= consume
                 if entry[1] <= 0:
                     queue.pop(0)
-    return rounds
+
+
+def _pair_rounds(trades: list[TradeRecord]) -> list[float]:
+    """按 ts_code FIFO 配对买入-卖出轮次，每轮一个 pnl（保持既有签名）。"""
+    return [m[3] for m in _iter_fifo_matches(trades)]
+
+
+def pair_round_details(trades: list[TradeRecord]) -> list[dict]:
+    """FIFO 配对明细（行为审计用）：每轮的买卖价、股数、持有天数、收益率。
+
+    与 `_pair_rounds` 共用同一配对算法，只是额外保留轮次元数据。
+    买入侧费用记在 commission，卖出侧费用（佣金+印花税+过户费）合并计入。
+    """
+    out: list[dict] = []
+    for buy, sell, volume, pnl in _iter_fifo_matches(trades):
+        cost = buy.price * volume
+        hold_days = None
+        try:
+            if isinstance(buy.trade_date, date) and isinstance(sell.trade_date, date):
+                hold_days = (sell.trade_date - buy.trade_date).days
+        except TypeError:
+            hold_days = None
+        out.append({
+            "ts_code": buy.ts_code,
+            "buy_date": buy.trade_date,
+            "sell_date": sell.trade_date,
+            "buy_price": buy.price,
+            "sell_price": sell.price,
+            "volume": volume,
+            "cost": cost,
+            "pnl": pnl,
+            "ret": (pnl / cost) if cost > 0 else 0.0,
+            "hold_days": hold_days,
+            "buy_reason": buy.reason,
+            "sell_reason": sell.reason,
+        })
+    return out
 
 
 def _avg_holding_days(trades: list[TradeRecord]) -> float:

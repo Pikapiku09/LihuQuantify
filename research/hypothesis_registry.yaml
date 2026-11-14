@@ -1,0 +1,43 @@
+# 研究假设登记册（预注册闸）——机器维护，请勿手改格式；追加请用 research.registry.append_entry
+# 规则见 docs/研究纪律_20261114.md：未登记的参数变更不得上线。
+# status: pending | passed | failed | rejected；passed 必须同时有 evidence 与 decided_at（不许自证）。
+- id: H-2026-11-14-001
+  title: MACD 死叉离场优于 MA10 破位
+  rationale: 435 轮回测：MACD-only 离场收益 +2.41% vs 现行 MA10 破位 +0.72%；登记前已看到结果，属事后假设，必须走 IS/OOS 切分验证（禁止在同一段样本上反复调参）。
+  pre_registered_at: '2026-11-14'
+  method:
+    pairing: fifo
+    universe: IR 系 435 轮（main + ir20 + s43/s44/wbr25 合并；口径见 review_progress）
+    is_window:
+    - '2024-09-24'
+    - '2025-12-31'
+    oos_window:
+    - '2026-01-01'
+    - '2026-11-10'
+  pass_criteria:
+    min_oos_improvement_pp: 2.0
+    max_mdd_increase_pp: 5.0
+    require_significance: false
+  status: pending
+  evidence: null
+  decided_at: null
+- id: H-2026-11-14-002
+  title: 分批止盈优于一次性清仓
+  rationale: 用户真实交割单（2024-09-23~2026-11-13）：分批止盈 73 波 +22,593 元（61.6%）vs 一次性清仓 41 波 −19,728 元（39.0%）；⚠ 分批波仓位大 3.1 倍、持有久 2.9 倍，未做仓位/期限中性化，必须 OOS 复核后才可采纳。
+  pre_registered_at: '2026-11-14'
+  method:
+    pairing: wave
+    universe: 用户真实交割单（gb18030 原始记录；仅证券买入/卖出，排除天天宝与银证转账）
+    is_window:
+    - '2024-09-23'
+    - '2025-12-31'
+    oos_window:
+    - '2026-01-01'
+    - '2026-11-13'
+  pass_criteria:
+    min_oos_improvement_pp: 2.0
+    max_mdd_increase_pp: 5.0
+    require_significance: true
+  status: pending
+  evidence: null
+  decided_at: null

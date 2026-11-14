@@ -189,6 +189,7 @@ def peak_capture(rounds: list[dict], high_lookup) -> dict:
     """
     vals = []
     skipped_no_rise = 0
+    skipped_tiny_range = 0
     for r in rounds:
         bd, sd = r.get("buy_date"), r.get("sell_date")
         if not isinstance(bd, date) or not isinstance(sd, date):
@@ -206,10 +207,17 @@ def peak_capture(rounds: list[dict], high_lookup) -> dict:
         if denom <= 0:
             skipped_no_rise += 1
             continue
+        # 分母过小（区间最高价仅比买价高不到 1%）时捕获率极不稳定：
+        # 一个 denom=0.01 的轮次就能让比值变成 -230%，把均值彻底带偏。
+        # 这类轮次剔除并单独计数，比 winsorize 更可解释。
+        if denom < abs(bp) * 0.01:
+            skipped_tiny_range += 1
+            continue
         vals.append((sp - bp) / denom)
     if not vals:
         return {"n": 0, "mean": 0.0, "median": 0.0, "p25": 0.0, "p75": 0.0,
-                "below_half_pct": 0.0, "skipped_no_rise": skipped_no_rise}
+                "below_half_pct": 0.0, "skipped_no_rise": skipped_no_rise,
+                "skipped_tiny_range": skipped_tiny_range}
     arr = np.array(vals)
     return {
         "n": len(vals),
@@ -219,6 +227,7 @@ def peak_capture(rounds: list[dict], high_lookup) -> dict:
         "p75": round(float(np.quantile(arr, 0.75)), 4),
         "below_half_pct": round(float((arr < 0.5).mean()), 4),
         "skipped_no_rise": skipped_no_rise,
+        "skipped_tiny_range": skipped_tiny_range,
     }
 
 

@@ -96,12 +96,19 @@ def evaluate_thresholds(report: dict) -> list[dict]:
     return out
 
 
-def _fmt_ratio(v: float | None, path: str) -> str:
+# 每个指标的展示单位（不能靠 key 里有没有 "ratio" 猜，规模比是倍数不是百分比）
+_UNITS = {
+    "loss_add_ratio.ratio": "{:.1%}",
+    "position_sizing.loss_to_win_ratio": "{:.2f}x",
+    "turnover.turnover_annual": "{:.1f} 倍",
+    "peak_capture.median": "{:.1%}",
+}
+
+
+def _fmt_metric(v: float | None, path: str) -> str:
     if v is None:
         return "-"
-    if "ratio" in path or "median" in path or "pct" in path:
-        return f"{v:.1%}"
-    return f"{v:.2f}"
+    return _UNITS.get(path, "{:.4g}").format(v)
 
 
 def format_markdown(report: dict) -> str:
@@ -126,8 +133,8 @@ def format_markdown(report: dict) -> str:
     ]
     for item in evaluate_thresholds(report):
         lines.append(
-            f"| {item['label']} | {_fmt_ratio(item['value'], item['key'])} "
-            f"| {item['op']} {_fmt_ratio(item['limit'], item['key'])} "
+            f"| {item['label']} | {_fmt_metric(item['value'], item['key'])} "
+            f"| {item['op']} {_fmt_metric(item['limit'], item['key'])} "
             f"| {'**告警**' if item['hit'] else '正常'} |")
 
     lines += [
@@ -147,10 +154,11 @@ def format_markdown(report: dict) -> str:
         f"- 占全部买入额：**{la['ratio']:.1%}**",
         "",
         "## 3. 峰值捕获率（涨幅口径）", "",
-        f"- 中位 **{pc['median']:.1%}**（均值 {pc['mean']:.1%}，"
-        f"P25 {pc['p25']:.1%} / P75 {pc['p75']:.1%}）",
+        f"- 中位 **{pc['median']:.1%}**（P25 {pc['p25']:.1%} / P75 {pc['p75']:.1%}）",
+        f"- 均值 {pc['mean']:.1%}（分布长尾，判断以中位数为准）",
         f"- 捕获率 <50% 的占比：{pc['below_half_pct']:.1%}",
-        f"- 持有期未上涨而跳过：{pc.get('skipped_no_rise', 0)} 轮",
+        f"- 持有期未上涨跳过 {pc.get('skipped_no_rise', 0)} 轮、"
+        f"涨幅不足 1% 跳过 {pc.get('skipped_tiny_range', 0)} 轮（分母过小不稳定）",
         "",
         f"## 4. 卖出后走势（窗口 {pu['window']} 日）", "",
         f"- 继续上涨比例：**{pu['continued_up_pct']:.1%}**",

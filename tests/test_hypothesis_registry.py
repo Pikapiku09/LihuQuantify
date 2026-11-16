@@ -45,6 +45,7 @@ def _entry() -> dict:
             "min_oos_improvement_pp": 2.0,
             "max_mdd_increase_pp": 5.0,
             "require_significance": False,
+            "decision_rule": "OOS 超额 >=+2.0pp 且回撤恶化 <=5.0pp（仅单测占位）。",
         },
         "status": "pending",
         "evidence": None,
@@ -196,9 +197,22 @@ def test_status_whitelist_rejects(status):
     assert any("status" in msg for msg in _errors_of(status=status))
 
 
-@pytest.mark.parametrize("status", ["pending", "failed", "rejected"])
-def test_non_passed_statuses_do_not_require_evidence(status):
-    assert not _errors_of(status=status)
+@pytest.mark.parametrize("status", ["failed", "rejected"])
+def test_non_pending_statuses_require_evidence(status):
+    """2026-11-16 语义变更：非 pending 一律要 evidence + decided_at。
+
+    原规则只对 passed 要求 evidence，导致 `failed` 可以是「判了但没说为什么」——
+    半年后没人知道该方向为什么被关掉。判定结论本身也是证据，必须留痕。
+    """
+    errors = _errors_of(status=status)
+    assert any("evidence" in msg for msg in errors)
+
+
+@pytest.mark.parametrize("status", ["failed", "rejected", "inconclusive"])
+def test_non_pending_statuses_accepted_with_evidence(status):
+    e = _entry()
+    e.update({"status": status, "evidence": "证据占位", "decided_at": "2026-11-20"})
+    assert validate_entry(e) == []
 
 
 def test_passed_status_accepted_with_evidence_and_date():
@@ -335,5 +349,6 @@ def test_summarize_counts():
     ]
     stats = summarize(entries)
     assert stats == {"total": 5, "pending": 1, "passed": 1,
-                     "failed": 1, "rejected": 1}
-    assert set(STATUSES) == {"pending", "passed", "failed", "rejected"}
+                     "failed": 1, "rejected": 1, "inconclusive": 0}
+    # 2026-11-16 新增 inconclusive：设计无检验力时不得混进 failed
+    assert set(STATUSES) == {"pending", "passed", "failed", "rejected", "inconclusive"}

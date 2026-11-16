@@ -34,14 +34,22 @@ import yaml
 DEFAULT_PATH = Path(__file__).resolve().parent / "hypothesis_registry.yaml"
 
 # 状态白名单 / 配对口径白名单（口径声明：fifo=逐笔先进先出；wave=持仓周期聚合）
-STATUSES: tuple[str, ...] = ("pending", "passed", "failed", "rejected")
+# 2026-11-16 新增 inconclusive：**设计无检验力**（样本量/触发次数不足，既不能确认也不能否证）。
+# 为什么需要它：H-2026-11-16-008 曾被判 failed，但证据自己写着「只触发 3 次、无检验力」——
+# 在无检验力上判否定，与「检验了但不达标」是两回事，混在 failed 里会污染 yes/no 叙事。
+STATUSES: tuple[str, ...] = ("pending", "passed", "failed", "rejected", "inconclusive")
 PAIRINGS: tuple[str, ...] = ("fifo", "wave")
 
 # pass_criteria 必填键（缺任何一项都无法判定"通过"）
+# 2026-11-16 新增 decision_rule：**判定规则必须事前用自然语言写清**。
+# 起因：H-006 预注册只写了 min_oos_improvement_pp>=2.0，实际却用「1/3 种子方向反转」
+# 和「换实盘策略后效应消失」两条**未登记**的理由判了 failed —— 事后挪动标准。
+# 光有数值门槛不够，多重检验校正、稳健性要求、换样本要求都得在事前落成文字。
 PASS_CRITERIA_KEYS: tuple[str, ...] = (
     "min_oos_improvement_pp",
     "max_mdd_increase_pp",
     "require_significance",
+    "decision_rule",
 )
 
 # 封闭 schema：允许的字段集合（含可选 notes 供人工注释）
@@ -58,8 +66,10 @@ HEADER = (
     "# 研究假设登记册（预注册闸）——机器维护，请勿手改格式；追加请用 "
     "research.registry.append_entry\n"
     "# 规则见 docs/研究纪律_20261114.md：未登记的参数变更不得上线。\n"
-    "# status: pending | passed | failed | rejected；"
-    "passed 必须同时有 evidence 与 decided_at（不许自证）。\n"
+    "# status: pending | passed | failed | rejected | inconclusive；"
+    "非 pending 必须同时有 evidence 与 decided_at（不许自证）。\n"
+    "# pass_criteria.decision_rule 必须事前用文字写清判定规则（含多重检验/稳健性要求），"
+    "禁止事后追加理由。\n"
 )
 
 
@@ -182,12 +192,18 @@ def validate_entry(entry: Any) -> list[str]:
         if "require_significance" in crit and not isinstance(
                 crit.get("require_significance"), bool):
             errors.append("pass_criteria.require_significance 必须是布尔值")
+        # 2026-11-16：判定规则必须事前落成文字。光有数值门槛挡不住「事后追加理由」。
+        if not _is_nonempty_str(crit.get("decision_rule")):
+            errors.append(
+                "pass_criteria.decision_rule 必填且为非空字符串——"
+                "必须事前写清判定规则（含多重检验校正、稳健性/换样本要求、"
+                "无检验力时如何判），否则等于允许事后挪动标准")
 
-    # ---- status：白名单 + passed 的"不许自证"约束 ----
+    # ---- status：白名单 + 非 pending 的"不许自证"约束 ----
     status = entry.get("status")
     if status not in STATUSES:
         errors.append(f"status 必须是 {list(STATUSES)} 之一（当前 {status!r}）")
-    elif status == "passed":
+    elif status != "pending":
         evidence = entry.get("evidence")
         empty = (
             evidence is None
@@ -196,10 +212,10 @@ def validate_entry(entry: Any) -> list[str]:
         )
         if empty:
             errors.append(
-                "status=passed 时 evidence 必须非空（禁止自证：必须写清验证结果/出处）")
+                f"status={status} 时 evidence 必须非空（禁止自证：必须写清验证结果/出处）")
         if parse_ymd(entry.get("decided_at")) is None:
             errors.append(
-                "status=passed 时 decided_at 必须是 'YYYY-MM-DD'"
+                f"status={status} 时 decided_at 必须是 'YYYY-MM-DD'"
                 f"（当前 {entry.get('decided_at')!r}）")
     return errors
 

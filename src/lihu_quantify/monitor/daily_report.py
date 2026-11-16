@@ -311,6 +311,18 @@ def _render_risk(d: dict) -> str:
         f"（{filter_note}；当日有效信号 {d.get('signals', 0)} 个{stale_note}）</p>"
     )
 
+    # 分散度检查（2026-11-16）：单票上限只有在「真的分到 3 只以上」时才起作用
+    try:
+        from ..risk.limits import concentration_warning
+
+        warn = concentration_warning(len(d.get("positions") or []))
+        if warn:
+            parts.append(
+                "<p style='margin:8px 0;padding:8px 10px;border-left:3px solid #f59e0b;"
+                "background:#fffbeb;font-size:13px;'>⚠️ " + _esc(warn) + "</p>")
+    except Exception:  # noqa: BLE001 - 提示性检查失败不得影响日报生成
+        pass
+
     # 市场闸门条件统计（2026-10-23 前向验证：闸门开/关分组的条件期望）
     gate = d.get("market_gate") or {}
     if gate:

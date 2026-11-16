@@ -168,8 +168,8 @@ hr("四、构建日级权益曲线")
 # 采用「代数式重建」而非运行态匹配：
 #   现金(t) = 期初现金 + Σ现金流水（买：−(成交额+费用)；卖：+(成交额−费用)）
 #   持仓(t) = 期初持仓 + Σ净买入量
-#   权益(t) = 现金(t) + Σ持仓(t)×当日收盘
-# 这样不存在「同日先卖后买导致持仓为负」的路径依赖，也不会产生假现金负值。
+#   权益(t) = 现金(t) + Σ持仓(t)×当日估值价
+# 好处：不存在「同日先卖后买导致持仓为负」的路径依赖。
 EXCLUDED_CODES = {"113704.SH"}          # 春风转债：配债所得、无行情，整体排除
 fl = fills_in[~fills_in["ts_code"].isin(EXCLUDED_CODES)].copy()
 fl["cashflow"] = np.where(fl["side"] == "buy",
@@ -180,24 +180,22 @@ sell_gross = float(fl.loc[fl["side"] == "sell", "amount"].sum())
 fee_total = float(fl["fee"].sum())
 excluded_proceeds = float(fills_in.loc[fills_in["ts_code"].isin(EXCLUDED_CODES)
                                        & (fills_in["side"] == "sell"), "amount"].sum())
-
-# 每日现金流与每日净买入量
 cf_day = fl.groupby("d")["cashflow"].sum()
-qty_day = fl.pivot_table(index="d", columns="ts_code", values="volume", aggfunc="sum")
-signed = fl.assign(sq=np.where(fl["side"] == "buy", fl["volume"], -fl["volume"])) \
-           .pivot_table(index="d", columns="ts_code", values="sq", aggfunc="sum")
-signed = signed.reindex(columns=px.columns, fill_value=0.0).fillna(0.0) \
-               .reindex(cal, fill_value=0.0).cumsum()
+signed = (fl.assign(sq=np.where(fl["side"] == "buy", fl["volume"], -fl["volume"]))
+            .pivot_table(index="d", columns="ts_code", values="sq", aggfunc="sum")
+            .reindex(columns=px.columns, fill_value=0.0).fillna(0.0)
+            .reindex(cal, fill_value=0.0).cumsum())
 pos_df = signed.copy()
 for c, v in opening.items():
     if c in opening_val:
         pos_df[c] = pos_df.get(c, 0.0) + v
 
 cash_series = cash0 + cf_day.reindex(cal, fill_value=0.0).cumsum()
-# ---- 估值价格面板 ----------------------------------------------------------
-# 有些标的的行情在分析窗口内**根本不存在**（例如凤凰航运 000520 在 2026-06~07 交易了
-# 47.7 万元，但行情从 2026-08-03 才开始）。若不处理，持仓市值会按 0 计，
-# 权益会出现荒谬的负值。这里采用「行情优先 → 缺失日用该标的当日成交均价 → ffill」。
+
+# ---- 估值价格面板 --------------------------------------------------------
+# 部分标的的行情在窗口内根本不存在（如凤凰航运 000520 在 2026-06~07 成交 47.7 万元，
+# 但行情自 2026-08-03 才有）。若不处理，持仓市值会按 0 计，权益出现荒谬负值。
+# 规则：行情优先 → 缺失日用该标的当日成交均价 → 逐标的 ffill。
 px_fill = fl.pivot_table(index="d", columns="ts_code", values="price", aggfunc="mean")
 px_val = px.copy()
 for c in px_fill.columns:
@@ -208,29 +206,26 @@ for c in px_fill.columns:
         px_val[c] = s
 px_val = px_val.ffill().reindex(cal)
 mv_series = (pos_df * px_val).sum(axis=1, min_count=1).fillna(0.0)
-na_cells = int((pos_df.abs() > 1e-9).mul(px_val.isna()).sum().sum())
-print(f"  无行情标的数 {len(no_quote)}（春风转债已整体排除）；"
-      f"用成交价兜底的标的 {int((px_val.iloc[-1].notna() & px.iloc[-1].isna()).sum())} 只")
-print(f"  持仓>0 但仍无任何价格的 (日×标的) 单元格：{na_cells}（已按 0 计值）")
+
 print(f"  成交额：买入 {buy_gross:,.0f}｜卖出 {sell_gross:,.0f}｜费用 {fee_total:,.0f}")
 print(f"  排除标的 {sorted(EXCLUDED_CODES)} 的卖出回款 {excluded_proceeds:,.2f} 元（无持仓、无行情）")
 print(f"  全程现金流合计 {float(fl['cashflow'].sum()):+,.2f} 元")
 
-# ---------- 独立的 FIFO 已实现盈亏（用于月度胜率与归因，不影响权益）----------
+# ---- 独立 FIFO 已实现盈亏（用于月度胜率与归因，不影响权益）----------------
 realized_total = 0.0
 sell_records = []
 lots = defaultdict(list)
 for c, v in opening.items():
     if c in opening_val:
         lots[c].append([v, float(px_day0[c])])
-# 同日先买后卖（理由见上：load_fills 丢失日内时间）
 fl_ord = fl.assign(_o=(fl["side"] == "sell").astype(int)).sort_values(["d", "_o"], kind="stable")
 total_sell_vol = 0.0
 total_matched = 0.0
 for _, f in fl_ord.iterrows():
     c, side = f["ts_code"], f["side"]
     if side == "buy":
-        lots[c].append([float(f["volume"]), (float(f["amount"]) + float(f["fee"])) / float(f["volume"])])
+        lots[c].append([float(f["volume"]),
+                        (float(f["amount"]) + float(f["fee"])) / float(f["volume"])])
     else:
         vol, amt, fee = float(f["volume"]), float(f["amount"]), float(f["fee"])
         total_sell_vol += vol
@@ -252,25 +247,21 @@ for _, f in fl_ord.iterrows():
             sell_records.append({"d": f["d"], "ts_code": c, "name": f["name"],
                                  "pnl": pnl, "cost": mc, "ret": pnl / mc if mc else np.nan})
 
-equity_rows = []
-for day in cal:
-    equity_rows.append({"date": day,
-                        "cash": float(cash_series.loc[day]),
-                        "mv": float(mv_series.loc[day]),
-                        "equity": float(cash_series.loc[day] + mv_series.loc[day]),
-                        "realized": realized_total})
-eq = pd.DataFrame(equity_rows).set_index("date")
+eq = pd.DataFrame([{"date": d,
+                    "cash": float(cash_series.loc[d]),
+                    "mv": float(mv_series.loc[d]),
+                    "equity": float(cash_series.loc[d] + mv_series.loc[d])}
+                   for d in cal]).set_index("date")
 print(f"  期末权益 {eq['equity'].iloc[-1]:,.2f} 元"
       f"（现金 {eq['cash'].iloc[-1]:,.2f} + 持仓市值 {eq['mv'].iloc[-1]:,.2f}）")
 print(f"  FIFO 已实现盈亏合计 {realized_total:,.2f} 元")
-unmatched_qty = total_sell_vol - total_matched
-print(f"  卖出中未能配对到买入批次的数量 {unmatched_qty:,.0f}（应为 0）")
+print(f"  卖出中未能配对到买入批次的数量 {total_sell_vol - total_matched:,.0f}（应为 0）")
 print(f"  现金项最低 {eq['cash'].min():,.2f}｜最高 {eq['cash'].max():,.2f}")
 print("  ⚠️ 现金项可能为负：交割单不含【天天宝申购/赎回】与【银证转账】，")
 print("     外部资金注入未被记录会让现金项变负，但「现金+持仓市值」的总权益仍成立")
 print("     （被买入的资产已计入持仓市值，两者相互抵消）。")
 
-# 恒等式自检：权益 = 初始资金 + FIFO已实现 + 未实现浮动
+# ---- 恒等式自检 ---------------------------------------------------------
 remaining_cost = sum(lot[0] * lot[1] for c in lots for lot in lots[c])
 floating = eq["mv"].iloc[-1] - remaining_cost
 lhs = float(eq["equity"].iloc[-1])
@@ -281,6 +272,48 @@ print(f"  恒等式自检：初始 {INIT_CAPITAL:,.0f} + 已实现 {realized_tot
       f"+ 浮动 {floating:,.2f} = {rhs:,.2f} vs 权益 {lhs:,.2f}（差 {lhs-rhs:+,.2f}）")
 assert abs(lhs - rhs) < 1.0, "权益恒等式不平，检查现金/持仓口径"
 print("  ✅ 恒等式通过")
+
+# ---- 估值边界敏感性：行情首次出现日造成的一次性跳变 ----------------------
+late_codes = []
+for c in px_fill.columns:
+    qs = px[c].first_valid_index() if c in px.columns else None
+    f0 = px_fill[c].first_valid_index()
+    if qs is not None and f0 is not None and qs > f0:
+        late_codes.append(c)
+jump_rows = []
+for c in late_codes:
+    qs = px[c].first_valid_index()
+    if qs is None or qs not in px_val.index:
+        continue
+    hist = pos_df.loc[:qs, c]
+    if len(hist) < 2:
+        continue
+    pos_before = hist.iloc[-2]
+    if abs(pos_before) < 1e-9:
+        continue
+    pv = px_val.loc[:qs, c]
+    if len(pv) < 2 or pd.isna(pv.iloc[-2]) or pd.isna(pv.iloc[-1]):
+        continue
+    jump_rows.append({"ts_code": c, "date": str(qs.date()), "pos": float(pos_before),
+                      "price_before": float(pv.iloc[-2]), "price_after": float(pv.iloc[-1]),
+                      "jump_yuan": float(pos_before * (pv.iloc[-1] - pv.iloc[-2]))})
+adj = pd.Series(0.0, index=cal)
+for r in jump_rows:
+    dd_ = pd.Timestamp(r["date"])
+    if dd_ in adj.index:
+        adj.loc[dd_] += r["jump_yuan"]
+raw_dd = float((eq["equity"] / eq["equity"].cummax() - 1.0).min())
+eq_adj = eq["equity"] - adj.cumsum()
+dd_adj = float((eq_adj / eq_adj.cummax() - 1.0).min())
+if jump_rows:
+    print(f"\n  ⚠️ 估值边界跳变 {len(jump_rows)} 处（行情首次出现日，估值从成交价兜底切到真实报价）：")
+    for r in jump_rows:
+        print(f"     {r['date']} {r['ts_code']} 持仓 {r['pos']:,.0f} "
+              f"× ({r['price_after']:.3f}−{r['price_before']:.3f}) = {r['jump_yuan']:+,.0f} 元")
+    print(f"  跳变合计 {sum(r['jump_yuan'] for r in jump_rows):+,.0f} 元")
+    print(f"  ⇒ 剔除跳变后最大回撤 {dd_adj*100:.2f}%（原始口径 {raw_dd*100:.2f}%）")
+else:
+    print("\n  估值边界跳变：无")
 
 
 # ============================================================ 5 月度
@@ -429,9 +462,11 @@ for lab, arr in [("最好 3 个月", best), ("最差 3 个月", worst)]:
             f"{t['name']}({t['ts_code']}) {t['turnover']:,.0f}元/{t['n']}笔" for t in r["top_turnover"]))
         if r["realized_by_stock"]:
             top = r["realized_by_stock"]
-            print(f"    当月已实现: 最赚 " + "、".join(
-                f"{t['ts_code']} {t['pnl']:+,.0f}" for t in top[::-1][:3]) +
-                "｜最亏 " + "、".join(f"{t['ts_code']} {t['pnl']:+,.0f}" for t in top[:3]))
+            win = sorted([t for t in top if t["pnl"] > 0], key=lambda x: -x["pnl"])[:3]
+            lose = sorted([t for t in top if t["pnl"] < 0], key=lambda x: x["pnl"])[:3]
+            print("    当月已实现: 最赚 " + ("、".join(
+                f"{t['ts_code']} {t['pnl']:+,.0f}" for t in win) if win else "无") +
+                "｜最亏 " + ("、".join(f"{t['ts_code']} {t['pnl']:+,.0f}" for t in lose) if lose else "无"))
 
 
 # ============================================================ 9 汇总输出
@@ -467,12 +502,15 @@ payload = {
         "excluded_code_sale_proceeds": round(excluded_proceeds, 2),
     },
     "limitations": [
-        "初始资金 110000 元为假设值，不是交割单中的事实；收益率水平依赖该假设",
-        "只覆盖一个证券账户，不含理财（天天宝）、其他账户、场外资产与打新收益",
-        "持仓按原始收盘价计价，未做复权；现金分红、送转会造成价格与权益的时点错位",
-        "期初已有持仓（无买入记录）被排除在模型外，其卖出回款不计入现金",
-        "成交晚于行情末日的记录无法计价，已剔除",
-        "月度收益首月（2024-10）为不完整月，从假设初始资金起算",
+        "初始资金 110000 元为假设值，不是交割单中的事实；收益率水平依赖该假设（但期初持仓首日市值约 10.48 万，与该假设量级吻合）",
+        "只覆盖一个证券账户，不含天天宝理财、银证转账、其他账户与场外资产；因此现金项可能为负，但『现金+持仓市值』的总权益仍成立",
+        "持仓按原始收盘价（未复权）计价，现金分红与送转会造成价格与权益的时点错位",
+        "期初已有持仓（无买入记录）按【首日收盘价】作为成本纳入模型，不是其真实成本；其盈亏从首日起算",
+        "春风转债（2026-06 配债所得、无任何行情）整体排除，其卖出回款 4825 元未计入",
+        "load_fills 按（日期, 代码）排序，丢失了日内成交时间；同日一律按先买后卖处理",
+        "停牌/无报价日按『最近成交价或最近收盘价』前向填充估值；行情在窗口内首次出现的标的会在该日产生一次性估值跳变（已量化，见 valuation_jumps）",
+        "成交晚于行情末日（2026-11-10）的 7 笔无法计价，已剔除",
+        "月度收益首月（2024-10）为不完整月，从假设初始资金起算；与上证月度收益的首月对比存在半月错位",
     ],
     "totals": {
         "equity_end": round(float(eq["equity"].iloc[-1]), 2),
@@ -494,7 +532,10 @@ payload = {
         "trough_equity": round(float(eq["equity"].loc[trough]), 2),
         "calendar_days": int((trough - peak).days),
         "recovered_date": str(recovered.date()) if recovered is not None else None,
+        "pct_ex_valuation_jumps": round(dd_adj * 100, 4),
+        "valuation_jump_note": "部分标的行情在分析窗口内才首次出现，该日估值从最近成交价切到真实报价会产生一次性跳变；pct_ex_valuation_jumps 为剔除这些跳变后的回撤",
     },
+    "valuation_jumps": jump_rows,
     "benchmark": {
         "code": BENCH_CODE,
         "spearman": round(sp, 4),

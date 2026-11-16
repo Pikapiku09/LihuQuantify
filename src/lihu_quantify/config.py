@@ -104,12 +104,16 @@ class RiskConfig(BaseModel):
     # min(cfg, 0.15)，而调度器 budget/invest 两处按 0.25 计算 —— 同一配置被解释成
     # 两个不同值。现将单票上限收敛为唯一定义，禁止任何调用方再硬编码。
     #
-    # 2026-11-16 由 0.15 放宽到 0.20（用户明确指示，与 dsh-invest v0.57.0 的插件口径统一）。
-    # ⚠ 该变更在 H-2026-11-16-005 中预注册的门槛是「回撤恶化 ≤5pp」，实测 −5.33pp，判定 failed。
-    #   回测口径 run_full_backtest.py 50 只主板 x 2 年：总收益 -13.59%→-20.59%、
-    #   最大回撤 -15.26%→-20.59%、期末权益 86,411→79,409（-7,002 元）。
-    #   放行是用户决策，不是回测结论；要回滚只需把本行改回 0.15。
-    max_single_position: float = 0.20
+    # 2026-11-16 演进：先由 0.15 放宽到 0.20（H-005，实测回撤恶化 5.33pp，判 failed），
+    # 修正回测口径后重测（H-007，实盘策略 IR），20% 虽回撤更小而收益劣化 -2.39pp，同样 failed。
+    # 随后集中度压力测试（outputs/concentration_stress.json）证明：**决定回撤的是同时持仓数，不是单票上限**
+    # —— K=1 时 p95 回撤 48.4%，K=3 时 16.7%；cap 15%→20% 仅 +3.65~3.98pp。
+    # 账户级实测回撤 -39.75% 与该测算吻合（2026-11-16）。
+    # 综上：**改回 0.15**，并把风控重心放到 risk.min_concurrent_positions。
+    max_single_position: float = 0.15
+    # 同时持仓下限（2026-11-16 新增）：低于该值视为分散度不足，日报告警；不自动阻断开仓。
+    # 依据：K=1 的 p95 回撤 48.4% vs K=3 的 16.7%（集中度压力测试），账户实测 -39.75%。
+    min_concurrent_positions: int = 3
     vol_target: VolTargetConfig = VolTargetConfig()   # P4（2026-09-26）主账本默认启用
     sentiment_filter: SentimentFilterConfig = SentimentFilterConfig()   # P6（2026-09-27）
     max_sector_position: float = 0.40

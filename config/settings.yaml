@@ -37,12 +37,13 @@ universe:
 # 主账本策略（2026-09-26 复盘决策 A）
 # CherryClaw 成本后年化 -5.92%、零成本仍 -3.29%，根因=入场追短期动量与已证 alpha（A股反转）相反；
 # 权重扫描：IR20 权重越高越好（0/100 唯一正收益 +10.25%）。故主账本切 IntradayReversal。
-# 单票上限 20% 由 risk.max_single_position 单点定义（2026-11-14 口径统一，2026-11-16 由 15% 放宽）：
+# 单票上限 15% 由 risk.max_single_position 单点定义（2026-11-14 口径统一，2026-11-16 得出结论后回到 15%）：
 # 此前 scheduler._build_strategy 对 IntradayReversal 硬编码 min(cfg, 0.15)，
 # 而调度器 budget / invest 两条路径按 0.25 计算 —— 同一配置被解释成两个值。
 # 现统一为单一定义，禁止任何调用方再硬编码。
-# ⚠ 0.15→0.20 的代价已实测（H-2026-11-16-005，判定 failed）：最大回撤 -15.26%→-20.59%（恶化 5.33pp），
-#   期末权益 86,411→79,409（-7,002 元）。采纳 0.20 是用户决策，不是回测结论；回滚只需改回 0.15。
+# 2026-11-16 的 0.15→0.20 实验两度判 failed（H-005 回撤恶化 5.33pp；H-007 实盘策略下收益劣化 2.39pp），
+# 且集中度压力测试显示决定回撤的是「同时持仓数」而非单票上限（K=1 时 p95 回撤 48.4%，K=3 时 16.7%），
+# 故回到 0.15，并把风控重心放到 risk.min_concurrent_positions。
 main_strategy: "intraday_reversal"     # cherry_claw（旧，已停用）| intraday_reversal
 
 # 策略参数（修复4 网格搜索稳健区域：50只×2年训练段，2026-08-26）
@@ -75,7 +76,10 @@ risk:
     target_vol: 0.35
     window: 20
     min_scale: 0.3
-  max_single_position: 0.20
+  max_single_position: 0.15
+  # 同时持仓下限（2026-11-16）：低于该值日报告警「分散度不足」，不自动阻断开仓。
+  # 依据：集中度压力测试 K=1 的 p95 回撤 48.4% vs K=3 的 16.7%；账户实测最大回撤 -39.75%。
+  min_concurrent_positions: 3
   max_sector_position: 0.40
   stop_loss_warn: -0.03
   stop_loss_exec: -0.05

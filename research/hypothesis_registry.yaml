@@ -18,9 +18,9 @@
     min_oos_improvement_pp: 2.0
     max_mdd_increase_pp: 5.0
     require_significance: false
-  status: pending
-  evidence: null
-  decided_at: null
+  status: failed
+  evidence: '2026-11-16 双口径 IS/OOS 复核均不通过。FIFO：IS 超额 +1.36pp（427 轮）→ OOS 超额 +0.32pp（207 轮），缩水 76%，低于 +2.0pp 门槛；OOS 胜率 38.2% 反而低于实际 47.8%。波口径：IS 超额 -23.7pp、OOS 超额 -3.44pp（122 波），即 MACD 在两种口径下都劣于实际。结论：原 +27,072 元优势主要来自 2024-2025 段行情与 FIFO 碎片化，不构成可用规则。'
+  decided_at: '2026-11-16'
 - id: H-2026-11-14-002
   title: 分批止盈优于一次性清仓
   rationale: 用户真实交割单（2024-09-23~2026-11-13）：分批止盈 73 波 +22,593 元（61.6%）vs 一次性清仓 41 波 −19,728 元（39.0%）；⚠ 分批波仓位大 3.1 倍、持有久 2.9 倍，未做仓位/期限中性化，必须 OOS 复核后才可采纳。

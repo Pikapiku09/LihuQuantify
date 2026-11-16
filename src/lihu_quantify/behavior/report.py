@@ -25,6 +25,7 @@ from .metrics import (
     post_sell_upside,
     turnover,
 )
+from .wave import build_waves, by_code, wave_summary
 
 # 告警阈值：(告警线, 方向, 中文名)
 THRESHOLDS = {
@@ -63,6 +64,14 @@ def build_report(fills: list[dict], rounds: list[dict], high_lookup,
             "win_rate": round(
                 sum(1 for r in rounds if float(r["pnl"]) > 0) / len(rounds), 4
             ) if rounds else 0.0,
+            # 持仓天数分布（与波口径对照用；FIFO 会被分批进出切碎）
+            "hold_median": _median(
+                [r["hold_days"] for r in rounds if r.get("hold_days") is not None],
+                as_int=True),
+            "hold_max": _max_int(
+                [r["hold_days"] for r in rounds if r.get("hold_days") is not None]),
+            "hold_over_60_pct": _pct_over(
+                [r["hold_days"] for r in rounds if r.get("hold_days") is not None], 60),
         },
         "quote_coverage": {"codes_total": len(codes), "codes_covered": covered},
         "pgr_plr": pgr_plr(rounds),
@@ -71,6 +80,10 @@ def build_report(fills: list[dict], rounds: list[dict], high_lookup,
         "post_sell_upside": post_sell_upside(rounds, high_lookup, window=20),
         "turnover": turnover(fills, capital_base),
         "position_sizing": position_sizing(rounds),
+        # 波口径（从 0 仓位建仓到清仓算一波）：还原真实持仓时长。
+        # FIFO 会把分批进出切碎，导致"持有期中位 12 天"这类失真。
+        "wave": wave_summary(build_waves(fills)),
+        "wave_by_code": by_code(build_waves(fills))[:15],
     }
 
 
@@ -81,6 +94,27 @@ def _get(report: dict, dotted: str):
             return None
         cur = cur[part]
     return cur
+
+
+def _median(xs, as_int: bool = False):
+    """中位数（空列表 → None，不用 0 冒充）。"""
+    v = sorted(x for x in xs if x is not None)
+    if not v:
+        return None
+    m = v[len(v) // 2]
+    return int(m) if as_int else m
+
+
+def _max_int(xs):
+    v = [x for x in xs if x is not None]
+    return max(v) if v else None
+
+
+def _pct_over(xs, limit: float) -> float:
+    v = [x for x in xs if x is not None]
+    if not v:
+        return 0.0
+    return round(sum(1 for x in v if x > limit) / len(v), 4)
 
 
 def evaluate_thresholds(report: dict) -> list[dict]:
@@ -116,6 +150,10 @@ def format_markdown(report: dict) -> str:
     f, r = report["fills"], report["rounds"]
     p, la, pc = report["pgr_plr"], report["loss_add_ratio"], report["peak_capture"]
     ps, pu, tu = report["position_sizing"], report["post_sell_upside"], report["turnover"]
+    wv = report.get("wave") or {}
+    _fifo_median = r.get("hold_median")
+    _fifo_max = r.get("hold_max")
+    _fifo_60 = r.get("hold_over_60_pct", 0.0)
 
     lines = [
         "# 行为体检报告", "",
@@ -178,6 +216,41 @@ def format_markdown(report: dict) -> str:
         f"- 盈利单均规模 {ps['win_cost_mean']:,.0f} / 亏损单均规模 "
         f"{ps['loss_cost_mean']:,.0f} → 比 **{ps['loss_to_win_ratio']:.2f}x**",
         "",
+        "---", "",
+        "## 7. 两个口径对照（重要）", "",
+        "FIFO 按「每一股」配对，会把分批进出切碎；波口径按「仓位归零」算一波，",
+        "还原「这一波我拿了多久」。两者都对，测的东西不同。", "",
+        "| 项 | FIFO 口径 | 波口径 |",
+        "|---|---|---|",
+        f"| 笔数 / 波数 | {r['n_rounds']} | {wv.get('n_waves', 0)} |",
+        f"| 累计已实现盈亏 | {r['total_pnl']:+,.0f} | "
+        f"{wv.get('total_pnl', 0):+,.0f} |",
+        f"| 胜率 | {r['win_rate']:.1%} | {wv.get('win_rate', 0):.1%} |",
+        f"| 持仓中位 | {_fifo_median} 天 | {wv.get('hold_median')} 天 |",
+        f"| 持仓最长 | {_fifo_max} 天 | {wv.get('hold_max')} 天 |",
+        f"| 超 60 天的占比 | {_fifo_60:.1%} | "
+        f"{(wv.get('max_hold_60plus', 0) / max(1, wv.get('n_waves', 1))):.1%} |",
+        f"| 未平仓 | - | {wv.get('n_open', 0)} 波 |",
+        "",
+        "> **为什么必须看两列**：FIFO 会把一个 254 天的长线持仓切成 28 个 32 天的碎片，",
+        "> 只看 FIFO 会严重低估你的真实持仓时长，也会误判「拿不住」这类结论。",
+        "",
+    ]
+
+    # 按标的（波口径）
+    wbc = report.get("wave_by_code") or []
+    if wbc:
+        lines += ["## 8. 分标的战绩（波口径，已清仓）", "",
+                  "| 代码 | 名称 | 波数 | 已实现盈亏 | 收益率 | 最长持有 |",
+                  "|---|---|---|---|---|---|"]
+        for d in wbc:
+            lines.append(
+                f"| {d['ts_code']} | {d['name'] or '-'} | {d['n_waves']} "
+                f"| {d['pnl']:+,.0f} | {d['ret']:+.1%} "
+                f"| {d['max_hold'] if d['max_hold'] is not None else '-'} 天 |")
+        lines.append("")
+
+    lines += [
         "---", "",
         "> 本报告纯只读审计，不参与任何信号/下单/风控决策。",
         "> 口径说明见 `docs/行为审计口径与校准_20261114.md`。",

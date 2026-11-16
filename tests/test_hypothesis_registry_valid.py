@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from research.registry import (  # noqa: E402
     DEFAULT_PATH,
+    STATUSES as VALID_STATUS,
     load_registry,
     validate_registry,
 )
@@ -49,21 +50,41 @@ def test_repo_registry_exists_and_is_valid():
         "仓库内登记册存在非法条目：\n" + "\n".join(validate_registry(entries)))
 
 
-def test_repo_registry_has_two_prefilled_pending_hypotheses():
+def test_repo_registry_has_two_prefilled_hypotheses():
+    """两条预填假设存在且结构正确。
+
+    ⚠ 不断言 status == "pending"：假设的最终归宿本来就是 pending → passed/failed，
+    写死状态会让登记册一被使用测试就红（H-001 于 2026-11-16 判定 failed 时踩过）。
+    这里只校验**结构**与**状态合法**，状态转换由别的用例保证。
+    """
     by_id = {entry["id"]: entry for entry in load_registry()}
 
     h1 = by_id["H-2026-11-14-001"]
     assert "MACD" in h1["title"]
-    assert h1["status"] == "pending"
+    assert h1["status"] in VALID_STATUS
     assert h1["method"]["pairing"] == "fifo"
     assert h1["method"]["is_window"] == ["2024-09-24", "2025-12-31"]
     assert h1["method"]["oos_window"] == ["2026-01-01", "2026-11-10"]
 
     h2 = by_id["H-2026-11-14-002"]
     assert "分批" in h2["title"] or "止盈" in h2["title"]
-    assert h2["status"] == "pending"
+    assert h2["status"] in VALID_STATUS
     assert h2["method"]["pairing"] in ("fifo", "wave")
     assert h2["method"]["is_window"][1] < h2["method"]["oos_window"][0]
+
+
+def test_decided_hypotheses_record_evidence_and_date():
+    """已判定（passed/failed）的假设必须留下 evidence 与 decided_at。
+
+    这是可追溯性的底线：一个"判定过但没写理由"的假设，
+    等于把结论交给记忆，下次没人知道为什么否掉它。
+    """
+    for entry in load_registry():
+        if entry["status"] in ("passed", "failed"):
+            assert entry.get("evidence"), (
+                f"{entry['id']} 状态为 {entry['status']} 但缺 evidence")
+            assert entry.get("decided_at"), (
+                f"{entry['id']} 状态为 {entry['status']} 但缺 decided_at")
 
 
 def test_pending_hypotheses_have_no_evidence_yet():

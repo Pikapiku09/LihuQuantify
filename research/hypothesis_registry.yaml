@@ -141,3 +141,58 @@
     +2.96%/大盘 -4.52%，最大回撤三池几乎相同（-10.79%/-11.50%/-10.94%），完全没有单调关系。判定 failed 的理由：① 1/3 种子方向反转，不满足「可上线规则」的稳健性；②
     换成实盘策略后效应不存在，说明这是 CherryClaw 动量入场规则与小盘的交互，不是市场规律。补记：本回测的小盘池仍受策略「近20日日均成交额>=1亿」前置硬过滤，并非真正的小微盘；且按当前上市股票构建，存在幸存者偏差（三池同等受影响）。
   decided_at: '2026-11-16'
+- id: H-2026-11-16-007
+  title: 单票上限 20% 在实盘策略 IR 上回撤恶化不超过 5pp
+  rationale: H-2026-11-16-005 测的 15%->20% 代价实际跑的是 CherryClaw（run_full_backtest.py 无条件用 CherryClaw），而 settings.main_strategy
+    是 intraday_reversal。即上次那个 -5.33pp 回撤来自一个已停用策略，口径错配。本条在修正策略选择后重测同一件事。
+  pre_registered_at: '2026-11-16'
+  method:
+    pairing: fifo
+    universe: run_full_backtest.py head-50 主板池，按 settings.main_strategy 选策略（修正后为 intraday_reversal），仅改
+      risk.max_single_position
+    is_window:
+    - '2024-10-15'
+    - '2025-12-31'
+    oos_window:
+    - '2026-01-01'
+    - '2026-11-13'
+  pass_criteria:
+    min_oos_improvement_pp: 0.0
+    max_mdd_increase_pp: 5.0
+    require_significance: false
+  status: failed
+  evidence: 已修 run_full_backtest.py 的策略选择：此前它无条件用 CherryClaw，而 settings.main_strategy=intraday_reversal，导致
+    2026-11-16 那次 15%->20% 的代价实测（回撤 +5.33pp）实际来自一个已停用策略，口径错配。修正后重测同一件事：全窗口 总收益 +1.70%->-4.06%（-5.76pp）、最大回撤
+    -10.84%->-5.46%（**改善 5.38pp**）、夏普 -0.258->-0.803、胜率 34.85%->33.00%、期末权益 101,701->95,943（-5,757 元）。IS（2024-10-15~2025-12-31）：+1.19%
+    vs -2.39%（20% 差 3.58pp）；OOS（2026-01-01~2026-11-13）：+0.05% vs -2.34%（差 2.39pp），OOS 回撤 -10.84% vs -5.46%（20%
+    更好）。判定 failed：OOS 收益劣化 -2.39pp，不满足「不劣化」门槛（回撤门槛反而通过）。重要修正：在实盘策略上 20% 不是「更高风险」，而是「更低收益 + 更低回撤」——与 CherryClaw
+    上「收益和回撤双输」的结论相反。注意：两个口径的 OOS 收益都接近零（+0.05% vs -2.34%），2.4pp 的差在两年窗口内属噪声量级。
+  decided_at: '2026-11-16'
+- id: H-2026-11-16-008
+  title: 买入后 5 日涨幅为负即离场，优于基线
+  rationale: 行为归因显示：进场涨幅<=2% 的波最终胜率仅 9.5%（OOS 0%），而「进场涨幅」是事后变量不能当信号；实时可得的代理是买入后 5 日涨幅（全样本 delta=0.463、OOS
+    0.528、FDR=0.001）。本条把它做成可执行规则：买入后第 5 个交易日收盘，若相对成本涨幅 <0% 则次日全部离场，与基线对比。方向预测：该规则会提高胜率但可能砍掉后段反弹，净效果不确定，故设
+    2pp 的净收益门槛。
+  pre_registered_at: '2026-11-16'
+  method:
+    pairing: fifo
+    universe: run_full_backtest.py head-50 主板池 + IntradayReversal；基线=原规则，实验组=加「5 日观察哨」离场规则，其余完全相同
+    is_window:
+    - '2024-10-15'
+    - '2025-12-31'
+    oos_window:
+    - '2026-01-01'
+    - '2026-11-13'
+  pass_criteria:
+    min_oos_improvement_pp: 2.0
+    max_mdd_increase_pp: 5.0
+    require_significance: false
+  status: failed
+  evidence: 实验组 = IntradayReversal + FiveDayWatchStrategy（信号 bar 记第0根，第5根 bar 收盘涨幅 <阈值 即全部离场）。结果（50 只主板
+    x 2 年，上限 20%）：基线 总收益 -4.06%/回撤 -5.46%/OOS -2.34%；days=5,thr=0% → -5.56%/-6.75%/OOS -4.34%（OOS 净收益
+    -2.00pp，未过 +2pp 门槛）；days=5,thr=-2% → -6.03%/-6.81%/OOS -4.35%；days=10,thr=0% → -4.02%/-5.46%/OOS -2.34%。判定
+    failed 的直接理由：OOS 净收益 -2.00pp < 门槛 +2.0pp。更重要的诊断：实际只触发 3 次（days=5,thr=-2% 触发 2 次）。原因是规则与现有止损高度重叠——IR
+    在窗口内生成 665 个买入信号，其中 328 个在第 5 根 bar 收益为负（离线诊断确认会发 sell），但引擎实际仅成交约 94 笔，且移动止盈 3% / -5% 执行 / -8% 强制止损在观察哨到期前就把亏损单清掉了，最终只有
+    3 笔走到第 5 天仍为负。故本实验样本量无检验力，既不能确认也不能强否证该规则。重要限定：本实验是在**已有系统化止损**的引擎里做的；用户真实交易口径下 36% 的波进场增益<=2%、平均持有
+    26 天，观察哨可能仍有价值，但需在 wave 口径上另行验证，不能由本实验直接推广或否定。
+  decided_at: '2026-11-16'

@@ -71,10 +71,39 @@ def build_sector_map(client: TushareClient, store: DuckDBStore) -> dict[str, str
     return sector_map
 
 
+def make_strategy(settings):
+    """按 settings.main_strategy 构造策略（2026-11-16 修复口径错配）。
+
+    历史问题：这里原本无条件构造 CherryClaw，而 config/settings.yaml 的
+    main_strategy 是 intraday_reversal —— 于是一切「全量回测」结论都来自一个
+    已停用策略，包括 2026-11-16 那次单票上限 15%->20% 的代价实测。
+    现在按配置选，回测口径与实盘口径一致。
+    """
+    s, r = settings.strategy, settings.risk
+    name = (getattr(s, "main_strategy", "") or "intraday_reversal").strip()
+    if name == "cherry_claw":
+        return CherryClaw(
+            ma_periods=tuple(s.ma_periods),
+            golden_cross_max_freshness=s.golden_cross_max_freshness_days,
+            volume_ratio_threshold=s.volume_ratio_threshold,
+            entity_ratio_threshold=s.entity_ratio_threshold,
+            close_to_ma5_max_dev=s.close_to_ma5_max_dev,
+            max_position_pct=r.max_single_position,
+            stop_loss_force_pct=r.stop_loss_force,
+        )
+    from lihu_quantify.strategy.intraday_reversal import IntradayReversal
+
+    return IntradayReversal(
+        max_position_pct=r.max_single_position,
+        stop_loss_force_pct=r.stop_loss_force,
+    )
+
+
 def _config_hash(settings) -> str:
     """配置摘要（回测结果可追溯：参数+费率+过滤模式）。"""
     s, r, b = settings.strategy, settings.risk, settings.backtest
     payload = json.dumps({
+        "main_strategy": getattr(s, "main_strategy", ""),
         "ma_periods": s.ma_periods,
         "freshness": s.golden_cross_max_freshness_days,
         "volume_ratio": s.volume_ratio_threshold,
@@ -156,15 +185,8 @@ def main():
     s = settings.strategy
     r = settings.risk
     b = settings.backtest
-    strategy = CherryClaw(
-        ma_periods=tuple(s.ma_periods),
-        golden_cross_max_freshness=s.golden_cross_max_freshness_days,
-        volume_ratio_threshold=s.volume_ratio_threshold,
-        entity_ratio_threshold=s.entity_ratio_threshold,
-        close_to_ma5_max_dev=s.close_to_ma5_max_dev,
-        max_position_pct=r.max_single_position,
-        stop_loss_force_pct=r.stop_loss_force,
-    )
+    strategy = make_strategy(settings)
+    logger.info(f"策略：{type(strategy).__name__}（main_strategy={getattr(s, 'main_strategy', '')}）")
     broker = SimulatedBroker(
         commission_rate=b.commission, stamp_tax_rate=b.stamp_tax, slippage=b.slippage,
     )
@@ -197,6 +219,8 @@ def main():
         "market_filter_mode": s.market_filter_mode if s.market_filter else "off",
         "pool_info": {
             "type": "head-N 主板池",
+            "strategy": type(strategy).__name__,
+            "main_strategy": getattr(s, "main_strategy", ""),
             "n_requested": args.n,
             "n_with_data": len(data),
             "years": args.years,

@@ -104,7 +104,12 @@ def test_script_runs_without_error_and_prints_summary():
     assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
     assert "校验通过" in proc.stdout
     assert "pending" in proc.stdout
-    assert "共 2 条" in proc.stdout or "共 2 条" in proc.stdout.replace(" ", "")
+    # 不断言固定条数：登记册会随着研究推进持续追加
+    # （H-2026-11-16-003/004 加入时踩过一次，硬编码 "共 2 条" 直接把测试打红）。
+    # 这里只校验摘要报出的条数与登记册实际条数一致。
+    n = len(load_registry())
+    flat = proc.stdout.replace(" ", "")
+    assert f"共{n}条" in flat, f"摘要条数与登记册不一致（期望 {n} 条）：{proc.stdout}"
 
 
 def test_script_exits_1_on_invalid_registry(tmp_path: Path):

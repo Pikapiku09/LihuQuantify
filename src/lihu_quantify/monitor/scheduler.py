@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -247,12 +250,66 @@ def _risk_budget_coef(budget: dict, market_state: str) -> float:
     return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
 
 
+def _maybe_refresh_behavior_audit(cfg: dict, path: Path) -> bool:
+    """缓存过期时调 ``scripts/behavior_audit.py`` 重算一次（2026-11-16）。
+
+    为什么需要它：行为体检要读几百笔交割单 + 逐轮查 DuckDB 行情，不能放在每日巡检里，
+    原本只能人工跑 CLI 生成 ``outputs/behavior_report.json``。结果是缓存过期后
+    日报会一直标黄、第 7 项指标（买入后 5 日观察哨）形同失效 —— 2026-11-16 实测
+    缓存已经是当天的，但没有任何机制保证它 7 天后还是新的。
+
+    为什么不另起定时器：行为体检的输入是**外部交割单文件**，没有事件可挂钩；
+    而日报每天都会读这份缓存，读之前顺手判一次新旧最省事。
+
+    失败只记 warning、返回 False —— 体检数据缺失绝不能杀死巡检。
+    """
+    fills = cfg.get("fills") or []
+    if not isinstance(fills, list) or not fills:
+        return False                      # 未配置交割单 → 只读缓存，不重算
+    missing = [str(f) for f in fills if not Path(str(f)).exists()]
+    if missing:
+        logger.warning(f"[行为体检] 交割单缺失，跳过自动重算：{missing}")
+        return False
+    days = _as_int_between(cfg.get("auto_refresh_days"), 7, 1, 365)
+    try:
+        age_days = (time.time() - path.stat().st_mtime) / 86400.0
+    except OSError:
+        age_days = 1e9                    # 缓存不存在 → 视为过期
+    if age_days < days:
+        return False
+    script = _ROOT / "scripts" / "behavior_audit.py"
+    if not script.exists():
+        logger.warning(f"[行为体检] 找不到 {script}，跳过自动重算")
+        return False
+    cmd = [sys.executable, str(script),
+           "--fills", *[str(f) for f in fills],
+           "--json", str(path)]
+    try:
+        # encoding 必须显式指定：Windows 下 text=True 默认按 locale（GBK）解码，
+        # 而 CLI 输出是 UTF-8 中文，会抛 UnicodeDecodeError（2026-11-16 实测）。
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"[行为体检] 自动重算失败（不影响巡检）: {exc}")
+        return False
+    if proc.returncode != 0:
+        logger.warning(f"[行为体检] 自动重算退出码 {proc.returncode}："
+                       f"{(proc.stderr or '')[-300:]}")
+        return False
+    logger.info(f"[行为体检] 缓存已自动重算（原过期 {age_days:.1f} 天）")
+    return True
+
+
 def _load_behavior_audit() -> Optional[dict]:
-    """读行为体检缓存，供日报展示（纯只读展示层）。
+    """读行为体检缓存，供日报展示（纯只读展示层 + 过期自动重算）。
 
     为什么只读缓存而不现场计算：行为体检要读几百笔交割单并逐轮查 DuckDB 行情，
     放在每日巡检里会显著拖慢流程。故由 ``scripts/behavior_audit.py --json``
     定期生成缓存，巡检只做一次 JSON 读取。
+
+    2026-11-16：加入 ``_maybe_refresh_behavior_audit``——配置了 ``fills`` 且缓存超过
+    ``auto_refresh_days`` 天时，在读之前自动重算一次。此前只能人工跑 CLI，
+    没人记得跑就会出现「日报一直标黄、第 7 项指标失效」。
 
     返回 None 的情形（日报整节省略、线上行为与改造前一致）：
         - settings.yaml 无 behavior_audit 块，或 enabled != true
@@ -269,6 +326,10 @@ def _load_behavior_audit() -> Optional[dict]:
     path = Path(str(cache))
     if not path.is_absolute():
         path = _ROOT / str(cache)
+    try:
+        _maybe_refresh_behavior_audit(cfg, path)
+    except Exception as exc:  # noqa: BLE001 - 自动重算是增强，失败不得影响巡检
+        logger.warning(f"[行为体检] 自动重算流程异常（忽略）: {exc}")
     stale_days = _as_int_between(cfg.get("stale_days"), 7, 1, 365)
     try:
         from ..behavior.report import load_cached

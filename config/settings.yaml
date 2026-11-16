@@ -166,6 +166,15 @@ behavior_audit:
   enabled: true
   cache_json: "outputs/behavior_report.json"
   stale_days: 7                         # 缓存超过 N 天 → 日报标黄提示"数据陈旧"
+  # 2026-11-16：缓存过期自动重算。此前只能人工跑 CLI，没人记得跑就会出现
+  # 「日报一直标黄 + 第 7 项指标（买入后 5 日观察哨）形同失效」。
+  # 配了 fills 且缓存超过 auto_refresh_days 天时，巡检读缓存前会先调
+  # scripts/behavior_audit.py 重算一次；失败只记 warning，不影响巡检。
+  # 把 fills 留空即可退回「只读缓存、不自动重算」的旧行为。
+  auto_refresh_days: 7
+  fills:
+    - "E:/Dsh_WorkSapce/Dify_Agents/投研反思/Table_1010.csv"
+    - "E:/Dsh_WorkSapce/Dify_Agents/投研反思/Table_1254.csv"
 
 # 影子账本（第十二轮：多池并行积累参考样本）
 # 统计纪律：评审进度/胜率以主账本（paper_state.json）为准；影子仅跨池稳健性对照，

@@ -194,8 +194,24 @@ for c, v in opening.items():
         pos_df[c] = pos_df.get(c, 0.0) + v
 
 cash_series = cash0 + cf_day.reindex(cal, fill_value=0.0).cumsum()
-mv_series = (pos_df * px.reindex(cal)).sum(axis=1, min_count=1)
-mv_series = mv_series.fillna(0.0)
+# ---- 估值价格面板 ----------------------------------------------------------
+# 有些标的的行情在分析窗口内**根本不存在**（例如凤凰航运 000520 在 2026-06~07 交易了
+# 47.7 万元，但行情从 2026-08-03 才开始）。若不处理，持仓市值会按 0 计，
+# 权益会出现荒谬的负值。这里采用「行情优先 → 缺失日用该标的当日成交均价 → ffill」。
+px_fill = fl.pivot_table(index="d", columns="ts_code", values="price", aggfunc="mean")
+px_val = px.copy()
+for c in px_fill.columns:
+    s = px_fill[c].dropna()
+    if c in px_val.columns:
+        px_val[c] = px_val[c].where(px_val[c].notna(), s)
+    else:
+        px_val[c] = s
+px_val = px_val.ffill().reindex(cal)
+mv_series = (pos_df * px_val).sum(axis=1, min_count=1).fillna(0.0)
+na_cells = int((pos_df.abs() > 1e-9).mul(px_val.isna()).sum().sum())
+print(f"  无行情标的数 {len(no_quote)}（春风转债已整体排除）；"
+      f"用成交价兜底的标的 {int((px_val.iloc[-1].notna() & px.iloc[-1].isna()).sum())} 只")
+print(f"  持仓>0 但仍无任何价格的 (日×标的) 单元格：{na_cells}（已按 0 计值）")
 print(f"  成交额：买入 {buy_gross:,.0f}｜卖出 {sell_gross:,.0f}｜费用 {fee_total:,.0f}")
 print(f"  排除标的 {sorted(EXCLUDED_CODES)} 的卖出回款 {excluded_proceeds:,.2f} 元（无持仓、无行情）")
 print(f"  全程现金流合计 {float(fl['cashflow'].sum()):+,.2f} 元")
@@ -446,7 +462,9 @@ payload = {
         "dropped_late_fills": int(len(dropped)),
         "opening_positions_excluded": {c: int(v) for c, v in opening.items()},
         "opening_positions_total_units": int(opening_total),
-        "opening_position_sale_proceeds_excluded": round(unmatched_proceeds, 2),
+        "opening_positions_day0_value": round(mv0, 2),
+        "opening_positions_valuation": "期初持仓按首日收盘价计入模型成本，其盈亏从首日起算",
+        "excluded_code_sale_proceeds": round(excluded_proceeds, 2),
     },
     "limitations": [
         "初始资金 110000 元为假设值，不是交割单中的事实；收益率水平依赖该假设",
@@ -498,6 +516,7 @@ payload = {
 OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 OUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 print(f"\n  已写出 {OUT_JSON}（{OUT_JSON.stat().st_size:,} 字节）")
+
 
 
 

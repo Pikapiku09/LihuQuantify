@@ -250,6 +250,56 @@ def _risk_budget_coef(budget: dict, market_state: str) -> float:
     return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
 
 
+def _write_strategy_health() -> Optional[str]:
+    """把模拟盘健康度快照写给 dsh-invest 工作台（2026-11-16）。
+
+    为什么需要它：dsh-invest 的「策略健康」页读的是
+    ``outputs/strategy_health.json``（只读契约），而那份文件此前只能人工跑
+    ``scripts/export_strategy_health.py`` 生成。不自动写，页面上就永远是一份陈旧的
+    快照——比没有更糟，因为旧数据看起来跟真的一样。
+
+    为什么用子进程而不是 import：``scripts/`` 是入口层，``src/`` 是包层，
+    让包反向依赖脚本正是 merge-survey 点出的反模式（web/server.py 就这么干过）。
+    子进程隔离还能保证导出脚本出错时不污染调度器状态。
+
+    失败只记 warning、返回 None —— 快照缺失绝不能让巡检失败。
+    """
+    try:
+        cfg = _read_settings_yaml().get("strategy_health") or {}
+    except Exception:  # noqa: BLE001 - 坏配置不得杀死巡检
+        return None
+    if not isinstance(cfg, dict) or not _as_bool(cfg.get("enabled"), False):
+        return None
+    rel = str(cfg.get("out_json") or "outputs/strategy_health.json")
+    path = Path(rel)
+    if not path.is_absolute():
+        path = _ROOT / rel
+    hours = _as_int_between(cfg.get("refresh_hours"), 20, 1, 168)
+    try:
+        age_h = (time.time() - path.stat().st_mtime) / 3600.0
+    except OSError:
+        age_h = 1e9                             # 不存在 → 视为过期
+    if age_h < hours:
+        return str(path)                        # 新鲜，跳过（返回路径便于调用方记录）
+    script = _ROOT / "scripts" / "export_strategy_health.py"
+    if not script.exists():
+        logger.warning(f"[策略健康] 找不到 {script}，跳过导出")
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--out", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"[策略健康] 导出失败（不影响巡检）: {exc}")
+        return None
+    if proc.returncode != 0:
+        logger.warning(f"[策略健康] 导出退出码 {proc.returncode}：{(proc.stderr or '')[-300:]}")
+        return None
+    logger.info(f"[策略健康] 快照已刷新（原过期 {age_h:.1f} 小时）→ {path}")
+    return str(path)
+
+
 def _maybe_refresh_behavior_audit(cfg: dict, path: Path) -> bool:
     """缓存过期时调 ``scripts/behavior_audit.py`` 重算一次（2026-11-16）。
 
@@ -1417,6 +1467,8 @@ class DailyScanner:
         summary["mdd_guard"] = mdd_guard
         # 行为体检摘要（纯展示层；未启用或无缓存 → None，日报整节省略）
         summary["behavior_audit"] = _load_behavior_audit()
+        # 策略健康快照（写给 dsh-invest 工作台的只读契约；失败不影响巡检）
+        summary["strategy_health"] = _write_strategy_health()
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
         #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
         #      结果随 last_scan.json 持久化） ----

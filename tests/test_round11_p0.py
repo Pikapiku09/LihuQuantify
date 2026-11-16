@@ -207,16 +207,18 @@ def test_position_gate_first_buy_bounds():
 
     gate = ChecklistGate()
     acc = AccountSnapshot(total_asset=100_000.0)
-    # 顶格 15%：15000/100000 在 IEEE-754 下略大于 0.15，检查须留容差放行
+    # 门槛从配置读，不写死：单票上限调整过两次（25%→15%→20%），
+    # 写死数字会让改风控参数时测试假红。这里测的是「边界放行 / 超线拒绝」的语义。
+    cap = gate.MAX_SINGLE_PCT
     ok = gate._check_position(_pos_signal(), acc,
-                              CheckContext(invest_amount=15_000.0))
+                              CheckContext(invest_amount=cap * 100_000))
     assert ok.approved is True
     bad = gate._check_position(_pos_signal(), acc,
-                               CheckContext(invest_amount=16_000.0))
+                               CheckContext(invest_amount=cap * 100_000 * 1.01))
     assert bad.approved is False
-    # 存量 10% 时本笔 5% 恰好达线 → 通过
+    # 存量 10% 时本笔恰好补到上限 → 通过
     edge = gate._check_position(_pos_signal(), _pos_snapshot(0.10),
-                                CheckContext(invest_amount=5_000.0))
+                                CheckContext(invest_amount=(cap - 0.10) * 100_000))
     assert edge.approved is True
 
 

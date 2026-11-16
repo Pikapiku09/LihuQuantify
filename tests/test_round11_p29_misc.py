@@ -45,7 +45,10 @@ def test_p29_limits_constants_read_settings(tmp_path, monkeypatch):
     from lihu_quantify.risk.limits import MAX_SECTOR_POSITION, MAX_SINGLE_POSITION
 
     st = get_settings()
-    assert MAX_SINGLE_POSITION == st.risk.max_single_position == 0.15
+    # 不断言固定数值：单票上限会被风控决策调整（2026-11-14 25%→15%，2026-11-16 15%→20%），
+    # 写死数字会让"改配置"这个正常动作把测试打红。这里只校验「单一事实来源」这条不变量。
+    assert 0 < MAX_SINGLE_POSITION <= 0.30
+    assert MAX_SINGLE_POSITION == st.risk.max_single_position
     assert MAX_SECTOR_POSITION == st.risk.max_sector_position == 0.40
     # checklist / position_limit 引用同一常量来源
     from lihu_quantify.risk.checklist import ChecklistGate

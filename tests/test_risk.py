@@ -205,12 +205,12 @@ def test_stop_loss_calc_price():
 
 def test_position_limiter_single_reject():
     limiter = PositionLimiter()
-    # 总资产 10万，已持市值 2万，再加 1万 → 单票 30% > 15% 上限（2026-11-14 由 25% 收紧）
+    # 总资产 10万，已持市值 2万，再加 1万 → 单票 30%，超过上限（由配置读，不写死）
     positions = [Position(ts_code="600519.SH", volume=100, cost=180, current_price=200, sector="白酒")]
     account = AccountSnapshot(total_asset=100000, cash=80000, positions=positions)
     ok, reason = limiter.can_add("600519.SH", 10000, account, sector="白酒")
     assert not ok
-    assert "15%" in reason
+    assert f"{PositionLimiter.MAX_SINGLE:.0%}" in reason
 
 
 def test_position_limiter_sector_reject():
@@ -226,14 +226,16 @@ def test_position_limiter_sector_reject():
 def test_position_limiter_pass():
     limiter = PositionLimiter()
     account = AccountSnapshot(total_asset=100000, cash=100000, positions=[])
-    # 12% < 15% 单票上限（2026-11-14 由 25% 收紧）
+    # 上限从配置读，不写死（25%→15%→20% 调过两次，写死会让改风控参数时测试假红）
+    cap = PositionLimiter.MAX_SINGLE
+    # 明显低于上限
     ok, reason = limiter.can_add("600519.SH", 12000, account, sector="白酒")
     assert ok, reason
-    # 边界回归：恰好顶格 15% 必须放行。
-    # 15000/100000 在 IEEE-754 下 = 0.15000000000000002，此前无容差比较会把
+    # 边界回归：恰好顶格必须放行。
+    # 顶格金额 / 总资产 在 IEEE-754 下可能略大于上限常量，此前无容差比较会把
     # 所有"顶格"仓位误拒（曾导致回测 0 成交），见 position_limit.can_add 注释。
-    ok_edge, reason_edge = limiter.can_add("600519.SH", 15000, account, sector="白酒")
-    assert ok_edge, f"顶格 15% 应放行，实际：{reason_edge}"
+    ok_edge, reason_edge = limiter.can_add("600519.SH", cap * 100000, account, sector="白酒")
+    assert ok_edge, f"顶格应放行，实际：{reason_edge}"
 
 
 def test_position_limiter_no_averaging_down():

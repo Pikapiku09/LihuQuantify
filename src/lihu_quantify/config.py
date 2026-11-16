@@ -102,8 +102,14 @@ class VolTargetConfig(BaseModel):
 class RiskConfig(BaseModel):
     # 2026-11-14 口径统一：此前 scheduler._build_strategy 对 IntradayReversal 硬编码
     # min(cfg, 0.15)，而调度器 budget/invest 两处按 0.25 计算 —— 同一配置被解释成
-    # 两个不同值。现将 15% 收敛为唯一定义，禁止任何调用方再硬编码。
-    max_single_position: float = 0.15
+    # 两个不同值。现将单票上限收敛为唯一定义，禁止任何调用方再硬编码。
+    #
+    # 2026-11-16 由 0.15 放宽到 0.20（用户明确指示，与 dsh-invest v0.57.0 的插件口径统一）。
+    # ⚠ 该变更在 H-2026-11-16-005 中预注册的门槛是「回撤恶化 ≤5pp」，实测 −5.33pp，判定 failed。
+    #   回测口径 run_full_backtest.py 50 只主板 x 2 年：总收益 -13.59%→-20.59%、
+    #   最大回撤 -15.26%→-20.59%、期末权益 86,411→79,409（-7,002 元）。
+    #   放行是用户决策，不是回测结论；要回滚只需把本行改回 0.15。
+    max_single_position: float = 0.20
     vol_target: VolTargetConfig = VolTargetConfig()   # P4（2026-09-26）主账本默认启用
     sentiment_filter: SentimentFilterConfig = SentimentFilterConfig()   # P6（2026-09-27）
     max_sector_position: float = 0.40

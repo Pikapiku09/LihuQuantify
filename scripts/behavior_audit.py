@@ -88,6 +88,46 @@ def _make_high_lookup(db_path: Path):
     return lookup, close
 
 
+def _make_close_at(db_path: Path):
+    """返回 close_at(code, start_date, n) -> start 之后第 n 个交易日的收盘价。
+
+    用于「买入后 N 日观察哨」。取不到（代码不在库 / 后续交易日不足）返回 None。
+    与 high_lookup 共用同一只读连接，避免重复打开 DuckDB。
+    """
+    cache: dict[tuple, float | None] = {}
+    con = None
+    if db_path and Path(db_path).exists():
+        try:
+            import duckdb
+            con = duckdb.connect(str(db_path), read_only=True)
+        except Exception:  # noqa: BLE001
+            con = None
+
+    def close_at(ts_code: str, start, n: int) -> float | None:
+        if con is None:
+            return None
+        key = (ts_code, str(start), int(n))
+        if key in cache:
+            return cache[key]
+        try:
+            row = con.execute(
+                "SELECT close FROM daily_quotes WHERE ts_code=? "
+                "AND trade_date >= ? ORDER BY trade_date LIMIT 1 OFFSET ?",
+                [ts_code, start, int(n)],
+            ).fetchone()
+            val = float(row[0]) if row and row[0] is not None else None
+        except Exception:  # noqa: BLE001
+            val = None
+        cache[key] = val
+        return val
+
+    def close() -> None:
+        if con is not None:
+            con.close()
+
+    return close_at, close
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="交割单行为体检")
     ap.add_argument("--fills", nargs="+", required=True, help="交割单 CSV（GBK 编码）")
@@ -108,10 +148,13 @@ def main(argv=None) -> int:
 
     rounds = pair_round_details(to_trade_records(fills))
     lookup, close_db = _make_high_lookup(Path(args.db))
+    close_at, close_db2 = _make_close_at(Path(args.db))
     try:
-        report = build_report(fills, rounds, lookup, capital_base=args.capital)
+        report = build_report(fills, rounds, lookup, capital_base=args.capital,
+                              close_at=close_at)
     finally:
         close_db()
+        close_db2()
 
     wrote = False
     if args.json_out:

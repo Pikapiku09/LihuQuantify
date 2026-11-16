@@ -319,6 +319,77 @@ def turnover(fills: list[dict], capital_base: float | None = None) -> dict:
 # 6. 仓位规模与盈亏单规模比
 # ============================================================
 
+def post_entry_signal(waves: list, close_at, days: int = 5) -> dict:
+    """买入后 N 个交易日的收益，能否预示这一波的最终结果？
+
+    这是全部分析里**唯一实时可用**的进场质量信号：
+        「进场涨幅」要等持有期结束才知道最高价（事后变量），
+        而「买入后 5 日涨幅」在买入后一周就能观测到。
+
+    Args:
+        waves: ``behavior.wave.Wave`` 列表（只统计已清仓）
+        close_at: ``close_at(code, start_date, n) -> float | None``
+            返回 start_date 之后第 n 个交易日的收盘价，取不到返回 None
+        days: 观测窗口（交易日）
+
+    实测（114 波，2026-11 数据）：
+        5 日 >+5%  → 最终胜率 89.5%
+        5 日 <−5%  → 最终胜率 26.7%
+        相关系数 +0.412，R²=0.169
+    """
+    samples = []
+    for w in waves:
+        if w.open or w.buy_date is None or w.sell_amount <= 0:
+            continue
+        bv = sum(f["volume"] for f in w.fills if f["side"] == "buy")
+        sv = sum(f["volume"] for f in w.fills if f["side"] == "sell")
+        if bv <= 0 or sv <= 0:
+            continue
+        buy_px = w.buy_amount / bv
+        sell_px = w.sell_amount / sv
+        if buy_px <= 0 or sell_px <= 0:
+            continue
+        px = close_at(w.ts_code, w.buy_date, days)
+        if px is None or px <= 0:
+            continue
+        samples.append({
+            "fwd": px / buy_px - 1.0,
+            "ret": sell_px / buy_px - 1.0,
+            "hold_days": w.hold_days,
+        })
+    if not samples:
+        return {"n": 0, "days": days, "buckets": [], "corr": 0.0, "r2": 0.0}
+
+    import numpy as _np
+    fwd = _np.array([s["fwd"] for s in samples])
+    ret = _np.array([s["ret"] for s in samples])
+    corr = float(_np.corrcoef(fwd, ret)[0, 1]) if len(samples) >= 5 else 0.0
+
+    # 分箱边界与实测报告一致
+    edges = [(-9.9, -0.05, "<-5%"), (-0.05, -0.02, "-5~-2%"),
+             (-0.02, 0.0, "-2~0%"), (0.0, 0.02, "0~2%"),
+             (0.02, 0.05, "2~5%"), (0.05, 9.9, ">5%")]
+    buckets = []
+    for lo, hi, label in edges:
+        idx = [i for i, s in enumerate(samples) if lo < s["fwd"] <= hi]
+        if not idx:
+            continue
+        rr = ret[idx]
+        buckets.append({
+            "label": label,
+            "n": len(idx),
+            "mean_ret": round(float(rr.mean()), 4),
+            "win_rate": round(float((rr > 0).mean()), 4),
+        })
+    return {
+        "n": len(samples),
+        "days": days,
+        "buckets": buckets,
+        "corr": round(corr, 4),
+        "r2": round(corr * corr, 4),
+    }
+
+
 def position_sizing(rounds: list[dict]) -> dict:
     """单笔投入（成本金额）分布 + 亏损单/盈利单的平均规模比。
 

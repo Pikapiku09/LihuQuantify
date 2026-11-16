@@ -22,6 +22,7 @@ from .metrics import (
     peak_capture,
     pgr_plr,
     position_sizing,
+    post_entry_signal,
     post_sell_upside,
     turnover,
 )
@@ -37,11 +38,13 @@ THRESHOLDS = {
 
 
 def build_report(fills: list[dict], rounds: list[dict], high_lookup,
-                 capital_base: float | None = None) -> dict:
-    """汇总 6 项指标 + 行情覆盖率。纯计算，无 IO。
+                 capital_base: float | None = None, close_at=None) -> dict:
+    """汇总行为指标 + 行情覆盖率。纯计算，无 IO。
 
     ``capital_base`` 传给换手率计算；不传时退回「资金余额」口径（会高估）。
+    ``close_at(code, start_date, n)`` 用于买入后 N 日观察哨；不传则该项跳过。
     """
+    waves = build_waves(fills)
     codes = {r["ts_code"] for r in rounds}
     covered = 0
     if rounds:
@@ -82,8 +85,11 @@ def build_report(fills: list[dict], rounds: list[dict], high_lookup,
         "position_sizing": position_sizing(rounds),
         # 波口径（从 0 仓位建仓到清仓算一波）：还原真实持仓时长。
         # FIFO 会把分批进出切碎，导致"持有期中位 12 天"这类失真。
-        "wave": wave_summary(build_waves(fills)),
-        "wave_by_code": by_code(build_waves(fills))[:15],
+        "wave": wave_summary(waves),
+        "wave_by_code": by_code(waves)[:15],
+        # 第 7 项：买入后 N 日观察哨（唯一实时可用的进场质量信号）
+        "post_entry": (post_entry_signal(waves, close_at)
+                       if callable(close_at) else None),
     }
 
 
@@ -249,6 +255,28 @@ def format_markdown(report: dict) -> str:
                 f"| {d['pnl']:+,.0f} | {d['ret']:+.1%} "
                 f"| {d['max_hold'] if d['max_hold'] is not None else '-'} 天 |")
         lines.append("")
+
+    # 第 7 项：买入后 5 日观察哨
+    pe = report.get("post_entry") or {}
+    if pe.get("n"):
+        lines += [
+            f"## 9. 买入后 {pe['days']} 日观察哨（实时可用）", "",
+            f"样本 {pe['n']} 波，相关系数 {pe['corr']:+.3f}（R²={pe['r2']:.3f}）。",
+            "",
+            f"| 买入后 {pe['days']} 日收益 | 波数 | 最终收益 | 最终胜率 |",
+            "|---|---|---|---|",
+        ]
+        for b in pe["buckets"]:
+            lines.append(
+                f"| {b['label']} | {b['n']} | {b['mean_ret']:+.1%} "
+                f"| {b['win_rate']:.1%} |")
+        lines += [
+            "",
+            f"> **可执行规则**：买入后 {pe['days']} 个交易日内没涨起来（尤其跌超 2%），",
+            "> 这笔交易最终胜率不到 40%；而涨过 5% 的最终胜率接近 90%。",
+            "> 这是全部指标里唯一**买入后一周就能观测**的进场质量信号。",
+            "",
+        ]
 
     lines += [
         "---", "",

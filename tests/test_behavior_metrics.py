@@ -19,9 +19,11 @@ from lihu_quantify.behavior.metrics import (
     peak_capture,
     pgr_plr,
     position_sizing,
+    post_entry_signal,
     post_sell_upside,
     turnover,
 )
+from lihu_quantify.behavior.wave import build_waves
 from lihu_quantify.types import TradeRecord
 
 
@@ -250,3 +252,62 @@ def test_position_sizing_loss_to_win_ratio():
     assert out["win_cost_mean"] == pytest.approx(10000.0)
     assert out["loss_cost_mean"] == pytest.approx(14000.0)
     assert out["loss_to_win_ratio"] == pytest.approx(1.4)
+
+
+# ============================================================
+# 第 7 项：买入后 N 日观察哨
+# ============================================================
+
+def _mk_wave(code, buy_d, sell_d, buy_px, sell_px, vol=1000):
+    fills = [
+        {"ts_code": code, "name": "T", "side": "buy", "trade_date": buy_d,
+         "price": buy_px, "volume": vol, "amount": buy_px * vol, "fee": 0.0,
+         "cash_balance": 0.0},
+        {"ts_code": code, "name": "T", "side": "sell", "trade_date": sell_d,
+         "price": sell_px, "volume": vol, "amount": sell_px * vol, "fee": 0.0,
+         "cash_balance": 0.0},
+    ]
+    return build_waves(fills)[0]
+
+
+def test_post_entry_signal_buckets_and_corr():
+    """买入后 5 日涨得多的波，最终也赚得多 → 正相关。"""
+    waves = []
+    # 造 5 个波：fwd 从 -8% 递增到 +8%，ret 同向
+    for i, (fwd, ret) in enumerate([(-0.08, -0.10), (-0.03, -0.05),
+                                    (-0.01, -0.01), (0.03, 0.05), (0.08, 0.12)]):
+        d0 = date(2026, 1, 5) + timedelta(days=i * 40)
+        waves.append(_mk_wave(f"A{i}", d0, d0 + timedelta(days=20),
+                              10.0, 10.0 * (1 + ret)))
+
+    fwd_map = {"A0": -0.08, "A1": -0.03, "A2": -0.01, "A3": 0.03, "A4": 0.08}
+    out = post_entry_signal(waves, lambda c, s, n: 10.0 * (1 + fwd_map[c]))
+    assert out["n"] == 5
+    assert out["corr"] > 0.9
+    labels = {b["label"] for b in out["buckets"]}
+    assert ">5%" in labels and "<-5%" in labels
+    # 高 fwd 组胜率 100%，低 fwd 组 0%
+    high = next(b for b in out["buckets"] if b["label"] == ">5%")
+    low = next(b for b in out["buckets"] if b["label"] == "<-5%")
+    assert high["win_rate"] == 1.0
+    assert low["win_rate"] == 0.0
+
+
+def test_post_entry_signal_skips_missing_quotes_and_open_waves():
+    d0 = date(2026, 1, 5)
+    closed = _mk_wave("A", d0, d0 + timedelta(days=20), 10.0, 11.0)
+    # 未平仓波不参与
+    open_fills = [{"ts_code": "B", "name": "T", "side": "buy", "trade_date": d0,
+                   "price": 10.0, "volume": 1000, "amount": 10000.0, "fee": 0.0,
+                   "cash_balance": 0.0}]
+    open_w = build_waves(open_fills)[0]
+
+    out = post_entry_signal([closed, open_w], lambda c, s, n: None)
+    assert out["n"] == 0                     # 行情全缺
+    out2 = post_entry_signal([closed, open_w], lambda c, s, n: 10.5)
+    assert out2["n"] == 1                    # 只有已清仓那一波
+
+
+def test_post_entry_signal_empty():
+    out = post_entry_signal([], None, days=5)
+    assert out["n"] == 0 and out["buckets"] == [] and out["corr"] == 0.0

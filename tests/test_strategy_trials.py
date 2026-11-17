@@ -173,3 +173,44 @@ def test_repo_block_consistent():
     assert block["records"]
     assert "n" in block["summary"]["direction_hit_5d"]["expected_up"]
     assert block["rules"]["entry"]
+
+# ===== 复权口径（2026-11-17，v0.68.0）=====
+
+def test_adj_ratio_uses_factor_ratio():
+    """复权收益必须用因子比值，不能只看收盘价。"""
+    from lihu_quantify.monitor.strategy_trials import _adj_ratio
+
+    closes = {"2026-11-05": 10.0, "2026-11-12": 10.0}   # 价格没动
+    adj = {"2026-11-05": 1.0, "2026-11-12": 1.1}        # 但发生除权
+    r = _adj_ratio(closes, adj, "2026-11-05", "2026-11-12")
+    assert r == pytest.approx(0.1), "价格不变但因子变，复权收益应为 +10%"
+
+
+def test_adj_ratio_none_when_factor_missing():
+    from lihu_quantify.monitor.strategy_trials import _adj_ratio
+
+    assert _adj_ratio({"a": 1.0, "b": 2.0}, {}, "a", "b") is None
+
+
+def test_factor_lookup_uses_last_known_before_date():
+    """adj_factors 末日可能落后行情；用「最近已知因子」而不是当 1.0。"""
+    from lihu_quantify.monitor.strategy_trials import _factor_at
+
+    series = {"2026-11-10": 1.2, "2026-11-13": 1.5}
+    assert _factor_at(series, "2026-11-17") == 1.5      # 之后没有 → 用最近已知
+    assert _factor_at(series, "2026-11-11") == 1.2
+    assert _factor_at(series, "2026-11-01") == 1.2      # 之前没有 → 用最早
+
+
+def test_track_one_marks_basis():
+    """有因子标 adjusted；无因子回落原始价并标 raw_fallback（页面据此提示未复权）。"""
+    closes = {d: 10.0 for d in CAL}
+    closes["2026-11-12"] = 11.0
+    adj = {d: 1.0 for d in CAL}
+
+    adjusted = track_one(_row(stance="看多"), CAL, closes, adj=adj)
+    assert adjusted["basis"] == "adjusted"
+
+    fallback = track_one(_row(stance="看多"), CAL, closes, adj={})
+    assert fallback["basis"] == "raw_fallback"
+    assert fallback["ret5"] == pytest.approx(0.1)

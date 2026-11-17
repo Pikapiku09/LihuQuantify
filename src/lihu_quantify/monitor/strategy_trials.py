@@ -78,7 +78,34 @@ def _proposal_id(row: dict) -> str:
     return f"{row.get('ts','')}|{row.get('code','')}|{call}"
 
 
-def track_one(row: dict, calendar: list, closes: dict, max_hold_days: int = DEFAULT_MAX_HOLD) -> dict:
+
+def _factor_at(series: dict, date: str):
+    """取 date 当日或之前最近的复权因子；之前没有则取最早的（避免静默当 1.0）。
+
+    复权因子是阶跃函数，除权除息日才变。adj_factors 的末日可能落后于行情
+    （实测 2026-11-13 vs 行情 11-17），此时用「最近已知因子」是正确的，
+    比拿 1.0 硬算更接近真值。
+    """
+    if not series:
+        return None
+    before = [d for d in series if d <= date]
+    if before:
+        return series[max(before)]
+    after = [d for d in series if d > date]
+    return series[min(after)] if after else None
+
+
+def _adj_ratio(closes: dict, series: dict, base_date: str, later_date: str):
+    """复权后的区间收益。因子缺失返回 None，由调用方回落到原始价。"""
+    c0, c1 = closes.get(base_date), closes.get(later_date)
+    f0, f1 = _factor_at(series, base_date), _factor_at(series, later_date)
+    if not c0 or not c1 or not f0 or not f1:
+        return None
+    return (c1 * f1) / (c0 * f0) - 1.0
+
+
+def track_one(row: dict, calendar: list, closes: dict, max_hold_days: int = DEFAULT_MAX_HOLD,
+              adj: dict | None = None) -> dict:
     """跟踪一条结论。``calendar`` 为升序日期字符串列表，``closes`` 为 {date: close}。"""
     code = str(row["code"])
     ts = str(row["ts"])[:10]
@@ -105,6 +132,7 @@ def track_one(row: dict, calendar: list, closes: dict, max_hold_days: int = DEFA
         "pnl_ratio": None,
         "ret5": None,
         "ret10": None,
+        "basis": None,
         "hit5": None,
         "hit10": None,
     }
@@ -125,7 +153,14 @@ def track_one(row: dict, calendar: list, closes: dict, max_hold_days: int = DEFA
         if len(after) > horizon:
             later = closes.get(after[horizon])
             if later and base_close:
-                ret = later / base_close - 1.0
+                # 优先复权口径（与「判断质量」页一致），因子缺失才回落原始价并标注
+                adj_ret = _adj_ratio(closes, adj or {}, base_date, after[horizon])
+                if adj_ret is not None:
+                    ret = adj_ret
+                    rec["basis"] = "adjusted"
+                else:
+                    ret = later / base_close - 1.0
+                    rec["basis"] = rec["basis"] or "raw_fallback"
                 rec[key_ret] = round(ret, 4)
                 exp = rec["expected_direction"]
                 if exp != 0:
@@ -161,10 +196,19 @@ def track_one(row: dict, calendar: list, closes: dict, max_hold_days: int = DEFA
         rec["mark_date"] = last
         rec["mark_price"] = closes.get(last)
 
+    exit_date = rec["exit_date"] or rec.get("mark_date")
     exit_px = rec["exit_price"] if rec["exit_price"] is not None else rec.get("mark_price")
     if exit_px is not None and base_close:
-        rec["pnl"] = round((exit_px - base_close) * SHARES, 2)
-        rec["pnl_ratio"] = round(exit_px / base_close - 1.0, 4)
+        # 收益率走复权口径；元计盈亏也按复权价估算，并在 basis 里标明
+        adj_ret = _adj_ratio(closes, adj or {}, base_date, exit_date) if exit_date else None
+        if adj_ret is not None:
+            rec["pnl_ratio"] = round(adj_ret, 4)
+            rec["pnl"] = round(base_close * adj_ret * SHARES, 2)
+            rec["basis"] = "adjusted"
+        else:
+            rec["pnl_ratio"] = round(exit_px / base_close - 1.0, 4)
+            rec["pnl"] = round((exit_px - base_close) * SHARES, 2)
+            rec["basis"] = rec["basis"] or "raw_fallback"
     return rec
 
 
@@ -227,6 +271,12 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
         q = con.execute(
             "SELECT ts_code, trade_date, close FROM daily_quotes WHERE ts_code IN ("
             + ",".join("?" * len(codes)) + ")", codes).fetchall()
+        try:
+            adj_rows = con.execute(
+                "SELECT ts_code, trade_date, adj_factor FROM adj_factors WHERE ts_code IN ("
+                + ",".join("?" * len(codes)) + ")", codes).fetchall()
+        except Exception:  # noqa: BLE001 - 无复权表时整块回落原始价
+            adj_rows = []
     finally:
         con.close()
 
@@ -237,7 +287,15 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
             continue
         by_code.setdefault(code, {})[d] = float(close)
 
-    records = [track_one(p, calendar, by_code.get(str(p["code"]), {})) for p in proposals]
+    adj_by_code: dict[str, dict[str, float]] = {}
+    for code, day, factor in adj_rows:
+        d = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        if factor is None:
+            continue
+        adj_by_code.setdefault(code, {})[d] = float(factor)
+
+    records = [track_one(p, calendar, by_code.get(str(p["code"]), {}),
+                         adj=adj_by_code.get(str(p["code"]), {})) for p in proposals]
     # 内部字段不外泄
     for r in records:
         r.pop("_base", None)
@@ -251,6 +309,9 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
             "max_hold_days": DEFAULT_MAX_HOLD,
             "exit": "收盘<=stop → stop；收盘>=target → target；持有>=max_hold → time",
             "long_stances": sorted(_LONG_SET),
+            "return_basis": "优先复权（adj_factor），因子缺失回落原始价并在记录 basis 标注",
+            "adj_covered_codes": len(adj_by_code),
+            "adj_missing_codes": sorted({str(p["code"]) for p in proposals} - set(adj_by_code)),
         },
         "summary": summarize(records),
         "records": records,

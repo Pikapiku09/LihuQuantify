@@ -83,9 +83,22 @@ def build_client() -> TushareClient:
 def target_trading_days(store: DuckDBStore, start: date, end: date) -> list[date]:
     """目标交易日列表。
 
-    优先用本地 ``index_daily`` 的日期（已完整到 2026-11-10），
-    这样可避免依赖空的 ``trade_cal`` 表，且与闸门判定同源。
+    **优先 ``trade_cal``**（``is_open=1``），其次回落 ``index_daily``。
+
+    2026-11-17 修正：原实现以 ``index_daily`` 为准，而 ``index_daily`` 本脚本补不了
+    （不在 ``BY_DATE_TABLES`` 里），导致它的末日 2026-11-10 把整个补数流程也钉死在 11-10 ——
+    「想把行情推到现在」时 days 列表直接缺最新几天，动静皆无。
+    ``trade_cal`` 已覆盖到 2026-12-31，用它才能把行情推进到最新交易日。
     """
+    df = store.query(
+        "SELECT DISTINCT cal_date FROM trade_cal "
+        "WHERE is_open = 1 AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
+        [start, end],
+    )
+    if not df.empty:
+        return [pd.Timestamp(d).date() for d in df["cal_date"].tolist()]
+
+    logger.warning("trade_cal 在该区间无数据，回落到 index_daily")
     df = store.query(
         "SELECT DISTINCT trade_date FROM index_daily "
         "WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date",
@@ -94,7 +107,7 @@ def target_trading_days(store: DuckDBStore, start: date, end: date) -> list[date
     if not df.empty:
         return [pd.Timestamp(d).date() for d in df["trade_date"].tolist()]
 
-    logger.warning("index_daily 在该区间无数据，回落到 Tushare trade_cal")
+    logger.warning("index_daily 在该区间也无数据，无法确定交易日")
     return []
 
 
@@ -175,6 +188,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="保留全市场约 5500 只（默认只保留库中已有股票池，防库膨胀）",
     )
+    parser.add_argument(
+        "--add-codes",
+        default="",
+        help=(
+            "逗号分隔的标的代码，追加进股票池（与库中已有标的取并集）。"
+            "用于把「AI 结论涉及但库里没有行情」的标的补进来，"
+            "比 --full-universe 精确，也不会把库撑大。"
+        ),
+    )
     parser.add_argument("--sleep", type=float, default=0.35, help="每日请求间隔秒（默认 0.35）")
     args = parser.parse_args(argv)
 
@@ -204,10 +226,19 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"待回填交易日 {len(days)} 个：{days[0]} ~ {days[-1]}")
 
         universe: set[str] | None = None
+        extra = {c.strip().upper() for c in (args.add_codes or "").split(",") if c.strip()}
         if not args.full_universe:
             uni_df = store.query("SELECT DISTINCT ts_code FROM daily_quotes")
-            universe = set(uni_df["ts_code"].tolist())
-            logger.info(f"股票池锁定为库中已有 {len(universe)} 只（--full-universe 可放开）")
+            base = set(uni_df["ts_code"].tolist())
+            universe = base | extra
+            if extra:
+                added = extra - base
+                logger.info(f"股票池 = 库中已有 {len(base)} 只 + 指定 {len(extra)} 只"
+                            f"（其中新增 {len(added)} 只，合计 {len(universe)}）")
+                if added:
+                    logger.info(f"新增标的：{sorted(added)}")
+            else:
+                logger.info(f"股票池锁定为库中已有 {len(base)} 只（--full-universe 可放开）")
 
         results = []
         for t in tables:

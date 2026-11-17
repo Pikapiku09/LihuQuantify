@@ -1640,27 +1640,21 @@ class DailyScanner:
         齐全，无需读库）生成 UTF-8 快照（ensure_ascii=False），编码链路
         单一可控，同时根治乱码问题（问题2）。
         schema：[{ts_code, name, industry, close, pct_chg, amount, trade_date}]
+
+        2026-11-17：构建与落盘抽到 monitor/heatmap_snapshot.py，这里只做委托。
+        ⚠ 两边**数据来源不同且无法统一**：巡检进程持有 DuckDB 写锁，自己读库必失败
+        （原注释「web 只读连接必败」就是这个原因），所以只能用内存里的 universe 行情
+        （约 200 只）；手动刷新脚本 scripts/refresh_heatmap_snapshot.py 读库，覆盖更广
+        （约 490 只）。消费端要展示「覆盖只数」，否则用户会以为两者矛盾。
         """
-        rows = [{
-            "ts_code": q["ts_code"],
-            "name": (name_map or {}).get(q["ts_code"]) or q["ts_code"],
-            "industry": (sector_map or {}).get(q["ts_code"]) or "未知",
-            "close": q["close"], "pct_chg": q["pct_chg"],
-            "amount": q["amount"], "trade_date": q["trade_date"],
-        } for q in quotes]
-        # 只保留最新交易日（长期停牌等陈旧 bar 剔除，避免混合日期误导）
-        if rows:
-            max_td = max(r["trade_date"] for r in rows)
-            rows = [r for r in rows if r["trade_date"] == max_td]
-        rows.sort(key=lambda r: -(r.get("amount") or 0))
-        path = _ROOT / "data" / "heatmap_snapshot.json"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-            logger.info(f"[热力图] 快照已写入 {len(rows)} 只（{max_td if rows else '-'}）")
-        except (OSError, TypeError) as e:
-            logger.warning(f"[热力图] 快照写入失败: {e}")
+        from .heatmap_snapshot import build_rows, write_snapshot
+
+        rows = build_rows(quotes, name_map, sector_map)
+        if write_snapshot(_ROOT, rows) is None:
+            logger.warning("[热力图] 快照写入失败")
+            return
+        max_td = rows[0]["trade_date"] if rows else "-"
+        logger.info(f"[热力图] 快照已写入 {len(rows)} 只（{max_td}）")
 
     def _read_last_scan(self) -> Optional[dict]:
         """读 data/last_scan.json（幂等保护，第四轮清单6）。损坏/不存在 → None。"""

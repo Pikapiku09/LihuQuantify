@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OUT_DEFAULT = ROOT / "outputs" / "strategy_health.json"
 
 
@@ -145,6 +145,26 @@ def _block_behavior(report: dict | None) -> tuple[dict | None, list[str]]:
     return out, []
 
 
+def _block_swing() -> tuple[dict | None, list[str]]:
+    """波段池块（v3 新增）：当前池子 + 三年回测 + 随机对照。"""
+    try:
+        from lihu_quantify.monitor.swing_snapshot import build_swing_block
+    except Exception:  # noqa: BLE001
+        return None, ["swing_pool"]
+    try:
+        block = build_swing_block(ROOT)
+    except Exception:  # noqa: BLE001
+        return None, ["swing_pool"]
+    missing = []
+    if not block.get("pool"):
+        missing.append("swing_pool_md")
+    if not block.get("backtest"):
+        missing.append("swing_backtest")
+    if not block.get("robustness"):
+        missing.append("swing_montecarlo")
+    return block, missing
+
+
 def _block_research() -> tuple[dict | None, list[str]]:
     """研究纪律登记册：判决分布 + 最近判定。"""
     try:
@@ -189,7 +209,7 @@ def _block_strategy(settings: dict) -> dict:
 
 
 def _findings(risk: dict | None, research: dict | None, strategy: dict,
-              equity: dict | None = None) -> list[dict]:
+              equity: dict | None = None, swing: dict | None = None) -> list[dict]:
     out: list[dict] = []
     if risk:
         if risk["status"] == "breach":
@@ -215,6 +235,10 @@ def _findings(risk: dict | None, research: dict | None, strategy: dict,
     if research and research.get("pending"):
         out.append({"level": "info",
                     "text": f"有 {research['pending']} 条假设仍待判定"})
+    if swing and swing.get("strategy_status") == "falsified":
+        out.append({"level": "error",
+                    "text": "波段池策略已证伪：扩样本后为负 alpha，暂停实盘、仅纸面跟踪；"
+                            "重启需预注册 + 纸面/小额 >=12 个月且 >=30 笔 + 前向 PF>=1.2 且胜率>=35%"})
     if strategy.get("shadow_drift"):
         out.append({"level": "warn",
                     "text": f"影子账本声明 {strategy['shadow_declared']} 本、实际只有 "
@@ -232,7 +256,8 @@ def build_snapshot() -> dict:
     risk, m1 = _block_risk(settings, state, equity)
     behavior, m2 = _block_behavior(behavior_raw)
     research, m3 = _block_research()
-    missing += m0 + m1 + m2 + m3
+    swing, m4 = _block_swing()
+    missing += m0 + m1 + m2 + m3 + m4
     strategy = _block_strategy(settings)
 
     return {
@@ -245,7 +270,8 @@ def build_snapshot() -> dict:
         "risk": risk,
         "behavior": behavior,
         "research": research,
-        "findings": _findings(risk, research, strategy, equity),
+        "swing": swing,
+        "findings": _findings(risk, research, strategy, equity, swing),
         "missing": missing,
     }
 

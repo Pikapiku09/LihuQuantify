@@ -124,3 +124,34 @@ def test_blocks_degrade_not_crash(monkeypatch):
     assert "paper_state" in s["missing"]
     assert s["behavior"] is None
     assert s["findings"] is not None
+
+def test_swing_block_shape(snap):
+    """波段池块（v3）：结构完整，且证伪状态必须被显式抬出来。"""
+    sw = snap["swing"]
+    if sw is None:
+        assert "swing_pool" in snap["missing"]
+        return
+    for key in ("pool", "backtest", "robustness", "strategy_status"):
+        assert key in sw, f"swing 缺字段：{key}"
+    if sw["pool"]:
+        assert "holdings" in sw["pool"] and "parse_ok" in sw["pool"]
+    if sw["backtest"]:
+        m = sw["backtest"]["metrics"]
+        for key in ("total_return", "max_drawdown", "win_rate"):
+            assert key in m
+        assert sw["backtest"]["disclaimers"], "回测的免责声明必须透传，不许吞掉"
+    if sw["robustness"]:
+        assert sw["robustness"]["windows"]
+        assert any(w["matched_headline"] for w in sw["robustness"]["windows"])
+
+
+def test_falsified_strategy_raises_error_finding(snap):
+    """策略已证伪时，findings 里必须有 error 级条目。
+
+    这条守的是「页面不能把已证伪的策略显示成正常策略」——恰好是这份数据最容易犯的错。
+    """
+    sw = snap.get("swing") or {}
+    if sw.get("strategy_status") != "falsified":
+        pytest.skip("当前波段池未标记证伪")
+    assert any(f["level"] == "error" and "证伪" in f["text"] for f in snap["findings"]), \
+        "证伪状态没有出现在 error 级 findings 里"

@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OUT_DEFAULT = ROOT / "outputs" / "strategy_health.json"
 
 
@@ -47,6 +47,26 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _block_overview(equity: dict | None) -> tuple[dict | None, list[str]]:
+    """今日巡检总览（v4 新增）：指标卡 + 简报 + 持仓。作为量化策略页首屏，不单开页面。"""
+    try:
+        from lihu_quantify.monitor.equity_history import EQUITY_FILE, load_points
+        from lihu_quantify.monitor.overview_snapshot import build_overview_block
+        points = load_points(ROOT / EQUITY_FILE)
+    except Exception:  # noqa: BLE001
+        return None, ["overview"]
+    try:
+        block = build_overview_block(ROOT, points)
+    except Exception:  # noqa: BLE001
+        return None, ["overview"]
+    if not block:
+        return None, ["overview", "last_scan"]
+    missing = []
+    if not block.get("trade_date"):
+        missing.append("last_scan")
+    return block, missing
 
 
 def _block_equity(limit_days: int = 250) -> tuple[dict | None, list[str]]:
@@ -68,6 +88,8 @@ def _block_equity(limit_days: int = 250) -> tuple[dict | None, list[str]]:
     if not points:
         return None, ["equity_history"]
     s = summarize(points)
+    # 来源必须标清：这段是模拟盘**自有日报**重建的，不是实盘交割单，也不是当日实时记账
+    s["basis"] = "daily_report"
     s["points"] = [{"d": p["date"], "v": round(p["total_asset"], 2)} for p in points[-limit_days:]]
     s["truncated_days"] = max(0, len(points) - limit_days)
     return s, []
@@ -230,8 +252,9 @@ def _findings(risk: dict | None, research: dict | None, strategy: dict,
                                 f"{equity.get('max_drawdown_trough_date')}）已越 25% 硬约束"})
         if equity.get("reconstructed_days"):
             out.append({"level": "info",
-                        "text": f"权益曲线前 {equity['reconstructed_days']} 个交易日由交割单重建，"
-                                f"非当日实时记账（live {equity.get('live_days', 0)} 天）"})
+                        "text": f"权益曲线前 {equity['reconstructed_days']} 个交易日由模拟盘自有日报重建，"
+                                f"非当日实时记账（live {equity.get('live_days', 0)} 天）；"
+                                f"实盘账本不在本快照内，切勿互相对照"})
     if research and research.get("pending"):
         out.append({"level": "info",
                     "text": f"有 {research['pending']} 条假设仍待判定"})
@@ -253,11 +276,12 @@ def build_snapshot() -> dict:
 
     missing: list[str] = []
     equity, m0 = _block_equity()
+    overview, m5 = _block_overview(equity)
     risk, m1 = _block_risk(settings, state, equity)
     behavior, m2 = _block_behavior(behavior_raw)
     research, m3 = _block_research()
     swing, m4 = _block_swing()
-    missing += m0 + m1 + m2 + m3 + m4
+    missing += m0 + m1 + m2 + m3 + m4 + m5
     strategy = _block_strategy(settings)
 
     return {
@@ -266,6 +290,7 @@ def build_snapshot() -> dict:
         "account_type": "paper",          # 硬约束：与 dsh-invest 的实盘账本严禁混账
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "strategy": strategy,
+        "overview": overview,
         "equity": equity,
         "risk": risk,
         "behavior": behavior,

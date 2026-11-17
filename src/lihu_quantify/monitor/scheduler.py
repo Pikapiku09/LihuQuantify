@@ -250,6 +250,46 @@ def _risk_budget_coef(budget: dict, market_state: str) -> float:
     return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
 
 
+def _append_equity_point() -> Optional[str]:
+    """把当天模拟盘组合权益追加进 data/equity_history.jsonl（2026-11-17）。
+
+    为什么需要它：``/api/equity`` 读的是**回测**曲线，``paper_state.json`` 只有当期快照。
+    没有日级序列，工作台的「量化策略」页就只能把回撤显示成 null。
+
+    只用 ``paper_state.asset.total_asset``（真实记账值，``source="live"``）；
+    历史段由 ``scripts/backfill_equity_history.py`` 从交割单重建并标 ``reconstructed``，
+    两者不会被互相覆盖（live 优先级更高）。
+
+    失败只记 warning 返回 None——权益曲线缺失不得影响巡检。
+    """
+    try:
+        from .equity_history import EQUITY_FILE, SOURCE_LIVE, append_point
+    except Exception:  # noqa: BLE001
+        return None
+    state_path = _ROOT / "data" / "paper_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    asset = state.get("asset") or {}
+    total = asset.get("total_asset")
+    day = state.get("trade_day") or state.get("last_trade_day")
+    if not isinstance(total, (int, float)) or total <= 0 or not day:
+        logger.warning("[权益历史] paper_state 缺 total_asset/trade_day，跳过")
+        return None
+    try:
+        changed = append_point(
+            _ROOT / EQUITY_FILE, day, float(total), source=SOURCE_LIVE,
+            cash=asset.get("cash"), market_value=asset.get("market_value"),
+        )
+    except Exception as exc:  # noqa: BLE001 - 写盘失败不得拖垮巡检
+        logger.warning(f"[权益历史] 写入失败: {exc}")
+        return None
+    if changed:
+        logger.info(f"[权益历史] 已追加 {day} total_asset={float(total):,.2f}")
+    return str(_ROOT / EQUITY_FILE)
+
+
 def _write_strategy_health() -> Optional[str]:
     """把模拟盘健康度快照写给 dsh-invest 工作台（2026-11-16）。
 
@@ -1469,6 +1509,8 @@ class DailyScanner:
         summary["behavior_audit"] = _load_behavior_audit()
         # 策略健康快照（写给 dsh-invest 工作台的只读契约；失败不影响巡检）
         summary["strategy_health"] = _write_strategy_health()
+        # 模拟盘权益历史（每日追加一个 live 点；量化策略页的权益曲线与回撤靠它）
+        summary["equity_history"] = _append_equity_point()
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
         #      不影响任何信号/成交/拦截结果。失败/未配置 → None 静默降级，
         #      结果随 last_scan.json 持久化） ----

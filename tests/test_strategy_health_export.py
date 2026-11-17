@@ -45,9 +45,40 @@ def test_account_type_is_paper(snap):
 
 
 def test_required_blocks_present(snap):
-    for key in ("strategy", "risk", "behavior", "research", "findings", "missing",
-                "generated_at"):
+    # v2 起必须有 equity（权益序列 + 回撤），页面靠它替掉原来那个 null 回撤
+    for key in ("strategy", "equity", "risk", "behavior", "research", "findings",
+                "missing", "generated_at"):
         assert key in snap, f"契约缺字段：{key}"
+    assert snap["schema_version"] >= 2, "加了 equity 块就必须升 schema 版本，不许在旧版本偷偷加字段"
+
+
+def test_equity_block_shape(snap):
+    """权益块要么是完整结构，要么是 None + 进 missing —— 不许半截。"""
+    eq = snap["equity"]
+    if eq is None:
+        assert "equity_history" in snap["missing"]
+        return
+    for key in ("n_points", "points", "current_drawdown", "max_drawdown",
+                "live_days", "reconstructed_days"):
+        assert key in eq, f"equity 缺字段：{key}"
+    assert isinstance(eq["points"], list) and eq["points"]
+    for pt in eq["points"]:
+        assert set(pt) == {"d", "v"} and isinstance(pt["v"], (int, float))
+    # 重建段与实时段必须能分辨（否则没人知道曲线哪段是补的）
+    assert eq["live_days"] + eq["reconstructed_days"] <= eq["n_points"]
+    if eq["reconstructed_days"]:
+        assert any("重建" in f["text"] for f in snap["findings"]), \
+            "存在重建段时 findings 必须说明，否则会被当成实时记账"
+
+
+def test_risk_uses_real_drawdown(snap):
+    """回撤必须来自权益历史，不许从 paper_state.high_water_mark 硬算。"""
+    eq, risk = snap["equity"], snap["risk"]
+    if eq is None:
+        assert risk["current_drawdown"] is None
+        assert "drawdown_note" in risk
+    else:
+        assert risk["current_drawdown"] == eq["current_drawdown"]
 
 
 def test_risk_block_matches_config(snap):

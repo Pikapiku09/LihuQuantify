@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OUT_DEFAULT = ROOT / "outputs" / "strategy_health.json"
 
 
@@ -49,7 +49,31 @@ def _read_json(path: Path):
         return None
 
 
-def _block_risk(settings: dict, state: dict | None) -> tuple[dict | None, list[str]]:
+def _block_equity(limit_days: int = 250) -> tuple[dict | None, list[str]]:
+    """权益块（v2 新增）：模拟盘真实权益序列 + 回撤水位。
+
+    数据来自 data/equity_history.jsonl：历史段由交割单重建（reconstructed）、
+    巡检段是真实记账值（live）。两者在块里分开计数，消费端必须能看出哪段是补的。
+    """
+    try:
+        from lihu_quantify.monitor.equity_history import (
+            EQUITY_FILE, load_points, summarize,
+        )
+    except Exception:  # noqa: BLE001
+        return None, ["equity_history"]
+    try:
+        points = load_points(ROOT / EQUITY_FILE)
+    except Exception:  # noqa: BLE001
+        return None, ["equity_history"]
+    if not points:
+        return None, ["equity_history"]
+    s = summarize(points)
+    s["points"] = [{"d": p["date"], "v": round(p["total_asset"], 2)} for p in points[-limit_days:]]
+    s["truncated_days"] = max(0, len(points) - limit_days)
+    return s, []
+
+
+def _block_risk(settings: dict, state: dict | None, equity: dict | None = None) -> tuple[dict | None, list[str]]:
     """风控块：单票上限 / 持仓下限 / 集中度 / 回撤水位。"""
     missing: list[str] = []
     risk_cfg = (settings.get("risk") or {})
@@ -85,14 +109,24 @@ def _block_risk(settings: dict, state: dict | None) -> tuple[dict | None, list[s
             out["max_single_weight"] = round(w, 4)
             out["largest_position"] = code
 
-    # 账户层回撤：paper_state 里的 high_water_mark 是**每只股票的**价格高点
-    # （{"000429.SZ": 13.78}），不是组合层权益高点，拿它算组合回撤会算出假数。
-    # 组合层权益历史目前没有持久化文件，故如实置 null 并写进 missing，不猜。
-    out["current_drawdown"] = None
-    out["drawdown_note"] = "组合层权益历史未持久化，暂无回撤水位"
+    # 账户层回撤：优先用 data/equity_history.jsonl 的真实序列（v2 起可用）。
+    # 拿 paper_state.high_water_mark 算组合回撤是错的——那是每只股票的价格高点
+    # （{"000429.SZ": 13.78}），算出来会是个看起来很像真的假数字。
+    if equity and equity.get("current_drawdown") is not None:
+        out["current_drawdown"] = equity["current_drawdown"]
+        out["max_drawdown"] = equity.get("max_drawdown")
+        out["equity_days"] = equity.get("n_points")
+        out["live_days"] = equity.get("live_days")
+        out["reconstructed_days"] = equity.get("reconstructed_days")
+    else:
+        out["current_drawdown"] = None
+        out["drawdown_note"] = "尚无权益历史（data/equity_history.jsonl 为空）"
 
-    # 状态判定：先看硬上限，再看集中度
-    if out["max_single_weight"] is not None and out["max_single_weight"] > max_single + 1e-9:
+    # 状态判定：回撤触线 > 单票超限 > 集中度不足
+    if (mdd_limit and out.get("current_drawdown") is not None
+            and out["current_drawdown"] <= -mdd_limit):
+        out["status"] = "breach"
+    elif out["max_single_weight"] is not None and out["max_single_weight"] > max_single + 1e-9:
         out["status"] = "breach"
     elif out["n_positions"] < min_pos:
         out["status"] = "warn"
@@ -154,7 +188,8 @@ def _block_strategy(settings: dict) -> dict:
     }
 
 
-def _findings(risk: dict | None, research: dict | None, strategy: dict) -> list[dict]:
+def _findings(risk: dict | None, research: dict | None, strategy: dict,
+              equity: dict | None = None) -> list[dict]:
     out: list[dict] = []
     if risk:
         if risk["status"] == "breach":
@@ -167,6 +202,16 @@ def _findings(risk: dict | None, research: dict | None, strategy: dict) -> list[
             out.append({"level": "error",
                         "text": f"单票权重 {risk['max_single_weight']:.1%} 超上限 "
                                 f"{risk['max_single_position']:.0%}"})
+    if equity:
+        mdd = equity.get("max_drawdown")
+        if mdd is not None and mdd <= -0.25:
+            out.append({"level": "error",
+                        "text": f"历史最大回撤 {mdd:.1%}（{equity.get('max_drawdown_peak_date')} → "
+                                f"{equity.get('max_drawdown_trough_date')}）已越 25% 硬约束"})
+        if equity.get("reconstructed_days"):
+            out.append({"level": "info",
+                        "text": f"权益曲线前 {equity['reconstructed_days']} 个交易日由交割单重建，"
+                                f"非当日实时记账（live {equity.get('live_days', 0)} 天）"})
     if research and research.get("pending"):
         out.append({"level": "info",
                     "text": f"有 {research['pending']} 条假设仍待判定"})
@@ -183,10 +228,11 @@ def build_snapshot() -> dict:
     behavior_raw = _read_json(ROOT / "outputs" / "behavior_report.json")
 
     missing: list[str] = []
-    risk, m1 = _block_risk(settings, state)
+    equity, m0 = _block_equity()
+    risk, m1 = _block_risk(settings, state, equity)
     behavior, m2 = _block_behavior(behavior_raw)
     research, m3 = _block_research()
-    missing += m1 + m2 + m3
+    missing += m0 + m1 + m2 + m3
     strategy = _block_strategy(settings)
 
     return {
@@ -195,10 +241,11 @@ def build_snapshot() -> dict:
         "account_type": "paper",          # 硬约束：与 dsh-invest 的实盘账本严禁混账
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "strategy": strategy,
+        "equity": equity,
         "risk": risk,
         "behavior": behavior,
         "research": research,
-        "findings": _findings(risk, research, strategy),
+        "findings": _findings(risk, research, strategy, equity),
         "missing": missing,
     }
 

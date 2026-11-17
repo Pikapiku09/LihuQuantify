@@ -50,6 +50,35 @@ DEFAULT_MAX_HOLD = 20
 SHARES = 100
 
 
+def default_costs() -> dict:
+    """交易成本默认值。**从 backtest/broker.py 取常量**，不另立一套。
+
+    A 股实际成本三块：
+    - 佣金：双边，万 2.5，单笔最低 5 元（`max(turnover*rate, 5)`）
+    - 印花税：**仅卖出**，万 5（2023-08-28 起减半；broker 里的取值即此）
+    - 滑点：0.1%，买入按不利方向上浮、卖出按不利方向下压
+    broker 已是全仓权威口径，抄一份数字必然漂移，所以在这里 import。
+    """
+    try:
+        from ..backtest.broker import SimulatedBroker
+
+        b = SimulatedBroker()
+        return {
+            "commission_rate": float(b.commission_rate),
+            "min_commission": float(SimulatedBroker.MIN_COMMISSION),
+            "stamp_tax_rate": float(b.stamp_tax_rate),
+            "slippage": float(b.slippage),
+            "lot": int(SimulatedBroker.LOT_SIZE),
+            "source": "backtest.broker.SimulatedBroker",
+        }
+    except Exception:  # noqa: BLE001 - broker 不可用时用保守默认
+        return {
+            "commission_rate": 0.00025, "min_commission": 5.0,
+            "stamp_tax_rate": 0.0005, "slippage": 0.001, "lot": 100,
+            "source": "fallback_defaults",
+        }
+
+
 def expected_direction(stance: Optional[str]) -> int:
     return _EXPECTED.get((stance or "").strip(), 0)
 
@@ -260,6 +289,7 @@ def simulate_portfolio(
     initial_capital: float = 100000.0,
     max_positions: int = 3,
     max_single_position: float = 0.15,
+    costs: dict | None = None,
 ) -> dict:
     """资金约束下的撮合模拟（2026-11-17，待办 3）。
 
@@ -278,6 +308,10 @@ def simulate_portfolio(
     - 权益 = 现金 + 持仓市值（复权优先，缺失回落原始价）
     """
     adj_by_code = adj_by_code or {}
+    c = costs or default_costs()
+    comm_rate, min_comm = c["commission_rate"], c["min_commission"]
+    stamp_rate, slip = c["stamp_tax_rate"], c["slippage"]
+    fee_sum = {"commission": 0.0, "stamp_tax": 0.0, "slippage": 0.0}
     cash = float(initial_capital)
     open_pos: dict[str, dict] = {}          # code -> position
     equity_curve: list[dict] = []
@@ -315,15 +349,27 @@ def simulate_portfolio(
             elif pos["held"] >= pos["max_hold_days"]:
                 reason = "time"
             if reason:
-                proceeds = p * pos["shares"]
+                raw = p
+                p_out = raw * (1.0 - slip)         # 卖出吃滑点：按不利方向下压
+                turnover = p_out * pos["shares"]
+                commission = max(turnover * comm_rate, min_comm)
+                stamp = turnover * stamp_rate       # 仅卖出
+                proceeds = turnover - commission - stamp
                 cash += proceeds
-                cost_basis = pos["entry_price"] * pos["shares"]
+                fee_sum["commission"] += commission
+                fee_sum["stamp_tax"] += stamp
+                fee_sum["slippage"] += (raw - p_out) * pos["shares"]
+                cost_basis = pos["entry_price"] * pos["shares"] + pos.get("entry_commission", 0.0)
+                net_pnl = proceeds - cost_basis
                 trades.append({
                     "code": code, "entry_date": pos["entry_date"], "exit_date": day,
-                    "entry_price": round(pos["entry_price"], 4), "exit_price": round(p, 4),
+                    "entry_price": round(pos["entry_price"], 4), "exit_price": round(p_out, 4),
                     "shares": pos["shares"], "exit_reason": reason,
-                    "pnl": round(proceeds - cost_basis, 2),
-                    "pnl_ratio": round(p / pos["entry_price"] - 1.0, 4),
+                    "pnl_gross": round((raw - pos["entry_price"]) * pos["shares"], 2),
+                    "commission": round(commission + pos.get("entry_commission", 0.0), 2),
+                    "stamp_tax": round(stamp, 2),
+                    "pnl": round(net_pnl, 2),
+                    "pnl_ratio": round(net_pnl / (pos["entry_price"] * pos["shares"]), 4),
                 })
                 del open_pos[code]
 
@@ -336,22 +382,38 @@ def simulate_portfolio(
             if len(open_pos) >= max_positions:
                 skipped["no_slot"] = skipped.get("no_slot", 0) + 1
                 continue
-            p = px(code, day)
-            if p is None or p <= 0:
+            raw = px(code, day)
+            if raw is None or raw <= 0:
                 skipped["no_quote"] = skipped.get("no_quote", 0) + 1
                 continue
+            # 买入吃滑点：按不利方向上浮，成交价即成本价
+            p = raw * (1.0 + slip)
             total_asset = cash + sum(
-                (px(c, day) or 0) * pos["shares"] for c, pos in open_pos.items())
+                (px(cc, day) or 0) * pos["shares"] for cc, pos in open_pos.items())
             budget = min(cash, total_asset * max_single_position)
-            shares = int(budget // (p * 100)) * 100
+            lot_cost = p * c["lot"]
+            shares = int(budget // lot_cost) * c["lot"] if lot_cost > 0 else 0
             if shares <= 0:
                 skipped["insufficient_cash"] = skipped.get("insufficient_cash", 0) + 1
                 continue
-            cash -= p * shares
+            turnover = p * shares
+            commission = max(turnover * comm_rate, min_comm)
+            if turnover + commission > cash:      # 扣完费不够，降一手
+                shares -= c["lot"]
+                if shares <= 0:
+                    skipped["insufficient_cash"] = skipped.get("insufficient_cash", 0) + 1
+                    continue
+                turnover = p * shares
+                commission = max(turnover * comm_rate, min_comm)
+            slip_cost = (p - raw) * shares
+            fee_sum["commission"] += commission
+            fee_sum["slippage"] += slip_cost
+            cash -= turnover + commission
             open_pos[code] = {
                 "entry_date": day, "entry_price": p, "shares": shares,
                 "target": r.get("target"), "stop": r.get("stop"),
                 "max_hold_days": DEFAULT_MAX_HOLD, "held": 0,
+                "entry_commission": commission, "entry_slip": slip_cost,
             }
 
         # 3) 记录权益
@@ -377,7 +439,16 @@ def simulate_portfolio(
             "max_positions": max_positions,
             "max_single_position": max_single_position,
             "entry": "结论日后第一个交易日收盘",
-            "lot": 100,
+            "lot": c["lot"],
+        },
+        "costs": {
+            "commission_rate": comm_rate, "min_commission": min_comm,
+            "stamp_tax_rate": stamp_rate, "slippage": slip,
+            "source": c.get("source"),
+            "total_commission": round(fee_sum["commission"], 2),
+            "total_stamp_tax": round(fee_sum["stamp_tax"], 2),
+            "total_slippage": round(fee_sum["slippage"], 2),
+            "total_fees": round(sum(fee_sum.values()), 2),
         },
         "equity_curve": equity_curve,
         "trades": trades,
@@ -463,6 +534,7 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
     portfolio = simulate_portfolio(
         records, _cal, by_code, adj_by_code,
         initial_capital=_init, max_positions=_max_positions, max_single_position=_max_single,
+        costs=default_costs(),
     )
 
     return {

@@ -235,17 +235,21 @@ def test_portfolio_respects_max_positions():
 
 
 def test_portfolio_position_size_capped():
-    """单票不超过 总资产×上限；股数向下取整到 100 股。"""
+    """单票不超过 总资产×上限；股数向下取整到 100 股。
+
+    用**零成本**口径验仓位算法本身 —— 含成本时买入即扣费，净值必然低于初始，
+    那是成本测试的事，不该混进仓位测试。
+    """
     from lihu_quantify.monitor.strategy_trials import simulate_portfolio
 
     cal = ["2026-11-05"]
     closes = {"A.SZ": {"2026-11-05": 10.0}}
     out = simulate_portfolio(
         [_mk_rec("A.SZ", "2026-11-05")], cal, closes,
-        initial_capital=100000.0, max_positions=3, max_single_position=0.15)
-    # 上限 15000 元 / 10 元 = 1500 股，取整后仍是 1500
-    assert out["final_equity"] != 100000.0 or True
-    # 通过期末权益反推：现金 = 100000 - 1500*10 = 85000，市值 15000 → 权益仍 100000
+        initial_capital=100000.0, max_positions=3, max_single_position=0.15,
+        costs={"commission_rate": 0.0, "min_commission": 0.0,
+               "stamp_tax_rate": 0.0, "slippage": 0.0, "lot": 100})
+    # 上限 15000 元 / 10 元 = 1500 股：现金 85000 + 市值 15000 = 100000
     assert out["final_equity"] == pytest.approx(100000.0)
 
 
@@ -314,3 +318,89 @@ def test_repo_config_has_portfolio_max_positions():
     cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
     st = cfg.get("strategy_trials") or {}
     assert int(st.get("portfolio_max_positions") or 0) >= 1
+
+# ===== 交易成本（2026-11-17）=====
+
+def test_default_costs_source_is_broker():
+    """成本常量必须来自 broker，不能另立一套数字。"""
+    from lihu_quantify.monitor.strategy_trials import default_costs
+
+    c = default_costs()
+    assert c["commission_rate"] == pytest.approx(0.00025)
+    assert c["min_commission"] == pytest.approx(5.0)
+    assert c["stamp_tax_rate"] == pytest.approx(0.0005)
+    assert c["slippage"] == pytest.approx(0.001)
+    assert c["lot"] == 100
+    assert "broker" in (c.get("source") or ""), "应标明取自 broker"
+
+
+def test_buy_pays_slippage_and_commission():
+    """买入：成交价上浮滑点，且收佣金（小仓位触发 5 元下限）。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05"]
+    closes = {"A.SZ": {"2026-11-05": 10.0}}
+    out = simulate_portfolio([_mk_rec("A.SZ", "2026-11-05")], cal, closes,
+                             initial_capital=100000.0, max_single_position=0.15)
+    c = out["costs"]
+    assert c["total_commission"] == pytest.approx(5.0), "15000 元仓位佣金不足 5 元 → 取下限"
+    assert c["total_slippage"] > 0
+    assert c["total_stamp_tax"] == 0.0, "买入不收印花税"
+    assert out["final_equity"] < 100000.0, "扣完成本净值必然低于初始"
+
+
+def test_sell_charges_stamp_tax_and_nets_out():
+    """卖出：收印花税，且 pnl 为净额（小于毛额）。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06"]
+    closes = {"A.SZ": {"2026-11-05": 10.0, "2026-11-06": 12.0}}
+    out = simulate_portfolio([_mk_rec("A.SZ", "2026-11-05", target=11.0)], cal, closes,
+                             initial_capital=100000.0, max_single_position=0.15)
+    assert out["n_trades"] == 1
+    t = out["trades"][0]
+    assert out["costs"]["total_stamp_tax"] > 0, "卖出必须收印花税"
+    assert t["pnl"] < t["pnl_gross"], "净盈亏应小于毛盈亏"
+    assert t["stamp_tax"] > 0
+    assert t["exit_price"] < 12.0, "卖出吃滑点，成交价应低于名义价"
+
+
+def test_costs_total_is_sum_of_parts():
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06"]
+    closes = {"A.SZ": {"2026-11-05": 10.0, "2026-11-06": 12.0}}
+    out = simulate_portfolio([_mk_rec("A.SZ", "2026-11-05", target=11.0)], cal, closes)
+    c = out["costs"]
+    assert c["total_fees"] == pytest.approx(
+        c["total_commission"] + c["total_stamp_tax"] + c["total_slippage"], abs=0.01)
+
+
+def test_no_cost_baseline_differs_from_zero_cost():
+    """含成本与零成本必须给出不同结果 —— 否则说明成本没接上。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05"]
+    closes = {"A.SZ": {"2026-11-05": 10.0}}
+    recs = [_mk_rec("A.SZ", "2026-11-05")]
+    with_cost = simulate_portfolio(recs, cal, closes, initial_capital=100000.0)
+    zero = simulate_portfolio(recs, cal, closes, initial_capital=100000.0,
+                              costs={"commission_rate": 0.0, "min_commission": 0.0,
+                                     "stamp_tax_rate": 0.0, "slippage": 0.0, "lot": 100})
+    assert zero["final_equity"] == pytest.approx(100000.0)
+    assert with_cost["final_equity"] < zero["final_equity"]
+
+
+def test_repo_portfolio_has_cost_block():
+    """真实产出必须带成本块，并声明费率来源。"""
+    import json
+    p = ROOT / "outputs" / "strategy_trials.json"
+    if not p.exists():
+        pytest.skip("缺少产出")
+    d = json.loads(p.read_text(encoding="utf-8"))
+    port = d.get("portfolio")
+    if not port:
+        pytest.skip("无撮合块")
+    c = port.get("costs") or {}
+    for k in ("commission_rate", "min_commission", "stamp_tax_rate", "slippage", "total_fees"):
+        assert k in c, f"成本块缺 {k}"

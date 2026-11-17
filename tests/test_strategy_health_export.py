@@ -155,3 +155,19 @@ def test_falsified_strategy_raises_error_finding(snap):
         pytest.skip("当前波段池未标记证伪")
     assert any(f["level"] == "error" and "证伪" in f["text"] for f in snap["findings"]), \
         "证伪状态没有出现在 error 级 findings 里"
+
+def test_backtest_block_shape(snap):
+    """策略回测块（v5）：回测与网格必须分开，且幸存者偏差可读。"""
+    bt = snap.get("backtest")
+    if bt is None:
+        assert "backtest_result" in snap["missing"]
+        return
+    for key in ("main", "grid", "survivorship_bias"):
+        assert key in bt, f"backtest 缺字段：{key}"
+    if bt["main"]:
+        m = bt["main"]
+        for key in ("metrics", "pool", "curve", "curve_points_total"):
+            assert key in m
+        for key in ("total_return", "max_drawdown", "sharpe", "win_rate"):
+            assert key in m["metrics"]
+        assert bt["survivorship_bias"], "回测口径必须交代幸存者偏差"

@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OUT_DEFAULT = ROOT / "outputs" / "strategy_health.json"
 
 
@@ -47,6 +47,22 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _block_backtest() -> tuple[dict | None, list[str]]:
+    """策略回测块（v5 新增）：实盘策略回测绩效 + 参数网格寻优摘要。"""
+    try:
+        from lihu_quantify.monitor.backtest_snapshot import build_backtest_block
+    except Exception:  # noqa: BLE001
+        return None, ["backtest_result"]
+    try:
+        block = build_backtest_block(ROOT)
+    except Exception:  # noqa: BLE001
+        return None, ["backtest_result"]
+    missing = []
+    if not block.get("main"):
+        missing.append("backtest_result")
+    return block, missing
 
 
 def _block_overview(equity: dict | None) -> tuple[dict | None, list[str]]:
@@ -281,7 +297,8 @@ def build_snapshot() -> dict:
     behavior, m2 = _block_behavior(behavior_raw)
     research, m3 = _block_research()
     swing, m4 = _block_swing()
-    missing += m0 + m1 + m2 + m3 + m4 + m5
+    backtest, m6 = _block_backtest()
+    missing += m0 + m1 + m2 + m3 + m4 + m5 + m6
     strategy = _block_strategy(settings)
 
     return {
@@ -296,6 +313,7 @@ def build_snapshot() -> dict:
         "behavior": behavior,
         "research": research,
         "swing": swing,
+        "backtest": backtest,
         "findings": _findings(risk, research, strategy, equity, swing),
         "missing": missing,
     }

@@ -34,6 +34,8 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
+ROOT = Path(__file__).resolve().parents[3]
+
 DEFAULT_INBOX = Path("E:/Dsh_WorkSapce/Dify_Agents/.dsh-invest/store/conclusions.jsonl")
 LEDGER_FILE = Path("data") / "strategy_trials.json"
 
@@ -248,6 +250,140 @@ def summarize(records: Iterable[dict]) -> dict:
     }
 
 
+
+def simulate_portfolio(
+    records: list[dict],
+    calendar: list[str],
+    closes_by_code: dict[str, dict[str, float]],
+    adj_by_code: dict[str, dict[str, float]] | None = None,
+    *,
+    initial_capital: float = 100000.0,
+    max_positions: int = 3,
+    max_single_position: float = 0.15,
+) -> dict:
+    """资金约束下的撮合模拟（2026-11-17，待办 3）。
+
+    与单笔影子交易的区别
+    --------------------
+    单笔影子交易假设「每一笔都能按 100 股成交」，不涉及钱够不够、仓位满没满。
+    真实做的时候：现金有限、单票有上限、同时持仓数有上限 —— 结论一多就必须排队。
+    这个函数把那些约束加回来，回答「如果当初真按纪律做，账户会长什么样」。
+
+    规则（显式，与单笔影子交易保持一致的地方复用）
+    ----------------------------------------------
+    - 入场：结论日后第一个交易日收盘；仅买入类；每次按 min(可用现金, 总资产×单票上限) 买入
+    - 股数向下取整到 100 股；买不起 1 手 → 记 insufficient_cash，跳过
+    - 同时持仓上限 max_positions，满了 → 记 no_slot，跳过（不排队、不抢先）
+    - 出场：收盘 ≤ stop → stop；收盘 ≥ target → target；持有 ≥ max_hold_days → time
+    - 权益 = 现金 + 持仓市值（复权优先，缺失回落原始价）
+    """
+    adj_by_code = adj_by_code or {}
+    cash = float(initial_capital)
+    open_pos: dict[str, dict] = {}          # code -> position
+    equity_curve: list[dict] = []
+    trades: list[dict] = []
+    skipped: dict[str, int] = {}
+
+    # 每个交易日要处理的入场：base_date -> [record]
+    pending: dict[str, list[dict]] = {}
+    for r in records:
+        if r.get("status") not in ("open", "closed"):
+            continue
+        d = r.get("entry_date")
+        if not d:
+            continue
+        pending.setdefault(d, []).append(r)
+
+    def px(code: str, day: str) -> float | None:
+        return closes_by_code.get(code, {}).get(day)
+
+    for day in calendar:
+        # 1) 出场（先处理卖出，钱才能被下一笔用）
+        for code in list(open_pos.keys()):
+            pos = open_pos[code]
+            if day <= pos["entry_date"]:
+                continue
+            p = px(code, day)
+            if p is None:
+                continue
+            pos["held"] += 1
+            reason = None
+            if pos["stop"] is not None and p <= float(pos["stop"]):
+                reason = "stop"
+            elif pos["target"] is not None and p >= float(pos["target"]):
+                reason = "target"
+            elif pos["held"] >= pos["max_hold_days"]:
+                reason = "time"
+            if reason:
+                proceeds = p * pos["shares"]
+                cash += proceeds
+                cost_basis = pos["entry_price"] * pos["shares"]
+                trades.append({
+                    "code": code, "entry_date": pos["entry_date"], "exit_date": day,
+                    "entry_price": round(pos["entry_price"], 4), "exit_price": round(p, 4),
+                    "shares": pos["shares"], "exit_reason": reason,
+                    "pnl": round(proceeds - cost_basis, 2),
+                    "pnl_ratio": round(p / pos["entry_price"] - 1.0, 4),
+                })
+                del open_pos[code]
+
+        # 2) 入场
+        for r in pending.get(day, []):
+            code = str(r["code"])
+            if code in open_pos:
+                skipped["already_held"] = skipped.get("already_held", 0) + 1
+                continue
+            if len(open_pos) >= max_positions:
+                skipped["no_slot"] = skipped.get("no_slot", 0) + 1
+                continue
+            p = px(code, day)
+            if p is None or p <= 0:
+                skipped["no_quote"] = skipped.get("no_quote", 0) + 1
+                continue
+            total_asset = cash + sum(
+                (px(c, day) or 0) * pos["shares"] for c, pos in open_pos.items())
+            budget = min(cash, total_asset * max_single_position)
+            shares = int(budget // (p * 100)) * 100
+            if shares <= 0:
+                skipped["insufficient_cash"] = skipped.get("insufficient_cash", 0) + 1
+                continue
+            cash -= p * shares
+            open_pos[code] = {
+                "entry_date": day, "entry_price": p, "shares": shares,
+                "target": r.get("target"), "stop": r.get("stop"),
+                "max_hold_days": DEFAULT_MAX_HOLD, "held": 0,
+            }
+
+        # 3) 记录权益
+        mv = sum((px(c, day) or 0) * pos["shares"] for c, pos in open_pos.items())
+        equity_curve.append({"d": day, "v": round(cash + mv, 2)})
+
+    peak = -1.0
+    mdd = 0.0
+    for pt in equity_curve:
+        peak = max(peak, pt["v"])
+        if peak > 0:
+            mdd = min(mdd, pt["v"] / peak - 1.0)
+    final = equity_curve[-1]["v"] if equity_curve else initial_capital
+    return {
+        "initial_capital": initial_capital,
+        "final_equity": round(final, 2),
+        "total_return": round(final / initial_capital - 1.0, 4) if initial_capital else None,
+        "max_drawdown": round(mdd, 4),
+        "n_trades": len(trades),
+        "n_open": len(open_pos),
+        "skipped": skipped,
+        "rules": {
+            "max_positions": max_positions,
+            "max_single_position": max_single_position,
+            "entry": "结论日后第一个交易日收盘",
+            "lot": 100,
+        },
+        "equity_curve": equity_curve,
+        "trades": trades,
+    }
+
+
 def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Optional[dict]:
     """读结论 + 行情，产出契约块。库/文件缺失返回 None（调用方进 missing）。"""
     inbox = Path(inbox_path) if inbox_path else DEFAULT_INBOX
@@ -300,6 +436,35 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
     for r in records:
         r.pop("_base", None)
 
+    try:
+        from ..config import get_settings
+
+        _settings = get_settings()
+        _init = float(_settings.init_capital or 100000.0)
+        _max_single = float(_settings.risk.max_single_position)
+    except Exception:  # noqa: BLE001
+        _init, _max_single = 100000.0, 0.15
+    # ⚠ 撮合的「最多持仓数」不能借用 risk.min_concurrent_positions ——
+    # 那是「至少拿几只」的下限，拿它当上限属语义反转。单独给一个默认 3，可从 yaml 覆盖。
+    _max_positions = 3
+    try:
+        import yaml as _yaml
+
+        _cfg = _yaml.safe_load((ROOT / "config" / "settings.yaml").read_text(encoding="utf-8")) or {}
+        _tcfg = _cfg.get("strategy_trials") or {}
+        _max_positions = int(_tcfg.get("portfolio_max_positions") or 3)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 曲线只覆盖「有提案」的区间：用全历史（1909 个交易日）会把结论里的 10 天压成一条直线，
+    # 回撤也会被无关区间稀释到没有意义。
+    _first_day = min((str(r.get("proposed_date") or "")[:10] for r in records), default="") or ""
+    _cal = [d for d in calendar if not _first_day or d >= _first_day]
+    portfolio = simulate_portfolio(
+        records, _cal, by_code, adj_by_code,
+        initial_capital=_init, max_positions=_max_positions, max_single_position=_max_single,
+    )
+
     return {
         "generated_at": None,
         "source": str(inbox),
@@ -314,5 +479,6 @@ def build_trials_block(db_path: Path, inbox_path: Optional[Path] = None) -> Opti
             "adj_missing_codes": sorted({str(p["code"]) for p in proposals} - set(adj_by_code)),
         },
         "summary": summarize(records),
+        "portfolio": portfolio,
         "records": records,
     }

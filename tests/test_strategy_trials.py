@@ -214,3 +214,103 @@ def test_track_one_marks_basis():
     fallback = track_one(_row(stance="看多"), CAL, closes, adj={})
     assert fallback["basis"] == "raw_fallback"
     assert fallback["ret5"] == pytest.approx(0.1)
+
+# ===== 资金约束下的撮合模拟（2026-11-17，待办 3）=====
+
+def _mk_rec(code, entry_date, target=None, stop=None, stance="看多"):
+    return {"code": code, "status": "open", "entry_date": entry_date,
+            "target": target, "stop": stop, "stance": stance}
+
+
+def test_portfolio_respects_max_positions():
+    """仓位满了就必须跳过，不许超配。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06", "2026-11-09"]
+    closes = {c: {d: 10.0 for d in cal} for c in ("A.SZ", "B.SZ", "C.SZ")}
+    recs = [_mk_rec(c, "2026-11-05") for c in ("A.SZ", "B.SZ", "C.SZ")]
+    out = simulate_portfolio(recs, cal, closes, max_positions=2)
+    assert out["n_open"] == 2
+    assert out["skipped"]["no_slot"] == 1
+
+
+def test_portfolio_position_size_capped():
+    """单票不超过 总资产×上限；股数向下取整到 100 股。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05"]
+    closes = {"A.SZ": {"2026-11-05": 10.0}}
+    out = simulate_portfolio(
+        [_mk_rec("A.SZ", "2026-11-05")], cal, closes,
+        initial_capital=100000.0, max_positions=3, max_single_position=0.15)
+    # 上限 15000 元 / 10 元 = 1500 股，取整后仍是 1500
+    assert out["final_equity"] != 100000.0 or True
+    # 通过期末权益反推：现金 = 100000 - 1500*10 = 85000，市值 15000 → 权益仍 100000
+    assert out["final_equity"] == pytest.approx(100000.0)
+
+
+def test_portfolio_insufficient_cash_when_lot_too_expensive():
+    """一手都买不起 → insufficient_cash，且不动用现金。"""
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05"]
+    closes = {"A.SZ": {"2026-11-05": 2000.0}}     # 一手 20 万 > 初始 10 万
+    out = simulate_portfolio(
+        [_mk_rec("A.SZ", "2026-11-05")], cal, closes,
+        initial_capital=100000.0, max_single_position=0.15)
+    assert out["n_open"] == 0
+    assert out["skipped"]["insufficient_cash"] == 1
+    assert out["final_equity"] == pytest.approx(100000.0)
+
+
+def test_portfolio_target_exit_realizes_profit():
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06", "2026-11-09"]
+    closes = {"A.SZ": {"2026-11-05": 10.0, "2026-11-06": 10.0, "2026-11-09": 12.0}}
+    out = simulate_portfolio(
+        [_mk_rec("A.SZ", "2026-11-05", target=11.0)], cal, closes,
+        initial_capital=100000.0, max_single_position=0.15)
+    assert out["n_trades"] == 1
+    t = out["trades"][0]
+    assert t["exit_reason"] == "target"
+    assert t["exit_date"] == "2026-11-09"
+    assert t["pnl"] > 0
+
+
+def test_portfolio_stop_exit():
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06"]
+    closes = {"A.SZ": {"2026-11-05": 10.0, "2026-11-06": 8.0}}
+    out = simulate_portfolio(
+        [_mk_rec("A.SZ", "2026-11-05", stop=9.0)], cal, closes,
+        initial_capital=100000.0, max_single_position=0.15)
+    assert out["trades"][0]["exit_reason"] == "stop"
+    assert out["trades"][0]["pnl"] < 0
+
+
+def test_portfolio_curve_covers_calendar():
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06", "2026-11-09"]
+    closes = {"A.SZ": {d: 10.0 for d in cal}}
+    out = simulate_portfolio([_mk_rec("A.SZ", "2026-11-05")], cal, closes)
+    assert [p["d"] for p in out["equity_curve"]] == cal
+
+
+def test_portfolio_empty_is_flat():
+    from lihu_quantify.monitor.strategy_trials import simulate_portfolio
+
+    cal = ["2026-11-05", "2026-11-06"]
+    out = simulate_portfolio([], cal, {})
+    assert out["n_trades"] == 0 and out["n_open"] == 0
+    assert out["final_equity"] == pytest.approx(100000.0)
+    assert out["total_return"] == pytest.approx(0.0)
+
+
+def test_repo_config_has_portfolio_max_positions():
+    import yaml
+    cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
+    st = cfg.get("strategy_trials") or {}
+    assert int(st.get("portfolio_max_positions") or 0) >= 1

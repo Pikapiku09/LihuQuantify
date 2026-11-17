@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OUT_DEFAULT = ROOT / "outputs" / "strategy_health.json"
 
 
@@ -47,6 +47,24 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _block_strategy_trials() -> tuple[dict | None, list[str]]:
+    """结论影子跟踪块（v7 新增）：AI 结论放进行情里走一遍的结果。
+
+    读 outputs/strategy_trials.json（由 scripts/run_strategy_trials.py 生成）。
+    不在这里直接算：计算需要读 DuckDB，而巡检进程持有写锁，自己读库必失败。
+    """
+    path = ROOT / "outputs" / "strategy_trials.json"
+    if not path.exists():
+        return None, ["strategy_trials"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, ["strategy_trials"]
+    if not isinstance(data, dict) or not data.get("records"):
+        return None, ["strategy_trials"]
+    return data, []
 
 
 def _block_reports(limit: int = 12) -> tuple[dict | None, list[str]]:
@@ -314,7 +332,8 @@ def build_snapshot() -> dict:
     swing, m4 = _block_swing()
     backtest, m6 = _block_backtest()
     reports, m7 = _block_reports()
-    missing += m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7
+    trials, m8 = _block_strategy_trials()
+    missing += m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8
     strategy = _block_strategy(settings)
 
     return {
@@ -331,6 +350,7 @@ def build_snapshot() -> dict:
         "swing": swing,
         "backtest": backtest,
         "reports": reports,
+        "strategy_trials": trials,
         "findings": _findings(risk, research, strategy, equity, swing),
         "missing": missing,
     }

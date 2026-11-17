@@ -186,3 +186,23 @@ def test_reports_block_shape(snap):
         assert r["date"]
         # 任一数值字段要么是数，要么是 None —— 不允许 0 冒充「没有」
         assert r["total_asset"] is None or r["total_asset"] > 0
+
+def test_strategy_trials_block_shape(snap):
+    """结论影子跟踪块（v7）：规则与统计必须自描述，样本不足要如实给 n。"""
+    tr = snap.get("strategy_trials")
+    if tr is None:
+        assert "strategy_trials" in snap["missing"]
+        return
+    for key in ("rules", "summary", "records"):
+        assert key in tr, f"strategy_trials 缺字段：{key}"
+    for key in ("entry", "shares", "max_hold_days", "exit", "long_stances"):
+        assert key in tr["rules"], f"执行规则缺字段：{key}"
+    s = tr["summary"]
+    assert s["total"] == len(tr["records"])
+    for horizon in ("direction_hit_5d", "direction_hit_10d"):
+        assert "expected_up" in s[horizon] and "n" in s[horizon]["expected_up"]
+    # 每条记录必须能看出它为什么被跳过（或者进了影子交易）
+    for r in tr["records"]:
+        assert r["status"] in ("skipped", "open", "closed")
+        if r["status"] == "skipped":
+            assert r["skip_reason"], "跳过必须给原因"

@@ -171,3 +171,18 @@ def test_backtest_block_shape(snap):
         for key in ("total_return", "max_drawdown", "sharpe", "win_rate"):
             assert key in m["metrics"]
         assert bt["survivorship_bias"], "回测口径必须交代幸存者偏差"
+
+def test_reports_block_shape(snap):
+    """巡检日报块（v6）：最近 N 天，缺字段一律 None，不得编造。"""
+    rep = snap.get("reports")
+    if rep is None:
+        assert "reports" in snap["missing"]
+        return
+    assert rep["total"] >= len(rep["recent"])
+    assert rep["recent"], "有日报就必须给出最近若干条"
+    for r in rep["recent"]:
+        for key in ("date", "report_name", "checks", "checks_failed"):
+            assert key in r, f"日报条目缺字段：{key}"
+        assert r["date"]
+        # 任一数值字段要么是数，要么是 None —— 不允许 0 冒充「没有」
+        assert r["total_asset"] is None or r["total_asset"] > 0

@@ -112,3 +112,67 @@ def test_repo_settings_enable_strategy_health():
     assert sh.get("enabled") is True
     assert str(sh.get("out_json") or "").endswith("strategy_health.json")
     assert int(sh.get("refresh_hours") or 0) > 0
+
+
+# ===== 结论影子跟踪的巡检钩子（2026-11-17，Step 1）=====
+
+def test_trials_disabled_does_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(sch, "_read_settings_yaml",
+                        lambda *a, **k: {"strategy_trials": {"enabled": False}})
+    called = []
+    monkeypatch.setattr(sch.subprocess, "run", lambda *a, **k: called.append(a))
+    assert sch._write_strategy_trials() is None
+    assert called == []
+
+
+def test_trials_fresh_skipped(tmp_path, monkeypatch):
+    out = _age(tmp_path / "trials.json", 1)
+    monkeypatch.setattr(sch, "_read_settings_yaml", lambda *a, **k: {
+        "strategy_trials": {"enabled": True, "out_json": str(out), "refresh_hours": 20}})
+    called = []
+    monkeypatch.setattr(sch.subprocess, "run", lambda *a, **k: called.append(a))
+    assert sch._write_strategy_trials() == str(out)
+    assert called == []
+
+
+def test_trials_stale_triggers_run(tmp_path, monkeypatch):
+    out = _age(tmp_path / "trials.json", 30)
+    monkeypatch.setattr(sch, "_read_settings_yaml", lambda *a, **k: {
+        "strategy_trials": {"enabled": True, "out_json": str(out), "refresh_hours": 20}})
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(sch.subprocess, "run", lambda cmd, **kw: (calls.append(cmd), _Proc())[1])
+    assert sch._write_strategy_trials() == str(out)
+    assert len(calls) == 1
+    assert any("run_strategy_trials.py" in str(x) for x in calls[0])
+
+
+def test_trials_failure_swallowed(tmp_path, monkeypatch):
+    out = _age(tmp_path / "trials.json", 30)
+    monkeypatch.setattr(sch, "_read_settings_yaml", lambda *a, **k: {
+        "strategy_trials": {"enabled": True, "out_json": str(out), "refresh_hours": 20}})
+
+    class _Proc:
+        returncode = 3
+        stderr = "boom"
+
+    monkeypatch.setattr(sch.subprocess, "run", lambda *a, **k: _Proc())
+    assert sch._write_strategy_trials() is None
+
+    def _raise(*a, **k):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(sch.subprocess, "run", _raise)
+    assert sch._write_strategy_trials() is None
+
+
+def test_repo_settings_enable_strategy_trials():
+    import yaml
+    cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
+    st = cfg.get("strategy_trials") or {}
+    assert st.get("enabled") is True
+    assert str(st.get("out_json") or "").endswith("strategy_trials.json")

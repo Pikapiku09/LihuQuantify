@@ -189,6 +189,14 @@ strategy_health:
   out_json: "outputs/strategy_health.json"
   refresh_hours: 20
 
+# AI 结论影子跟踪（2026-11-17，Step 1）：读 dsh-invest 的 conclusions.jsonl，
+# 按显式规则在行情里走一遍，产出 outputs/strategy_trials.json 供工作台「结论验证」分组展示。
+# 只读对侧文件，不写；独立影子交易不占主账本资金。失败只记 warning。
+strategy_trials:
+  enabled: true
+  out_json: "outputs/strategy_trials.json"
+  refresh_hours: 20
+
 # 影子账本（第十二轮：多池并行积累参考样本）
 # 统计纪律：评审进度/胜率以主账本（paper_state.json）为准；影子仅跨池稳健性对照，
 # 同期账本间有市场相关性，不得当独立样本合并。

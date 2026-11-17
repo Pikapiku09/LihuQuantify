@@ -250,6 +250,50 @@ def _risk_budget_coef(budget: dict, market_state: str) -> float:
     return _as_float_between(budget.get(key), _DEFAULT_RISK_BUDGET[key], 0.0, 1.0)
 
 
+def _write_strategy_trials() -> Optional[str]:
+    """重算 AI 结论影子跟踪（2026-11-17，Step 1）。
+
+    为什么用子进程：``scripts/`` 是入口层、``src/`` 是包层，包反向依赖脚本是已知反模式；
+    而且计算要读 DuckDB，而巡检进程**持有写锁**，进程内直接读必失败。
+
+    失败只记 warning、返回 None —— 结论验证缺失不得影响巡检本身。
+    """
+    try:
+        cfg = _read_settings_yaml().get("strategy_trials") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(cfg, dict) or not _as_bool(cfg.get("enabled"), False):
+        return None
+    rel = str(cfg.get("out_json") or "outputs/strategy_trials.json")
+    path = Path(rel)
+    if not path.is_absolute():
+        path = _ROOT / rel
+    hours = _as_int_between(cfg.get("refresh_hours"), 20, 1, 168)
+    try:
+        age_h = (time.time() - path.stat().st_mtime) / 3600.0
+    except OSError:
+        age_h = 1e9
+    if age_h < hours:
+        return str(path)
+    script = _ROOT / "scripts" / "run_strategy_trials.py"
+    if not script.exists():
+        logger.warning(f"[结论验证] 找不到 {script}，跳过")
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--out", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(f"[结论验证] 执行失败（不影响巡检）: {exc}")
+        return None
+    if proc.returncode != 0:
+        logger.warning(f"[结论验证] 退出码 {proc.returncode}：{(proc.stderr or '')[-300:]}")
+        return None
+    logger.info(f"[结论验证] 已重算（原过期 {age_h:.1f} 小时）→ {path}")
+    return str(path)
+
+
 def _append_equity_point() -> Optional[str]:
     """把当天模拟盘组合权益追加进 data/equity_history.jsonl（2026-11-17）。
 
@@ -1509,6 +1553,8 @@ class DailyScanner:
         summary["behavior_audit"] = _load_behavior_audit()
         # 策略健康快照（写给 dsh-invest 工作台的只读契约；失败不影响巡检）
         summary["strategy_health"] = _write_strategy_health()
+        # 结论影子跟踪（读 conclusions.jsonl，独立进程算；失败不影响巡检）
+        summary["strategy_trials"] = _write_strategy_trials()
         # 模拟盘权益历史（每日追加一个 live 点；量化策略页的权益曲线与回撤靠它）
         summary["equity_history"] = _append_equity_point()
         # ---- 第八轮清单：AI 收盘总结（纯展示层；巡检主体全部完成之后调用，
